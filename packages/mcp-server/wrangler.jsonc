@@ -1,0 +1,53 @@
+{
+  // ServiceNow Code Mode MCP — Worker config (local dev + vitest-pool-workers).
+  // Production infra is provisioned via alchemy.run.ts (§2.11); this file is the
+  // source of truth for `wrangler dev --port 8787` and the test runtime.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "servicenow-codemode-mcp",
+  "main": "src/index.ts",
+  // Plan §2.9 — ONE compatibility date everywhere. See docs/DELTAS.md.
+  "compatibility_date": "2026-05-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Plan §2.1 — Worker Loader binding; the executor calls load() (never v1 code directly).
+  "worker_loaders": [{ "binding": "LOADER" }],
+
+  // Plan §2.10 / §2.6 / §2.4 — two KV namespaces, kept separate from TokenStoreDO.
+  // Placeholder IDs for local/test; real IDs come from `wrangler kv namespace create`
+  // or alchemy. vitest-pool-workers ignores IDs and uses in-memory KV.
+  "kv_namespaces": [
+    { "binding": "SCHEMA_KV", "id": "40c98ca0d717428e89e097ef30887b8a" },
+    { "binding": "OAUTH_KV", "id": "8de4edaad4d8481988a80be5edc77b46" }
+  ],
+
+  "dev": {
+    "port": 8787,
+    "ip": "127.0.0.1"
+  },
+
+  // Plan §2.10 — purpose-split Durable Objects (skeletons in Phase 0.12; logic later).
+  "durable_objects": {
+    "bindings": [
+      { "name": "AUTH_DO", "class_name": "AuthCorrelationDO" },
+      { "name": "TOKEN_DO", "class_name": "TokenStoreDO" },
+      { "name": "BUDGET_DO", "class_name": "BudgetDO" },
+      { "name": "LEDGER_DO", "class_name": "MutationLedgerDO" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "AuthCorrelationDO",
+        "TokenStoreDO",
+        "BudgetDO",
+        "MutationLedgerDO"
+      ]
+    }
+  ]
+
+  // Secret bindings (§2.11: SNOW_*, OAUTH_PROVIDER_SECRET, TOKEN_KEK,
+  // X_MCP_EXECUTOR_HMAC_KEY, SNAPSHOT_KEK) are provided via .dev.vars / `wrangler
+  // secret put` and added to the typed Env as their flows are built.
+}

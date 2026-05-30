@@ -1,0 +1,40 @@
+{
+  "name": "servicenow-codemode-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Code Mode MCP server for ServiceNow on Cloudflare Workers (stateless createMcpHandler).",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/shared",
+    "packages/mcp-server"
+  ],
+  "scripts": {
+    "typecheck": "tsc -b --pretty",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "wrangler dev --port 8787 --config packages/mcp-server/wrangler.jsonc",
+    "cf-types": "wrangler types --config packages/mcp-server/wrangler.jsonc",
+    "live:smoke": "node scripts/live-smoke.mjs",
+    "live:verify": "bash scripts/live-rpc-verify.sh",
+    "copy-wasm": "node -e \"require('fs').copyFileSync('node_modules/esbuild-wasm/esbuild.wasm','packages/mcp-server/src/sandbox/esbuild.wasm')\"",
+    "predev": "npm run copy-wasm",
+    "pretest": "npm run copy-wasm",
+    "deploy": "npm run copy-wasm && alchemy deploy",
+    "deploy:destroy": "alchemy destroy",
+    "deploy:e2e": "node scripts/deployed-e2e.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.16.10",
+    "@modelcontextprotocol/inspector": "^0.21.2",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.0",
+    "wrangler": "4.95.0"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

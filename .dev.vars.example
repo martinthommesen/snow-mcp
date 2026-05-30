@@ -1,0 +1,30 @@
+# ─── ServiceNow Code Mode MCP — local secrets template ───────────────────────
+# Copy to `.dev.vars` (git-ignored) and fill in. NEVER commit the real file.
+# Generate 256-bit base64 keys with:  openssl rand -base64 32
+# See DEVELOPMENT_PLAN.md §9 (quick-start) and §2.11 (bindings).
+
+# --- ServiceNow instance + OAuth (confidential client: Auth Code + PKCE + secret, §2.8) ---
+SNOW_INSTANCE_HOST="dev000000.service-now.com"
+SNOW_OAUTH_CLIENT_ID=""
+SNOW_OAUTH_CLIENT_SECRET=""          # confidential client — required where refresh tokens are needed (§2.8, B9)
+# Dev/CI only: ROPC (MFA-exempt) for a disposable PDI service identity. Leave unset in prod.
+SNOW_DEV_ROPC="0"
+SNOW_DEV_ROPC_USERNAME=""
+SNOW_DEV_ROPC_PASSWORD=""
+
+# --- MCP-client OAuth provider (§2.4) ---
+OAUTH_PROVIDER_SECRET=""             # signing/encryption secret for @cloudflare/workers-oauth-provider
+
+# --- Encryption keys (§2.7, §7.7) ---
+TOKEN_KEK=""                         # AES-256-GCM key-encryption-key for TokenStoreDO token envelopes
+SNAPSHOT_KEK=""                      # AES-256-GCM KEK for recovery snapshots (§7.7)
+
+# --- Executor actor-signing HMAC (§2.0) ---
+# Mirror this value to the ServiceNow property `x_mcp.executor.hmac_secret` on the instance.
+X_MCP_EXECUTOR_HMAC_KEY=""
+
+# Single-operator consent secret for the MCP OAuth flow (§2.4)
+MCP_OPERATOR_SECRET=""
+
+# Executor endpoint path (instance-specific; global-scope APIs get a numeric namespace)
+SNOW_EXECUTOR_PATH=""

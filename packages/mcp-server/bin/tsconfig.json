@@ -1,0 +1,14 @@
+{
+  // Node-targeted stdio shim (plan §8). Separate from the worker build (`tsc -b`) because
+  // it uses Node globals (process, Buffer). Type-checked standalone.
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true,
+    "types": ["node"],
+    "lib": ["ES2022"]
+  },
+  "include": ["**/*.ts", "../src/**/*.ts", "../worker-configuration.d.ts"]
+}

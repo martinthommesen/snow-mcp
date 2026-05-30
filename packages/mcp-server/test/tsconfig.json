@@ -1,0 +1,15 @@
+{
+  // Editor/standalone type-checking for tests. Not part of `tsc -b` (composite
+  // off, noEmit) — tests run via vitest's esbuild. Globals (WorkerLoader,
+  // Cloudflare.Env, Fetcher) come from worker-configuration.d.ts; the
+  // `cloudflare:test` module from @cloudflare/vitest-pool-workers/types (env.d.ts).
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true,
+    "types": []
+  },
+  "include": ["**/*.ts", "../worker-configuration.d.ts", "../src/wasm.d.ts"]
+}

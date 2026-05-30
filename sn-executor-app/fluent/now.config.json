@@ -1,0 +1,6 @@
+{
+  "scope": "x_1793136_mcp",
+  "scopeId": "5b92f9a4db49488da5913df28c363219",
+  "name": "MCP Executor",
+  "tsconfigPath": "./src/server/tsconfig.json"
+}

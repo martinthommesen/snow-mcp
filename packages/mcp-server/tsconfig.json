@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    // Cloudflare runtime globals (WorkerLoader, KVNamespace, ExecutionContext, ...)
+    // come from the generated worker-configuration.d.ts, included below.
+    "types": []
+  },
+  "include": ["src/**/*.ts", "worker-configuration.d.ts"],
+  "references": [{ "path": "../shared" }]
+}
