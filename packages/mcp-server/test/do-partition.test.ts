@@ -130,4 +130,14 @@ describe("Phase 7.3 / S17 — MutationLedgerDO leveled idempotency", () => {
     await l.complete({ x: 1 });
     expect((await ledger("k-conflict").begin("DIFFERENT")).state).toBe("blocked");
   });
+
+  it("P4 — complete() WITHOUT a matching begin() does NOT fabricate a record (no false replay)", async () => {
+    // The pre-P4 complete() invented { requestHash: "" } when the row was missing, which
+    // would replay a stored result for ANY future begin() with an empty-string hash.
+    const l = ledger("k-stray");
+    await l.complete({ leaked: true }); // stray complete, no begin
+    expect(await l.status()).toBe("none"); // nothing was stamped
+    // A subsequent real begin() with the empty hash still claims "new" (no false replay).
+    expect((await ledger("k-stray").begin("")).state).toBe("new");
+  });
 });

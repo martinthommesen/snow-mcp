@@ -15,6 +15,10 @@ export interface AuditActor {
 export interface AuditRecord {
   ts: number;
   requestId: string;
+  /** Per-run mutation ordinal (plan §P4): identifies the audit-event key within a run, so
+   *  the intent row and its result row share a key (result supersedes intent) while
+   *  distinct mutations / denials never overwrite each other. */
+  ordinal?: number;
   instance: string;
   actor: AuditActor;
   op: MutationOp;
@@ -22,7 +26,13 @@ export interface AuditRecord {
   sysId?: string;
   beforeHash?: string;
   afterHash?: string;
-  status: "ok" | "error" | "denied";
+  /** The human-supplied justification (admin_script mandatory). Stored verbatim — it is
+   *  attribution, never a secret or the script body (§P4). Redacted of stray secrets on emit. */
+  reason?: string;
+  /** "intent" is the audit-before-effect row (effect not yet attempted); it is superseded
+   *  at the same ordinal key by "ok" (success) or "error" (effect threw). A durable trail
+   *  left at "intent" reads as an UNRESOLVED intent — never a false success (plan §P4). */
+  status: "intent" | "ok" | "error" | "denied";
   errorClass?: string;
 }
 
@@ -40,6 +50,7 @@ export async function hashValue(value: unknown): Promise<string> {
 export interface BuildAuditInput {
   ts: number;
   requestId: string;
+  ordinal?: number;
   instance: string;
   actor: AuditActor;
   op: MutationOp;
@@ -47,6 +58,7 @@ export interface BuildAuditInput {
   sysId?: string;
   before?: unknown;
   after?: unknown;
+  reason?: string;
   status: AuditRecord["status"];
   errorClass?: string;
 }
@@ -61,10 +73,12 @@ export async function buildAuditRecord(input: BuildAuditInput): Promise<AuditRec
     op: input.op,
     status: input.status,
   };
+  if (input.ordinal !== undefined) rec.ordinal = input.ordinal;
   if (input.table !== undefined) rec.table = input.table;
   if (input.sysId !== undefined) rec.sysId = input.sysId;
   if (input.before !== undefined) rec.beforeHash = await hashValue(input.before);
   if (input.after !== undefined) rec.afterHash = await hashValue(input.after);
+  if (input.reason !== undefined) rec.reason = input.reason;
   if (input.errorClass !== undefined) rec.errorClass = input.errorClass;
   return rec;
 }

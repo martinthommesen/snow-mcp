@@ -53,7 +53,12 @@ export class MutationLedgerDO extends DurableObject {
   }
 
   async complete(result: unknown): Promise<void> {
-    const rec = (await this.ctx.storage.get<LedgerRecord>("rec")) ?? { status: "started", requestHash: "" };
+    // Only a key with an in-flight ("started") attempt may be completed. A missing row
+    // means complete() was called without a matching begin() — it must NOT invent a
+    // record (which would stamp a result under an empty requestHash, replaying it for
+    // ANY future hash). A stray complete() is a no-op (P4 fix of the :56 fabrication bug).
+    const rec = await this.ctx.storage.get<LedgerRecord>("rec");
+    if (!rec) return;
     await this.ctx.storage.put("rec", { ...rec, status: "completed", result } satisfies LedgerRecord);
   }
 

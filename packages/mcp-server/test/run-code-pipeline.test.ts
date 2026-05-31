@@ -249,6 +249,26 @@ describe("Phase 4 — run_code pipeline", () => {
     expect(res.structuredContent?.error).toContain("my own problem");
   });
 
+  it("§P4 — threads a host-authoritative runContext (requestId + tool-level reason/idempotencyKey) into buildRpc", async () => {
+    // The mutating/executor RPC methods need host-seen values, not snippet-supplied ones.
+    let seen: { requestId?: string; reason?: string; runKey?: string } | undefined;
+    const base = deps({ scope: "admin_script", tenant: "admin_script", instance: "admin_script" });
+    await runCode(
+      { code: `async () => 1`, mode: "admin_script", reason: "do the thing", idempotencyKey: "run-key-1" },
+      {
+        ...base,
+        buildRpc: (effectiveMode, runBudget, runContext) => {
+          seen = { requestId: runContext.requestId, reason: runContext.reason, runKey: runContext.runKey };
+          return base.buildRpc(effectiveMode, runBudget, runContext);
+        },
+      },
+    );
+    expect(typeof seen?.requestId).toBe("string"); // host-minted
+    expect(seen?.requestId).not.toBe("run-key-1"); // NOT the tool key
+    expect(seen?.reason).toBe("do the thing");
+    expect(seen?.runKey).toBe("run-key-1");
+  });
+
   it("§P2 — multi-byte output near the cap stays valid UTF-8 and within maxOutputBytes", async () => {
     // Return a large multi-byte string; serialization must byte-truncate without splitting.
     const res = await runCode(

@@ -31,6 +31,14 @@ TENANT_MAX_MODE=""                   # mode ceiling: read_only | write | admin_s
 INSTANCE_MAX_MODE=""                 # mode ceiling: read_only | write | admin_script (default admin_script)
 ALLOW_LOCALHOST=""                   # "true" to allow http://localhost Origin (dev only; default false)
 
+# --- Recovery snapshots + second-approval gate (P4) ---
+SNAPSHOT_ENABLED_TABLES=""           # comma-separated tables that get before/after recovery snapshots (empty = none)
+# admin_script second-approval policy (§7.9). Leave ALL empty to preserve single-operator
+# behavior (gate skipped); set ANY to ENFORCE (admin_script without a valid token/group denied).
+ADMIN_SCRIPT_ALLOWLIST=""            # comma-separated actor userIds permitted admin_script
+ADMIN_SCRIPT_APPROVAL_TOKENS=""      # comma-separated valid approval tokens
+ADMIN_SCRIPT_REQUIRED_GROUP=""       # required access-group name (token OR group satisfies the second approval)
+
 # --- Executor actor-signing HMAC (§2.0) ---
 # Mirror this value to the ServiceNow property `x_mcp.executor.hmac_secret` on the instance.
 X_MCP_EXECUTOR_HMAC_KEY=""

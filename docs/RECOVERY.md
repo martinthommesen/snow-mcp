@@ -56,6 +56,11 @@ mode instead of propagating the decrypt error: `integration_user` re-mints via R
 - Leveled idempotency (L1 replay / L2 indeterminate-blocks-retry / L3 documented limit) is
   **implemented + tested** (`do/mutation-ledger.ts`, S17).
 - Encrypted snapshots (`recovery/snapshots.ts`) reuse the AES-GCM envelope (`auth/crypto.ts`,
-  unit-verified) with a dedicated `SNAPSHOT_KEK`. The snapshot wiring into the mutating RPC
-  path is **not yet built** (mutations are gated but the live mutate path needs the auth
-  layer). The crypto primitive it depends on is verified.
+  unit-verified) with a dedicated `SNAPSHOT_KEK`. **Wired into the live `tableUpdate` path
+  (P4):** for a `reversible_from_snapshot`-class update (a table in `SNAPSHOT_ENABLED_TABLES`)
+  the host fetches the real before-state, seals a before/after snapshot under the versioned
+  `SNAPSHOT_KEK` ring, and persists it to `SNAPSHOT_KV` (30-day `expirationTtl`) **before**
+  issuing the PATCH. If the snapshot cannot be persisted the update **fails closed** (no
+  recovery row => no mutate). The mutating path is also wrapped by the idempotency ledger,
+  host audit (audit-before-effect, fail-closed), and the second-approval gate
+  (`sn/mutation-guard.ts`).

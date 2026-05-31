@@ -18,5 +18,12 @@ sensitive than snapshots.
 
 ## Status
 
-Policy defined; the snapshot store + purge job are not yet built (the crypto envelope it
-would use is unit-verified). `TOKEN_KEK`/`SNAPSHOT_KEK` are declared in `.dev.vars.example`.
+Policy defined and the host stores are now wired (P4): the recovery snapshot store is
+`SNAPSHOT_KV` and the host audit trail is `AUDIT_KV`, both written with a **30-day Cloudflare
+KV `expirationTtl`** (`tools/handlers.ts`). KV auto-expires each key at its TTL, so **no
+separate scheduled purge job is needed on the host side** for either store (the executor
+nonce-table purge is a separate, executor-side P7 concern). Snapshots are AES-256-GCM
+sealed (`recovery/snapshots.ts`) under the versioned `SNAPSHOT_KEK` ring (`buildKekRing`,
+P3); the integration user never holds the ring. `SNAPSHOT_ENABLED_TABLES` selects which
+tables get snapshots (empty = none; tenant opt-out narrows the recovery claim).
+`TOKEN_KEK`/`SNAPSHOT_KEK` are declared in `.dev.vars.example`.

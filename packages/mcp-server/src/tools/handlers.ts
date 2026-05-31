@@ -19,7 +19,15 @@ import { SchemaCache } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
 import { getServiceNowBearer, type SnOAuthConfig } from "../auth/servicenow-oauth.js";
 import { buildKekRing } from "../auth/crypto.js";
+import type { MutationDeps } from "../sn/rpc.js";
+import { auditKey, type RunContext, type AuditIdentity, type LedgerHandle } from "../sn/mutation-guard.js";
+import type { AuditRecord } from "../observability/audit.js";
+import { takeSnapshot, type SnapshotConfig } from "../recovery/snapshots.js";
+import type { ApprovalContext } from "../authz/approval.js";
 import type { Mode } from "@servicenow-codemode/shared";
+
+/** Durable-store retention for audit + snapshot KV keys (§7.7/§10): 30 days, auto-expire. */
+const RETENTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 class NotConnectedHttpClient implements SnHttpClient {
   async request(): Promise<never> {
@@ -30,6 +38,8 @@ class NotConnectedHttpClient implements SnHttpClient {
 export interface HandlerEnv {
   LOADER: WorkerLoader;
   BUDGET_DO?: DurableObjectNamespace;
+  // Idempotency ledger (§7.3) — declared optional; wired into the mutating path in P4.
+  LEDGER_DO?: DurableObjectNamespace;
   SCHEMA_KV?: KVNamespace;
   // Host audit (§7.2) + recovery snapshots (§7.7). Declared in P0; consumed in P4.
   AUDIT_KV?: KVNamespace;
@@ -40,6 +50,7 @@ export interface HandlerEnv {
   SNOW_OAUTH_CLIENT_SECRET?: string;
   TOKEN_DO?: DurableObjectNamespace;
   TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
+  SNAPSHOT_KEK?: string; // one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
   // Versioned KEK ring (P3): current + optional previous, for token + snapshot stores.
   TOKEN_KEK_CURRENT?: string;
   TOKEN_KEK_PREV?: string;
@@ -55,6 +66,15 @@ export interface HandlerEnv {
   // Executor (runServerScript / admin_script): HMAC signing key + endpoint path (§2.0, §5.6).
   X_MCP_EXECUTOR_HMAC_KEY?: string;
   SNOW_EXECUTOR_PATH?: string;
+  // Recovery-snapshot config (§7.7): the snapshot ring uses SNAPSHOT_KEK_CURRENT/_PREV
+  // (declared above) via buildKekRing (same scheme as the token ring, P3).
+  SNAPSHOT_ENABLED_TABLES?: string; // comma-separated tables that get before/after snapshots.
+  SNAPSHOT_OPT_OUT?: string; // "true" disables snapshots for this tenant (claim narrowed).
+  // Second-approval policy (§7.9). All optional: when NONE is set the gate is SKIPPED,
+  // preserving single-operator behavior. When ANY is set the gate ENFORCES (P4).
+  ADMIN_SCRIPT_ALLOWLIST?: string; // comma-separated actor userIds permitted admin_script.
+  ADMIN_SCRIPT_APPROVAL_TOKENS?: string; // comma-separated valid approval tokens.
+  ADMIN_SCRIPT_REQUIRED_GROUP?: string; // required access-group name (token OR group).
 }
 
 function b64ToBytes(b64: string): Uint8Array {
@@ -145,15 +165,106 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
       }
     : undefined;
 
+  // ── Live mutating/executor safety wiring (plan §P4) ──
+  // Capture the durable safety layers in closures so the per-call buildRpc can attach them
+  // (with the host-authoritative per-run context) to ServiceNowRPC. The audit attribution
+  // identity is the authenticated actor (no secrets); snowEffectiveUser is wired in P6b.
+  const identity: AuditIdentity = {
+    mcpActorUserId: userId,
+    ...(auth?.props?.email ? { mcpActorEmail: auth.props.email as string } : {}),
+  };
+
+  // Idempotency ledger (§7.3): one DO per (userId|instanceHost|runKey:ordinal).
+  const ledgerFactory = env.LEDGER_DO
+    ? (runKey: string) =>
+        (ordinal: number): LedgerHandle => {
+          const ns = env.LEDGER_DO!;
+          return ns.get(ns.idFromName(`${userId}|${instanceHost}|${runKey}:${ordinal}`)) as unknown as LedgerHandle;
+        }
+    : undefined;
+
+  // Durable host audit (§7.2): AUDIT_KV, keyed `${utcDateKey}/${requestId}/${ordinal}` so
+  // each mutation/denial gets its own key (intent then result for one ordinal share the key,
+  // so the result row supersedes the intent — "audit-before-effect then update"). 30-day
+  // auto-expiry: KV expires the key, so no separate purge job is needed here.
+  const auditSink = env.AUDIT_KV
+    ? async (record: AuditRecord): Promise<void> => {
+        await env.AUDIT_KV!.put(
+          auditKey(utcDateKey(), record.requestId, record.ordinal ?? 0),
+          JSON.stringify(record),
+          { expirationTtl: RETENTION_TTL_SECONDS },
+        );
+      }
+    : undefined;
+
+  // Recovery snapshots (§7.7): encrypt under the SNAPSHOT_KEK ring (same buildKekRing scheme
+  // as the token ring, P3) and persist to SNAPSHOT_KV with a 30-day TTL. Honor the tenant
+  // opt-out (no enabled tables => no snapshots, recovery claim narrowed). The integration
+  // user never decrypts (the KEK lives only host-side). The ring is built lazily + cached.
+  const snapshotKekSecret = env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK;
+  const snapshotEnabledTables = (env.SNAPSHOT_ENABLED_TABLES ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const snapshotReady = Boolean(env.SNAPSHOT_KV && snapshotKekSecret && snapshotEnabledTables.length > 0);
+  const snapshotConfig: SnapshotConfig = { enabledTables: snapshotEnabledTables, retentionMs: RETENTION_TTL_SECONDS * 1000 };
+  let snapshotRing: Promise<Awaited<ReturnType<typeof buildKekRing>>> | undefined;
+  const captureSnapshot = snapshotReady
+    ? async (input: {
+        requestId: string; ordinal: number; table: string; sysId: string;
+        before: Record<string, unknown>; after: Record<string, unknown>; takenAt: number;
+      }): Promise<boolean> => {
+        snapshotRing ??= buildKekRing(snapshotKekSecret!, env.SNAPSHOT_KEK_PREV);
+        const ring = await snapshotRing;
+        const snap = await takeSnapshot(snapshotConfig, ring, {
+          table: input.table, sysId: input.sysId, takenAt: input.takenAt,
+          before: input.before, after: input.after,
+        });
+        if (!snap) return false; // table opted out — recovery claim narrowed.
+        await env.SNAPSHOT_KV!.put(
+          `${input.requestId}/${input.ordinal}/${input.table}/${input.sysId}`,
+          JSON.stringify(snap),
+          { expirationTtl: RETENTION_TTL_SECONDS },
+        );
+        return true;
+      }
+    : undefined;
+
+  // Second-approval policy (§7.9): present ONLY when a tenant configures it. When none of
+  // the three knobs is set the gate is SKIPPED (single-operator default keeps working);
+  // when ANY is set it ENFORCES (admin_script without a valid token/group is denied).
+  const adminScriptAllowlist = (env.ADMIN_SCRIPT_ALLOWLIST ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const validApprovalTokens = (env.ADMIN_SCRIPT_APPROVAL_TOKENS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const requiredAccessGroup = env.ADMIN_SCRIPT_REQUIRED_GROUP?.trim();
+  const approvalConfigured = adminScriptAllowlist.length > 0 || validApprovalTokens.length > 0 || Boolean(requiredAccessGroup);
+  const approval: Omit<ApprovalContext, "mode" | "actorUserId" | "reason"> | undefined = approvalConfigured
+    ? {
+        adminScriptAllowlist,
+        ...(validApprovalTokens.length > 0 ? { validApprovalTokens: new Set(validApprovalTokens) } : {}),
+        ...(requiredAccessGroup ? { requiredAccessGroup } : {}),
+        ...(auth?.props?.accessGroups ? { actorAccessGroups: auth.props.accessGroups as string[] } : {}),
+      }
+    : undefined;
+
+  function buildMutationDeps(runContext: RunContext): MutationDeps {
+    return {
+      runContext,
+      identity,
+      now: () => Date.now(),
+      ...(ledgerFactory && runContext.runKey ? { ledger: ledgerFactory(runContext.runKey) } : {}),
+      ...(auditSink ? { audit: auditSink } : {}),
+      ...(captureSnapshot ? { captureSnapshot, snapshotEnabledTables } : {}),
+      ...(approval ? { approval } : {}),
+    };
+  }
+
   const runCodeDeps: RunCodeDeps = {
     loader: env.LOADER,
     scopeMaxMode, // from the client's OAuth scope (§2.0.1)
-    tenantMaxMode: "admin_script", // no tenant ceiling configured; scope is the cap
+    tenantMaxMode: "admin_script", // no tenant ceiling configured; scope is the cap (ceilings: P5)
     instanceMaxMode: "admin_script",
-    buildRpc: (effectiveMode: Mode, runBudget: RunBudget) =>
+    buildRpc: (effectiveMode: Mode, runBudget: RunBudget, runContext: RunContext) =>
       new ServiceNowRPC({
         http, instanceHost, effectiveMode, actorPolicy: policy, runBudget,
         ...(signing ? { signing, executorPath: env.SNOW_EXECUTOR_PATH! } : {}),
+        mutation: buildMutationDeps(runContext),
       }),
     ...(reserveDailyBudget ? { reserveDailyBudget } : {}),
   };

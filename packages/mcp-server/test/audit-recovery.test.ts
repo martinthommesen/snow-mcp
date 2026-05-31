@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildAuditRecord, emitAudit, hashValue, type AuditRecord } from "../src/observability/audit.js";
 import { takeSnapshot, readSnapshot, reversalFields, isSnapshotEnabled, isExpired, type SnapshotConfig } from "../src/recovery/snapshots.js";
 import { recoverability, isDeletePermitted } from "../src/recovery/policy.js";
+import { auditKey } from "../src/sn/mutation-guard.js";
 import type { KekRing } from "../src/auth/crypto.js";
 
 // ─── §7.2 — host-side audit ───────────────────────────────────────────────────
@@ -25,6 +26,25 @@ describe("§7.2 audit", () => {
     const rec = await buildAuditRecord({ ts: 1, requestId: "Bearer abcdef1234567890", instance: "i", actor: { mcpActorUserId: "u" }, op: "delete", status: "ok" });
     await emitAudit((r) => { captured.push(r); }, rec);
     expect(captured[0]!.requestId).toContain("[REDACTED]");
+  });
+
+  // ─── §P4 — records carry ordinal + reason (attribution); key never overwrites ──
+  it("carries the per-run ordinal + reason and survives emit (reason is attribution, not a secret)", async () => {
+    const captured: AuditRecord[] = [];
+    const rec = await buildAuditRecord({
+      ts: 1, requestId: "req-1", ordinal: 2, instance: "i",
+      actor: { mcpActorUserId: "u" }, op: "runServerScript",
+      reason: "rotate the cache", status: "ok",
+    });
+    await emitAudit((r) => { captured.push(r); }, rec);
+    expect(captured[0]!.ordinal).toBe(2);
+    expect(captured[0]!.reason).toBe("rotate the cache");
+  });
+
+  it("auditKey gives each (requestId, ordinal) its own per-day key — distinct mutations never collide", () => {
+    expect(auditKey("2026-05-31", "req-1", 1)).toBe("2026-05-31/req-1/1");
+    expect(auditKey("2026-05-31", "req-1", 1)).not.toBe(auditKey("2026-05-31", "req-1", 2));
+    expect(auditKey("2026-05-31", "req-1", 1)).not.toBe(auditKey("2026-05-31", "req-2", 1));
   });
 });
 

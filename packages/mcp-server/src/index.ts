@@ -45,6 +45,12 @@ export interface Env {
   ALLOW_LOCALHOST?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
+  // Recovery-snapshot config (§7.7) + second-approval policy (§7.9). All optional (P4);
+  // an unset approval policy SKIPS the gate (single-operator default keeps working).
+  SNAPSHOT_ENABLED_TABLES?: string;
+  ADMIN_SCRIPT_ALLOWLIST?: string;
+  ADMIN_SCRIPT_APPROVAL_TOKENS?: string;
+  ADMIN_SCRIPT_REQUIRED_GROUP?: string;
 }
 
 function originConfig(env: Env): OriginConfig {

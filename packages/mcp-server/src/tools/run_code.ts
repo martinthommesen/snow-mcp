@@ -12,6 +12,7 @@ import { serializeResult, utf8Len } from "../sandbox/serialize.js";
 import { SIZE_LIMITS } from "../config.js";
 import { McpToolError, toToolResult, parseSandboxError } from "../sn/errors.js";
 import type { ServiceNowRPC } from "../sn/rpc.js";
+import type { RunContext } from "../sn/mutation-guard.js";
 import { RunBudget } from "../sn/run-budget.js";
 import type { ToolTextResult } from "../server.js";
 
@@ -28,8 +29,13 @@ export interface RunCodeDeps {
   scopeMaxMode: Mode;
   tenantMaxMode: Mode;
   instanceMaxMode: Mode;
-  /** Build the per-call RPC boundary for the resolved mode + run budget. */
-  buildRpc: (effectiveMode: Mode, runBudget: RunBudget) => ServiceNowRPC;
+  /**
+   * Build the per-call RPC boundary for the resolved mode + run budget. The host-
+   * authoritative per-run context (requestId, reason, idempotencyKey) is threaded in so
+   * the mutating/executor methods can reach the ledger, audit, snapshot, and approval
+   * layers with host-seen values — never snippet-supplied (plan §P4).
+   */
+  buildRpc: (effectiveMode: Mode, runBudget: RunBudget, runContext: RunContext) => ServiceNowRPC;
   /**
    * Atomic daily budget reserve-before-load (§4.5). Called BEFORE the executor is
    * created, so an exhausted caller never creates a billable Dynamic Worker. Returns
@@ -87,8 +93,17 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
     }
 
     // 4) execute (ActorPolicy + capability + per-run budget enforced inside the RPC).
+    //    The per-run context carries host-authoritative values (a host-minted requestId,
+    //    the tool-level reason, and the tool-level idempotencyKey = the runKey). The
+    //    mutating/executor RPC methods hard-require the runKey (§P4) and ignore any
+    //    snippet-supplied per-call idempotency key for the ledger key.
+    const runContext: RunContext = {
+      requestId: crypto.randomUUID(),
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      ...(input.idempotencyKey !== undefined ? { runKey: input.idempotencyKey } : {}),
+    };
     const runBudget = new RunBudget();
-    const rpc = deps.buildRpc(effectiveMode, runBudget);
+    const rpc = deps.buildRpc(effectiveMode, runBudget, runContext);
     const executor = createExecutor(deps.loader, deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs });
     const exec = await executeSnippet(executor, js, [{ name: "servicenow", fns: rpc.fns() }]);
 
