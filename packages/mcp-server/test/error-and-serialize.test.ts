@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ERROR_CODES } from "@servicenow-codemode/shared";
-import { McpToolError, parseSandboxError, toToolResult } from "../src/sn/errors.js";
+import { McpToolError, mapServiceNowError, parseSandboxError, toToolResult } from "../src/sn/errors.js";
+import { REDACTED } from "../src/observability/redact.js";
 import { serializeResult, truncateUtf8, utf8Len } from "../src/sandbox/serialize.js";
 
 // ─── Phase P2 — error-code integrity + byte-safe output (pure helpers) ──────────
@@ -26,6 +27,52 @@ describe("parseSandboxError — membership-checked code (§P2)", () => {
     expect(ERROR_CODES).toContain("run_error");
     expect(ERROR_CODES).toContain("budget_exceeded");
     expect(new Set(ERROR_CODES).size).toBe(ERROR_CODES.length);
+  });
+});
+
+// ─── Phase P6a — the client-facing message is GENERIC; raw SN detail never leaks (finding 22) ──
+describe("mapServiceNowError — generic client message, typed code (§P6a, finding 22)", () => {
+  it("returns a GENERIC per-status message and keeps the typed code; raw SN detail does not leak", () => {
+    // A ServiceNow 403 body echoing ACL/identity/schema detail (sys_id, table, role, email).
+    const body = {
+      error: {
+        message:
+          "ACL denied for 6816f79cc0a8016401c5a33be04be441 on table 'sys_user' for role 'itil_admin' (admin@example.com)",
+      },
+    };
+    const err = mapServiceNowError(403, body);
+    expect(err).toBeInstanceOf(McpToolError);
+    expect(err!.code).toBe("actor_policy_denied"); // typed code intact
+    expect(err!.message).toBe("ServiceNow denied access (403)."); // generic, per-status
+    // None of the raw SN detail reaches the client-facing message.
+    expect(err!.message).not.toContain("6816f79cc0a8016401c5a33be04be441");
+    expect(err!.message).not.toContain("sys_user");
+    expect(err!.message).not.toContain("itil_admin");
+    expect(err!.message).not.toContain("admin@example.com");
+  });
+
+  it("maps the status families to generic messages (5xx -> instance_hibernating)", () => {
+    expect(mapServiceNowError(401)!.code).toBe("reauth_required");
+    expect(mapServiceNowError(429)!.code).toBe("budget_exceeded");
+    const five = mapServiceNowError(503, { error: { message: "node 7 down" } });
+    expect(five!.code).toBe("instance_hibernating");
+    expect(five!.message).toBe("ServiceNow is unavailable (5xx).");
+    expect(five!.message).not.toContain("node 7 down");
+  });
+
+  it("the generic message survives through toToolResult with the typed code (discovery path)", () => {
+    const res = toToolResult(mapServiceNowError(500, { error: { message: "stack trace + sys_id leak" } }));
+    expect(res.structuredContent.code).toBe("instance_hibernating");
+    expect(res.structuredContent.message).toBe("ServiceNow is unavailable (5xx).");
+    expect(JSON.stringify(res)).not.toContain("sys_id leak");
+  });
+
+  it("toToolResult scrubs secrets in a non-SN error string (secondary chokepoint)", () => {
+    // A non-SN error (e.g. servicenow-oauth.ts's `servicenow_oauth_failed: …`) is redacted by
+    // toToolResult even though it never passes through mapServiceNowError.
+    const res = toToolResult(new McpToolError("internal_error", "client_secret=supersecretvalue leaked"));
+    expect(res.structuredContent.message).toContain(REDACTED);
+    expect(JSON.stringify(res)).not.toContain("supersecretvalue");
   });
 });
 

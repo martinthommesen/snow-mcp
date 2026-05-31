@@ -55,7 +55,24 @@ export interface Env {
 
 function originConfig(env: Env): OriginConfig {
   const allowedOrigins = (env.ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  return { allowedOrigins, allowLocalhost: true };
+  // Env-gate localhost (plan §P6a, finding 20): default FALSE in prod so a forged
+  // `http://localhost` Origin no longer passes; operators opt in for local dev only.
+  return { allowedOrigins, allowLocalhost: env.ALLOW_LOCALHOST === "true" };
+}
+
+// Auth-surface paths the OAuthProvider routes BEFORE apiHandler — so the only origin check
+// (inside apiHandler, /mcp) never covers them. The top-level wrapper below applies the SAME
+// originConfig to these (plan §P6a, finding 32). `/servicenow/*` lands in P6b but the wrapper
+// covers it now so the per-user OAuth callback is guarded from the start. NOT guarded:
+// `/.well-known/*` (public metadata), `/health`, and `/mcp` (defense-in-depth check stays in
+// apiHandler). An absent Origin (non-browser client) is allowed by isOriginAllowed.
+function isAuthSurfacePath(pathname: string): boolean {
+  return (
+    pathname === "/authorize" ||
+    pathname === "/oauth/token" ||
+    pathname === "/oauth/register" ||
+    pathname.startsWith("/servicenow/")
+  );
 }
 
 /** Authenticated MCP API handler. Reached ONLY after the OAuthProvider validates the
@@ -81,7 +98,7 @@ const apiHandler = {
 // The OAuthProvider wraps the Worker: it implements /authorize metadata, /oauth/token,
 // /oauth/register, validates tokens on /mcp, and routes everything else to the consent
 // handler. No valid token on /mcp -> 401 (plan §2.4, §7.8; closes the open-endpoint gap).
-export default new OAuthProvider({
+const provider = new OAuthProvider({
   apiRoute: "/mcp",
   apiHandler,
   defaultHandler: serviceNowAuthHandler as never,
@@ -91,3 +108,24 @@ export default new OAuthProvider({
   scopesSupported: ["servicenow:read", "servicenow:write", "servicenow:admin_script"],
   allowPlainPKCE: false,
 });
+
+// Top-level fetch wrapper (plan §P6a, finding 32): run the Origin guard on the auth-surface
+// paths (which OAuthProvider routes BEFORE apiHandler, so they would otherwise be unchecked)
+// using the SAME OriginConfig as the /mcp check, THEN delegate to the provider. /mcp keeps its
+// own check inside apiHandler (defense in depth, same config).
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    try {
+      // A denied origin returns 403 (a return, not a throw) and skips the provider. A thrown
+      // MissingOAuthKvError (unbound OAUTH_KV) from provider.fetch is caught below -> 500,
+      // mirroring apiHandler's catch (plan §P6a, finding 36).
+      if (isAuthSurfacePath(new URL(request.url).pathname) && !isOriginAllowed(request, originConfig(env))) {
+        return originDeniedResponse();
+      }
+      return await provider.fetch(request, env, ctx);
+    } catch (e) {
+      console.error("top-level fetch error:", e instanceof Error ? e.message : String(e));
+      return Response.json({ error: "internal_error" }, { status: 500 });
+    }
+  },
+};

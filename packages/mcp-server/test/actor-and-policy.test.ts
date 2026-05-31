@@ -10,6 +10,7 @@ import {
 } from "../src/authz/actor-policy.js";
 import { requireCapability, hasCapability } from "../src/config.js";
 import { McpToolError } from "../src/sn/errors.js";
+import type { Mode } from "@servicenow-codemode/shared";
 
 const claims: ActorClaims = {
   mcp_actor_user_id: "u1",
@@ -101,6 +102,17 @@ describe("§2.12 ActorPolicy (B5)", () => {
   it("a permissive policy (single trusted operator) allows broadly", () => {
     const p = permissivePolicy(["inst1.service-now.com"]);
     expect(() => assertActorPolicy(p, { instance: "inst1.service-now.com", table: "anything", mode: "admin_script" })).not.toThrow();
+  });
+
+  // ─── Phase P6a — fail-closed on a non-Mode value (closes the latent fail-open) ──
+  // Pre-P6a: MODE_RISK[unknown] === undefined, so `undefined > MODE_RISK[maxMode]` was false
+  // and an unknown mode passed the policy gate. Now an unknown mode scores +Infinity and is
+  // DENIED, even under a permissive (admin_script) policy.
+  it("denies an unknown (non-Mode) requested mode, even under a permissive policy", () => {
+    const p = permissivePolicy(["inst1.service-now.com"]);
+    expect(() =>
+      assertActorPolicy(p, { instance: "inst1.service-now.com", table: "incident", mode: "super_admin" as unknown as Mode }),
+    ).toThrow(McpToolError);
   });
 });
 

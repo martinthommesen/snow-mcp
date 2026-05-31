@@ -30,7 +30,10 @@ function reqEnv(k: string): string {
 }
 
 const app = await alchemy("servicenow-codemode-mcp", {
-  password: process.env.OAUTH_PROVIDER_SECRET ?? "dev-state-password-change-me",
+  // Fail-closed (plan §P6a, finding 26): the Alchemy encrypted-state password MUST be the real
+  // OAUTH_PROVIDER_SECRET — never a hardcoded dev fallback. reqEnv throws when it is unset,
+  // matching the Worker-secret bindings below (which already fail closed via reqEnv).
+  password: reqEnv("OAUTH_PROVIDER_SECRET"),
 });
 
 // Adopt the KV namespaces already created in the account (by title).

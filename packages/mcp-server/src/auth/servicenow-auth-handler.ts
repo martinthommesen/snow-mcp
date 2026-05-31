@@ -8,6 +8,7 @@
 // scriptable for verification (the consent is a form POST, not a mandatory browser UI).
 
 import type { Mode } from "@servicenow-codemode/shared";
+import { requireOAuthKv } from "./oauth-kv.js";
 
 interface AuthRequestInfo {
   responseType: string;
@@ -35,9 +36,15 @@ interface OAuthHelpersLike {
 interface HandlerEnv {
   OAUTH_PROVIDER: OAuthHelpersLike;
   MCP_OPERATOR_SECRET?: string;
+  OAUTH_KV?: KVNamespace;
 }
 
 const SUPPORTED_SCOPES = ["servicenow:read", "servicenow:write", "servicenow:admin_script"] as const;
+
+/** Server-side consent state lives in OAUTH_KV under this prefix, keyed by a server-minted
+ *  nonce. Short TTL: a consent flow that isn't completed promptly is abandoned (plan §P6a). */
+const CONSENT_KEY_PREFIX = "consent:";
+const CONSENT_TTL_SECONDS = 600; // 10 minutes to complete the operator-secret consent.
 
 function maxModeFromScopes(scopes: string[]): Mode {
   if (scopes.includes("servicenow:admin_script")) return "admin_script";
@@ -55,7 +62,11 @@ function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
-function consentPage(oauth: AuthRequestInfo, clientName: string, error?: string): Response {
+/** Render the consent page. The hidden field carries ONLY the server-minted `nonce` — the
+ *  authoritative auth-request (scope/redirect/state) lives in OAUTH_KV under that nonce and
+ *  is never round-tripped through the client (plan §P6a, finding 22). `oauth` is read from
+ *  server state purely to DISPLAY the scopes being granted. */
+function consentPage(oauth: AuthRequestInfo, clientName: string, nonce: string, error?: string): Response {
   const scopes = grantScopes(oauth.scope);
   const html = `<!doctype html><meta charset="utf-8"><title>Authorize MCP client</title>
 <style>body{font:15px system-ui;max-width:34rem;margin:3rem auto;padding:0 1rem}
@@ -68,7 +79,7 @@ button{font:inherit;padding:.6rem 1rem;border:0;border-radius:6px;background:#25
 ${scopes.map((s) => `<div class="s">${esc(s)}</div>`).join("")}
 ${error ? `<p class="err">${esc(error)}</p>` : ""}
 <form method="POST" action="/authorize">
-  <input type="hidden" name="oauth" value='${esc(JSON.stringify(oauth))}'>
+  <input type="hidden" name="consent" value="${esc(nonce)}">
   <p><label>Operator secret<br><input type="password" name="operator_secret" autocomplete="off" style="width:100%;padding:.5rem"></label></p>
   <button type="submit">Approve</button>
 </form>`;
@@ -84,20 +95,38 @@ export const serviceNowAuthHandler = {
     }
 
     if (url.pathname === "/authorize") {
+      // OAUTH_KV holds the server-side consent state; a missing binding fails CLOSED here
+      // (plan §P6a) rather than silently re-parsing a client-controlled field.
+      const kv = requireOAuthKv(env);
+
       if (request.method === "GET") {
         const oauth = await env.OAUTH_PROVIDER.parseAuthRequest(request);
         const client = await env.OAUTH_PROVIDER.lookupClient(oauth.clientId);
-        return consentPage(oauth, client?.clientName ?? "", undefined);
+        // Bind the authoritative auth-request to server-side state under a server-minted nonce;
+        // only the nonce is ever sent to the client. Scope can no longer be tampered between
+        // GET (display/validate) and POST (grant) — the POST reads the stored object wholesale.
+        const nonce = crypto.randomUUID();
+        await kv.put(CONSENT_KEY_PREFIX + nonce, JSON.stringify(oauth), { expirationTtl: CONSENT_TTL_SECONDS });
+        return consentPage(oauth, client?.clientName ?? "", nonce);
       }
       if (request.method === "POST") {
         const form = await request.formData();
-        const oauth = JSON.parse(String(form.get("oauth") ?? "{}")) as AuthRequestInfo;
+        const nonce = String(form.get("consent") ?? "");
+        // Look up the server-side state; a missing/expired/forged nonce fails CLOSED (never
+        // trust a client-supplied auth-request). The stored object is the sole authority.
+        const stored = nonce ? await kv.get(CONSENT_KEY_PREFIX + nonce) : null;
+        if (!stored) return new Response("Invalid or expired consent request.", { status: 400 });
+        const oauth = JSON.parse(stored) as AuthRequestInfo;
+
         const secret = String(form.get("operator_secret") ?? "");
         const expected = env.MCP_OPERATOR_SECRET ?? "";
-        // Fail closed: no configured secret => never authorize.
+        // Fail closed: no configured secret => never authorize. On a wrong secret, re-render
+        // with the SAME nonce (do NOT delete the entry — its TTL keeps the retry valid).
         if (!expected || secret.length !== expected.length || !timingSafeEqual(secret, expected)) {
-          return consentPage(oauth, "", "Invalid operator secret.");
+          return consentPage(oauth, "", nonce, "Invalid operator secret.");
         }
+        // Single-use on success: burn the consent nonce so the grant can't be replayed.
+        await kv.delete(CONSENT_KEY_PREFIX + nonce);
         const scope = grantScopes(oauth.scope);
         const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
           request: oauth,

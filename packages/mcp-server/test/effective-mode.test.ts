@@ -71,3 +71,35 @@ describe("Phase 0.13b — effective mode is min(requested, scope, tenant, instan
     expect(r).toEqual({ ok: true, effective: "read_only" });
   });
 });
+
+// ─── Phase P6a — fail-closed on a non-Mode value (closes the latent fail-open) ──
+// Pre-P6a: MODE_RISK[unknown] === undefined, and `undefined > undefined` is false, so an
+// unknown requested mode slipped past the cap check and resolved up to admin_script. Now an
+// unknown mode scores +Infinity (modeRisk), so the cap check actively DENIES.
+describe("Phase P6a — unknown mode fails CLOSED (denied, never widened)", () => {
+  it("a non-Mode requested value is denied even when all ceilings are admin_script", () => {
+    const r = resolveEffectiveMode("super_admin" as unknown as Mode, allCeilings);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("mode_not_permitted");
+  });
+
+  it("a prototype-pollution-style key ('constructor') is denied, not resolved", () => {
+    const r = resolveEffectiveMode("constructor" as unknown as Mode, allCeilings);
+    expect(r.ok).toBe(false);
+  });
+
+  it("an unknown ceiling cannot widen the effective mode (treated as max risk)", () => {
+    // An unknown tenant ceiling must NOT become the (lowest) effective mode; a valid
+    // read_only request still resolves to read_only.
+    const r = resolveEffectiveMode("read_only", {
+      scopeMaxMode: "admin_script",
+      tenantMaxMode: "bogus" as unknown as Mode,
+      instanceMaxMode: "admin_script",
+    });
+    expect(r).toEqual({ ok: true, effective: "read_only" });
+  });
+
+  it("still resolves valid admin_script (no regression)", () => {
+    expect(resolveEffectiveMode("admin_script", allCeilings)).toEqual({ ok: true, effective: "admin_script" });
+  });
+});

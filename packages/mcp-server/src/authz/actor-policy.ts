@@ -7,7 +7,7 @@
 
 import { McpToolError } from "../sn/errors.js";
 import { assertMandatoryRowFilterSafe } from "../sn/validate.js";
-import { MODE_RISK, type Mode } from "@servicenow-codemode/shared";
+import { modeRisk, type Mode } from "@servicenow-codemode/shared";
 
 export interface ActorPolicy {
   /** Instance hosts this actor may reach. Empty = none. */
@@ -69,7 +69,10 @@ export function assertActorPolicy(
       table: ctx.table,
     });
   }
-  if (MODE_RISK[ctx.mode] > MODE_RISK[policy.maxMode]) {
+  // FAIL-CLOSED (plan §P6a): modeRisk scores any non-Mode value as +Infinity, so an unknown
+  // requested `ctx.mode` exceeds any valid maxMode and is DENIED (never fails open to
+  // admin_script via an `undefined > undefined === false` comparison).
+  if (modeRisk(ctx.mode) > modeRisk(policy.maxMode)) {
     throw new McpToolError("actor_policy_denied", `Mode "${ctx.mode}" exceeds this actor's maxMode "${policy.maxMode}".`);
   }
 }

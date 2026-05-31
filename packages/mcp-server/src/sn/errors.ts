@@ -3,6 +3,7 @@
 // MCP tool result. Pure host logic — unit-verified locally.
 
 import { ERROR_CODES, type ErrorCode } from "@servicenow-codemode/shared";
+import { redactString } from "../observability/redact.js";
 
 const ERROR_CODE_SET: ReadonlySet<string> = new Set(ERROR_CODES);
 
@@ -29,10 +30,16 @@ export function toToolResult(err: unknown): {
   // Carry structured detail (e.g. reauth_required.authorizeUrl, budget_exceeded.dimension)
   // through the non-sandbox throw path so preflight conditions survive (plan §P2).
   const detail = err instanceof McpToolError ? err.detail : undefined;
+  // Secondary chokepoint (plan §P6a): scrub secret patterns from the outgoing message so a
+  // non-SN error string (e.g. the `servicenow_oauth_failed: …` thrown in servicenow-oauth.ts)
+  // is redacted before reaching the client. SN-mapped messages are already generic (see
+  // mapServiceNowError); `detail` is structured and never carries secrets (§7.1), so it is
+  // passed through unredacted.
+  const safe = redactString(message);
   return {
-    content: [{ type: "text", text: `[${code}] ${message}` }],
+    content: [{ type: "text", text: `[${code}] ${safe}` }],
     isError: true,
-    structuredContent: detail !== undefined ? { code, message, detail } : { code, message },
+    structuredContent: detail !== undefined ? { code, message: safe, detail } : { code, message: safe },
   };
 }
 
@@ -65,19 +72,24 @@ export function parseSandboxError(message: string): { code?: ErrorCode; message:
  */
 export function mapServiceNowError(status: number, body?: { error?: { message?: string } }): McpToolError | null {
   if (status >= 200 && status < 300) return null;
-  const snMessage = body?.error?.message;
+  // The CLIENT-facing message is a GENERIC per-status string (plan §P6a): the raw ServiceNow
+  // message can carry ACL/identity/schema detail (sys_ids, table/role names, emails, queries),
+  // none of which the client should see. The raw message is LOGGED server-side (redacted) for
+  // operator debuggability only. The typed `code` and any structured `detail` (P2) are intact.
+  const raw = body?.error?.message;
+  if (raw !== undefined) console.error("ServiceNow error:", redactString(raw));
 
   // Hibernating PDIs answer with a 200 HTML splash or a gateway error; callers detect
   // the splash separately. Here we map the explicit status families.
-  if (status === 401) return new McpToolError("reauth_required", snMessage ?? "ServiceNow authentication failed.");
+  if (status === 401) return new McpToolError("reauth_required", "ServiceNow authentication failed (401).");
   if (status === 403) {
-    return new McpToolError("actor_policy_denied", snMessage ?? "ServiceNow denied access (ACL/role).");
+    return new McpToolError("actor_policy_denied", "ServiceNow denied access (403).");
   }
   if (status === 429) {
-    return new McpToolError("budget_exceeded", snMessage ?? "ServiceNow rate limit (429).");
+    return new McpToolError("budget_exceeded", "ServiceNow rate limit (429).");
   }
   if (status >= 500) {
-    return new McpToolError("instance_hibernating", snMessage ?? `ServiceNow ${status} (instance may be hibernating).`);
+    return new McpToolError("instance_hibernating", "ServiceNow is unavailable (5xx).");
   }
-  return new McpToolError("internal_error", snMessage ?? `ServiceNow error ${status}.`);
+  return new McpToolError("internal_error", `ServiceNow error ${status}.`);
 }

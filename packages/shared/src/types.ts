@@ -14,6 +14,22 @@ export const MODE_RISK: Readonly<Record<Mode, number>> = {
   admin_script: 2,
 };
 
+/** Membership check for the {@link Mode} union (plan §P6a, fail-closed authz boundary). */
+export function isValidMode(value: unknown): value is Mode {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(MODE_RISK, value);
+}
+
+/**
+ * Risk of a mode, FAIL-CLOSED for any non-{@link Mode} value (plan §P6a; closes the
+ * fail-open noted by the P5 reviewer). `MODE_RISK[unknown]` is `undefined`, and every
+ * `>`/`<` comparison against `undefined` is `false`, so an unknown mode would slip past
+ * `minByRisk`/cap checks up to `admin_script`. Treating an unknown mode as MAXIMUM risk
+ * (+Infinity) makes the cap check actively DENY rather than silently grant.
+ */
+export function modeRisk(value: Mode): number {
+  return isValidMode(value) ? MODE_RISK[value] : Number.POSITIVE_INFINITY;
+}
+
 /** Typed error codes surfaced to MCP clients (plan §1.6, §3.x). */
 export type ErrorCode =
   | "capability_denied"

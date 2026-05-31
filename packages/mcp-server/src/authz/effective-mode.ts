@@ -8,16 +8,21 @@
 // approve `admin_script`: that additionally needs the allowlist + second-approval
 // gate (§3.5, Phase 7.9), layered on top of a successful resolution here.
 
-import { MODE_RISK, type Mode } from "@servicenow-codemode/shared";
+import { modeRisk, type Mode } from "@servicenow-codemode/shared";
 
 /** Plan §0.9 Decision 1 — default floor. Flip to widen for private/internal demos. */
 export const DEFAULT_MODE: Mode = "read_only";
 
-/** Lowest-risk (most restrictive) of the given modes. */
+/**
+ * Lowest-risk (most restrictive) of the given modes. FAIL-CLOSED: `modeRisk` scores any
+ * non-{@link Mode} value as +Infinity (plan §P6a), so an unknown mode is treated as the
+ * HIGHEST risk and can never be selected as the (lower) effective mode — it would instead
+ * be rejected by `resolveEffectiveMode`'s cap check below.
+ */
 export function minByRisk(first: Mode, ...rest: Mode[]): Mode {
   let lowest = first;
   for (const m of rest) {
-    if (MODE_RISK[m] < MODE_RISK[lowest]) lowest = m;
+    if (modeRisk(m) < modeRisk(lowest)) lowest = m;
   }
   return lowest;
 }
@@ -47,7 +52,9 @@ export function resolveEffectiveMode(
   const ceiling = minByRisk(ceilings.scopeMaxMode, ceilings.tenantMaxMode, ceilings.instanceMaxMode);
 
   // requested may only narrow: if it asks for more risk than the ceiling allows, deny.
-  if (MODE_RISK[requested] > MODE_RISK[ceiling]) {
+  // FAIL-CLOSED (plan §P6a): an unknown `requested` mode scores +Infinity via modeRisk, so
+  // this comparison is true and the call is DENIED — never silently capped to admin_script.
+  if (modeRisk(requested) > modeRisk(ceiling)) {
     return { ok: false, code: "mode_not_permitted", requested, ceiling };
   }
   return { ok: true, effective: minByRisk(requested, ceiling) };

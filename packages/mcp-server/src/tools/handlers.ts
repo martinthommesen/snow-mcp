@@ -10,6 +10,7 @@ import type { ServerHandlers, ToolTextResult } from "../server.js";
 import { runCode, type RunCodeDeps } from "./run_code.js";
 import { ServiceNowRPC } from "../sn/rpc.js";
 import { SnFetchClient, type SnHttpClient } from "../sn/http.js";
+import { canonicalizeInstanceHost } from "../sn/url-allowlist.js";
 import { describeTable, listTables, type DiscoveryDeps } from "../sn/discovery.js";
 import { permissivePolicy, type ActorPolicy } from "../authz/actor-policy.js";
 import { McpToolError, toToolResult } from "../sn/errors.js";
@@ -109,7 +110,15 @@ export interface AuthContext {
 
 export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandlers {
   const scopeMaxMode: Mode = auth?.scopeMaxMode ?? "read_only";
-  const instanceHost = env.SNOW_INSTANCE_HOST ?? "unconfigured.invalid";
+  // Canonicalize + allowlist the configured instance host ONCE here (plan §P6a, finding "OAuth
+  // token off-allowlist"), then thread the canonical value to BOTH SnFetchClient AND the
+  // SnOAuthConfig. tokenRequest() POSTs https://${instanceHost}/oauth_token.do with the client
+  // secret + ROPC creds; sharing the already-allowlisted host means a bad SNOW_INSTANCE_HOST
+  // binding can never send credentials off-allowlist. When the host is unset we keep the
+  // sentinel (no connection is attempted — devConnected/oauthReady both require the host).
+  const instanceHost = env.SNOW_INSTANCE_HOST
+    ? canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST, { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] })
+    : "unconfigured.invalid";
   const userId = (auth?.props?.userId as string) ?? "operator";
   const policy: ActorPolicy = permissivePolicy([instanceHost]); // single-operator dev default
 

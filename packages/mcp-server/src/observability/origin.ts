@@ -30,6 +30,16 @@ function isLoopbackOrigin(origin: string): boolean {
   return LOOPBACK_HOSTS.has(url.hostname);
 }
 
+/** True when the Origin's host (scheme-agnostic host:port) equals the request URL's host.
+ *  A malformed Origin or request URL yields false (deny path, never throws). */
+function isSameOrigin(origin: string, requestUrl: string): boolean {
+  try {
+    return new URL(origin).host === new URL(requestUrl).host;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Returns true if the request's Origin is acceptable.
  * Absent Origin is treated as a non-browser request and allowed (see policy above).
@@ -37,6 +47,12 @@ function isLoopbackOrigin(origin: string): boolean {
 export function isOriginAllowed(request: Request, config: OriginConfig): boolean {
   const origin = request.headers.get("Origin");
   if (origin === null) return true; // non-browser client
+
+  // Same-origin auto-allow: DNS-rebinding/CSRF protection targets CROSS-origin requests.
+  // A request whose Origin host equals the request URL's own host is same-origin and
+  // legitimate — e.g. the worker's OWN browser consent POST to /authorize. A malformed
+  // Origin can't be parsed, so it falls through to the (deny-by-default) allowlist check.
+  if (isSameOrigin(origin, request.url)) return true;
 
   const allowLocalhost = config.allowLocalhost ?? true;
   if (allowLocalhost && isLoopbackOrigin(origin)) return true;

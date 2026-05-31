@@ -24,6 +24,26 @@ async function pkce() {
   return { verifier, challenge };
 }
 
+// P6a: GET /authorize with the standard snake_case OAuth query params, then scrape the
+// server-minted nonce from the hidden field `name="consent" value="…"` in the returned HTML.
+// `scope` is space-joined per the OAuth metadata convention.
+async function getConsentNonce({ clientId, redirectUri, scope, state, challenge }) {
+  const q = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: scope.join(" "),
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  });
+  const res = await fetch(`${BASE}/authorize?${q}`);
+  const html = await res.text();
+  const m = /name="consent" value="([^"]+)"/.exec(html);
+  if (!m) throw new Error(`no consent nonce from GET /authorize (status ${res.status})`);
+  return m[1];
+}
+
 let pass = 0, fail = 0;
 const check = (n, c) => { if (c) { pass++; console.log("  PASS", n); } else { fail++; console.log("  FAIL", n); } };
 
@@ -44,10 +64,13 @@ async function getToken(scopes) {
   const clientId = client.client_id;
   const { verifier, challenge } = await pkce();
   const state = b64url(crypto.getRandomValues(new Uint8Array(8)));
-  const authReq = { responseType: "code", clientId, redirectUri, scope: scopes, state, codeChallenge: challenge, codeChallengeMethod: "S256" };
 
-  // Operator consent (form POST with the oauth request + secret). Don't follow the redirect.
-  const form = new URLSearchParams({ oauth: JSON.stringify(authReq), operator_secret: OPERATOR_SECRET ?? "" });
+  // P6a consent is two steps: GET /authorize mints a server-side nonce rendered as a hidden
+  // field name="consent"; POST sends { consent: <nonce>, operator_secret }. The GET uses the
+  // STANDARD snake_case OAuth query params (parsed by OAuthProvider.parseAuthRequest), then we
+  // scrape the nonce from the HTML and POST it (mirrors getConsent/postConsent in the tests).
+  const nonce = await getConsentNonce({ clientId, redirectUri, scope: scopes, state, challenge });
+  const form = new URLSearchParams({ consent: nonce, operator_secret: OPERATOR_SECRET ?? "" });
   const consent = await fetch(`${BASE}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: form, redirect: "manual" });
   const loc = consent.headers.get("location");
   if (!loc) throw new Error(`no redirect from /authorize (status ${consent.status})`);
@@ -114,8 +137,9 @@ async function registerClient() {
   return (await r.json()).client_id;
 }
 async function authorize(clientId, challenge, secret) {
-  const authReq = { responseType: "code", clientId, redirectUri: "http://localhost/callback", scope: ["servicenow:read"], state: "s", codeChallenge: challenge, codeChallengeMethod: "S256" };
-  return fetch(`${BASE}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ oauth: JSON.stringify(authReq), operator_secret: secret }), redirect: "manual" });
+  // Two-step P6a consent: GET to mint+scrape the nonce, then POST { consent, operator_secret }.
+  const nonce = await getConsentNonce({ clientId, redirectUri: "http://localhost/callback", scope: ["servicenow:read"], state: "s", challenge });
+  return fetch(`${BASE}/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ consent: nonce, operator_secret: secret }), redirect: "manual" });
 }
 {
   const cid = await registerClient();
