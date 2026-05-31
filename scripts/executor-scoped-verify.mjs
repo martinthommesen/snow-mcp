@@ -12,7 +12,10 @@ function dv(k) {
 const host = dv("SNOW_INSTANCE_HOST");
 const basic = "Basic " + Buffer.from(`${dv("SNOW_DEV_ROPC_USERNAME")}:${dv("SNOW_DEV_ROPC_PASSWORD")}`).toString("base64");
 const keyBytes = Uint8Array.from(atob(dv("X_MCP_EXECUTOR_HMAC_KEY")), (c) => c.charCodeAt(0));
-const ENDPOINT = `https://${host}/api/x_1793136_mcp/x_mcp/executor/run`;
+// Hit the EXACT endpoint the live Worker calls (SNOW_EXECUTOR_PATH in .dev.vars, e.g. the
+// numeric scoped form /api/1793136/x_mcp/executor/run) so a scope-name-vs-numeric path-form
+// mismatch can't 404. Falls back to the scope-name form if SNOW_EXECUTOR_PATH is unset.
+const ENDPOINT = `https://${host}${dv("SNOW_EXECUTOR_PATH") || "/api/x_1793136_mcp/x_mcp/executor/run"}`;
 const h = { authorization: basic, accept: "application/json" };
 
 async function api(method, path, body) {

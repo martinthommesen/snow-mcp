@@ -123,6 +123,9 @@ check("B4 read_only-scoped client cannot request write (mode_not_permitted)", es
     arguments: {
       code: `async () => { const r = await servicenow.runServerScript({ script: "return gs.getUserName();", reason: "e2e", idempotencyKey: "k" + Date.now() }); return r; }`,
       mode: "admin_script", reason: "e2e admin_script executor proof",
+      // P4: the FIRST mutating RPC hard-requires a TOOL-LEVEL idempotencyKey (the inner one
+      // above is the snippet's, not the ledger key) — without this the run is capability_denied.
+      idempotencyKey: "e2e-fullchain-" + Date.now(),
     },
   });
   const text = rs.content?.[0]?.text ?? "";
