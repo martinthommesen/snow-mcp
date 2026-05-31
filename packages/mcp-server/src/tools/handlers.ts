@@ -31,12 +31,24 @@ export interface HandlerEnv {
   LOADER: WorkerLoader;
   BUDGET_DO?: DurableObjectNamespace;
   SCHEMA_KV?: KVNamespace;
+  // Host audit (§7.2) + recovery snapshots (§7.7). Declared in P0; consumed in P4.
+  AUDIT_KV?: KVNamespace;
+  SNAPSHOT_KV?: KVNamespace;
   SNOW_INSTANCE_HOST?: string;
   // Per-user ServiceNow OAuth path (preferred): tokens stored encrypted in TokenStoreDO.
   SNOW_OAUTH_CLIENT_ID?: string;
   SNOW_OAUTH_CLIENT_SECRET?: string;
   TOKEN_DO?: DurableObjectNamespace;
-  TOKEN_KEK?: string;
+  TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
+  // Versioned KEK ring (P3): current + optional previous, for token + snapshot stores.
+  TOKEN_KEK_CURRENT?: string;
+  TOKEN_KEK_PREV?: string;
+  SNAPSHOT_KEK_CURRENT?: string;
+  SNAPSHOT_KEK_PREV?: string;
+  // Credential mode (P6) + mode ceilings (P5). All optional in P0.
+  SERVICENOW_CREDENTIAL_MODE?: "per_user_oauth" | "integration_user";
+  TENANT_MAX_MODE?: Mode;
+  INSTANCE_MAX_MODE?: Mode;
   // Dev Basic-Auth fallback (mirrors .dev.vars) + ROPC creds reused by the OAuth path.
   SNOW_DEV_ROPC_USERNAME?: string;
   SNOW_DEV_ROPC_PASSWORD?: string;

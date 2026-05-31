@@ -36,6 +36,9 @@ const app = await alchemy("servicenow-codemode-mcp", {
 // Adopt the KV namespaces already created in the account (by title).
 const SCHEMA_KV = await KVNamespace("SCHEMA_KV", { title: "servicenow-codemode-SCHEMA_KV", adopt: true });
 const OAUTH_KV = await KVNamespace("OAUTH_KV", { title: "servicenow-codemode-OAUTH_KV", adopt: true });
+// Host audit (§7.2) + recovery snapshots (§7.7). Created on first deploy (adopt: true).
+const AUDIT_KV = await KVNamespace("AUDIT_KV", { title: "servicenow-codemode-AUDIT_KV", adopt: true });
+const SNAPSHOT_KV = await KVNamespace("SNAPSHOT_KV", { title: "servicenow-codemode-SNAPSHOT_KV", adopt: true });
 
 export const worker = await Worker("servicenow-codemode-mcp", {
   // Explicit script name → clean URL `servicenow-mcp.<subdomain>.workers.dev`
@@ -50,6 +53,8 @@ export const worker = await Worker("servicenow-codemode-mcp", {
     LOADER: WorkerLoader(),
     SCHEMA_KV,
     OAUTH_KV,
+    AUDIT_KV,
+    SNAPSHOT_KV,
     AUTH_DO: DurableObjectNamespace("AUTH_DO", { className: "AuthCorrelationDO", sqlite: true }),
     TOKEN_DO: DurableObjectNamespace("TOKEN_DO", { className: "TokenStoreDO", sqlite: true }),
     BUDGET_DO: DurableObjectNamespace("BUDGET_DO", { className: "BudgetDO", sqlite: true }),
@@ -59,6 +64,11 @@ export const worker = await Worker("servicenow-codemode-mcp", {
     SNOW_INSTANCE_HOST: reqEnv("SNOW_INSTANCE_HOST"),
     ...(process.env.SNOW_OAUTH_CLIENT_ID ? { SNOW_OAUTH_CLIENT_ID: process.env.SNOW_OAUTH_CLIENT_ID } : {}),
     ...(process.env.SNOW_EXECUTOR_PATH ? { SNOW_EXECUTOR_PATH: process.env.SNOW_EXECUTOR_PATH } : {}),
+    // Optional config knobs (P0; consumed in P5/P6). Plain bindings, never required.
+    ...(process.env.SERVICENOW_CREDENTIAL_MODE ? { SERVICENOW_CREDENTIAL_MODE: process.env.SERVICENOW_CREDENTIAL_MODE } : {}),
+    ...(process.env.ALLOW_LOCALHOST ? { ALLOW_LOCALHOST: process.env.ALLOW_LOCALHOST } : {}),
+    ...(process.env.TENANT_MAX_MODE ? { TENANT_MAX_MODE: process.env.TENANT_MAX_MODE } : {}),
+    ...(process.env.INSTANCE_MAX_MODE ? { INSTANCE_MAX_MODE: process.env.INSTANCE_MAX_MODE } : {}),
 
     // Secrets (encrypted in Alchemy state; uploaded as Worker secrets)
     MCP_OPERATOR_SECRET: alchemy.secret(reqEnv("MCP_OPERATOR_SECRET")),
@@ -69,6 +79,12 @@ export const worker = await Worker("servicenow-codemode-mcp", {
     OAUTH_PROVIDER_SECRET: alchemy.secret(reqEnv("OAUTH_PROVIDER_SECRET")),
     ...(process.env.SNAPSHOT_KEK ? { SNAPSHOT_KEK: alchemy.secret(process.env.SNAPSHOT_KEK) } : {}),
     ...(process.env.SNOW_OAUTH_CLIENT_SECRET ? { SNOW_OAUTH_CLIENT_SECRET: alchemy.secret(process.env.SNOW_OAUTH_CLIENT_SECRET) } : {}),
+    // Versioned KEK ring (P3). Optional until P3 provisions them; never reqEnv yet so the
+    // deploy doesn't break before they exist. P3 flips its own secret to required at its gate.
+    ...(process.env.TOKEN_KEK_CURRENT ? { TOKEN_KEK_CURRENT: alchemy.secret(process.env.TOKEN_KEK_CURRENT) } : {}),
+    ...(process.env.TOKEN_KEK_PREV ? { TOKEN_KEK_PREV: alchemy.secret(process.env.TOKEN_KEK_PREV) } : {}),
+    ...(process.env.SNAPSHOT_KEK_CURRENT ? { SNAPSHOT_KEK_CURRENT: alchemy.secret(process.env.SNAPSHOT_KEK_CURRENT) } : {}),
+    ...(process.env.SNAPSHOT_KEK_PREV ? { SNAPSHOT_KEK_PREV: alchemy.secret(process.env.SNAPSHOT_KEK_PREV) } : {}),
   },
 });
 

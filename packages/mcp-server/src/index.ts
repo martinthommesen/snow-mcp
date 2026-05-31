@@ -16,6 +16,10 @@ export interface Env {
   LOADER: WorkerLoader;
   SCHEMA_KV: KVNamespace;
   OAUTH_KV: KVNamespace;
+  // Host audit trail (§7.2) + recovery snapshots (§7.7). Declared optional in P0;
+  // consumed once their flows are wired (P4). Worker treats absence as "not durable".
+  AUDIT_KV?: KVNamespace;
+  SNAPSHOT_KV?: KVNamespace;
   AUTH_DO: DurableObjectNamespace;
   TOKEN_DO: DurableObjectNamespace;
   BUDGET_DO: DurableObjectNamespace;
@@ -28,9 +32,19 @@ export interface Env {
   SNOW_OAUTH_CLIENT_ID?: string;
   SNOW_OAUTH_CLIENT_SECRET?: string;
   X_MCP_EXECUTOR_HMAC_KEY?: string;
-  TOKEN_KEK?: string;
+  TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
   OAUTH_PROVIDER_SECRET?: string;
-  SNAPSHOT_KEK?: string;
+  SNAPSHOT_KEK?: string; // one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
+  // Versioned KEK ring (P3): current + optional previous, for both token + snapshot stores.
+  TOKEN_KEK_CURRENT?: string;
+  TOKEN_KEK_PREV?: string;
+  SNAPSHOT_KEK_CURRENT?: string;
+  SNAPSHOT_KEK_PREV?: string;
+  // Credential mode (P6) + ceilings (P5) + origin gate (P6a). All optional in P0.
+  SERVICENOW_CREDENTIAL_MODE?: "per_user_oauth" | "integration_user";
+  ALLOW_LOCALHOST?: string;
+  TENANT_MAX_MODE?: Mode;
+  INSTANCE_MAX_MODE?: Mode;
 }
 
 function originConfig(env: Env): OriginConfig {

@@ -16,8 +16,20 @@ SNOW_DEV_ROPC_PASSWORD=""
 OAUTH_PROVIDER_SECRET=""             # signing/encryption secret for @cloudflare/workers-oauth-provider
 
 # --- Encryption keys (§2.7, §7.7) ---
-TOKEN_KEK=""                         # AES-256-GCM key-encryption-key for TokenStoreDO token envelopes
-SNAPSHOT_KEK=""                      # AES-256-GCM KEK for recovery snapshots (§7.7)
+TOKEN_KEK=""                         # one-release alias for TOKEN_KEK_CURRENT (P3 migration)
+SNAPSHOT_KEK=""                      # one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
+# Versioned KEK ring (P3): set CURRENT = today's passphrase on first deploy; rotate later by
+# moving CURRENT -> PREV and setting a new CURRENT (both decrypt during the window).
+TOKEN_KEK_CURRENT=""                 # AES-256-GCM KEK for TokenStoreDO token envelopes (current)
+TOKEN_KEK_PREV=""                    # accepted during a rotation window (optional)
+SNAPSHOT_KEK_CURRENT=""              # AES-256-GCM KEK for recovery snapshots (current)
+SNAPSHOT_KEK_PREV=""                 # accepted during a rotation window (optional)
+
+# --- Mode / credential config (P5/P6) ---
+SERVICENOW_CREDENTIAL_MODE=""        # "per_user_oauth" | "integration_user" (default integration_user)
+TENANT_MAX_MODE=""                   # mode ceiling: read_only | write | admin_script (default admin_script)
+INSTANCE_MAX_MODE=""                 # mode ceiling: read_only | write | admin_script (default admin_script)
+ALLOW_LOCALHOST=""                   # "true" to allow http://localhost Origin (dev only; default false)
 
 # --- Executor actor-signing HMAC (§2.0) ---
 # Mirror this value to the ServiceNow property `x_mcp.executor.hmac_secret` on the instance.
