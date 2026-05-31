@@ -23,7 +23,13 @@ function dv(k) {
   }
 }
 const host = dv("SNOW_INSTANCE_HOST");
-const basic = "Basic " + Buffer.from(`${dv("SNOW_DEV_ROPC_USERNAME")}:${dv("SNOW_DEV_ROPC_PASSWORD")}`).toString("base64");
+// Table/index DDL (sys_db_object/sys_dictionary/sys_index) requires admin rights the ROPC
+// service account usually lacks (it 403s on table creation). Allow an admin-credential
+// OVERRIDE via env for the install run ONLY — not persisted to .dev.vars:
+//   SNOW_ADMIN_USER=admin SNOW_ADMIN_PASS='...' node scripts/executor-install.mjs
+const installUser = process.env.SNOW_ADMIN_USER || dv("SNOW_DEV_ROPC_USERNAME");
+const installPass = process.env.SNOW_ADMIN_PASS || dv("SNOW_DEV_ROPC_PASSWORD");
+const basic = "Basic " + Buffer.from(`${installUser}:${installPass}`).toString("base64");
 const keyB64 = dv("X_MCP_EXECUTOR_HMAC_KEY");
 
 async function api(method, path, body) {
