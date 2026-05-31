@@ -53,5 +53,9 @@ npx alchemy deploy      # reads .dev.vars; provisions Worker + bindings; prints 
   grant was live-verified **pre-hardening** (B9); the per-user dance is re-verified in P8.
 - Coordinated redeploy: P7's signed-`reason` canonical is a breaking payload change — deploy the
   Worker and reinstall the executor **together** (both or neither), and point `SNOW_EXECUTOR_PATH`
-  at the scoped `/api/x_1793136_mcp/...` endpoint.
+  at the literal two-segment scoped path **`/api/x_1793136_mcp/x_mcp/executor/run`** (namespace
+  `x_1793136_mcp` + service `x_mcp`). NOT the numeric `/api/1793136/x_mcp/...` form (a deprecated
+  global endpoint that bypassed verification — retired in P8) and NOT the one-segment
+  `/api/x_1793136_mcp/executor/run` (404s). ✅ Live-verified 2026-05-31: `deploy:e2e` 13/13 and
+  `executor-scoped-verify.mjs` 13/13 through the scoped endpoint.
 - Move off the Basic-Auth dev path to `per_user_oauth` for multi-user deployments.

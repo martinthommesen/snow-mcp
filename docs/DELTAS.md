@@ -136,24 +136,35 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
 - **Instance claim enforced (executor).** The verifier rejects a payload whose signed
   `actor.instance` does not name this instance (cross-instance replay → clean 401). The host
   already signed `instance`; the executor now compares it.
-- **Live nonce store = the DB-unique-indexed GLOBAL `x_mcp_nonce` table, INSERT-as-arbiter.**
-  The production verifier is the GLOBAL core (`new Function` + `GlideCertificateEncryption` are
-  global-only, D11). Its `_consumeNonce` does a bare INSERT into `x_mcp_nonce` and treats a
-  duplicate (insert returns falsy OR the unique-constraint violation) as a replay → reject,
-  closing the prior TOCTOU check-then-insert race. The concurrency arbiter is a **DB-enforced
-  unique index** on the value column (a `sys_index` record) + a global nonce-purge job. The
-  scoped `x_1793136_mcp_nonce` + its index/purge are **reserved/unused by the global core**
-  (kept for a possible future scoped-hosted verifier).
-- **`executor-install.mjs` = global-helper-only by default; global-REST endpoint DEPRECATED +
-  gated off.** The installer installs ONLY the global `x_mcp_verify` helper + its
-  tables/unique-index/purge/properties by default. The deprecated HMAC-only global-REST endpoint
-  (no role ACL — a second un-ACL'd executor surface) is gated behind `X_MCP_INSTALL_GLOBAL_REST=1`
-  (default OFF). The canonical surface is the scoped, role-ACL-gated Fluent REST
-  (`/api/x_1793136_mcp/x_mcp/executor/run`).
+- **Live nonce store = the DB-unique-indexed SCOPED `x_1793136_mcp_nonce` table, INSERT-as-arbiter
+  in the WRAPPER.** (Reconciled 2026-05-31 — supersedes an earlier draft that placed
+  `_consumeNonce` in the global core against a global `x_mcp_nonce` table; that never shipped, HEAD
+  `8c6e1fd` moved consumption to the scoped wrapper, confirmed live.) The scoped wrapper
+  (`x_mcp_executor.js`) delegates HMAC verify + `new Function` eval to the GLOBAL `x_mcp_verify`
+  core (global-only primitives, D11) — that core does **verify()/execute()/run() only, no nonce,
+  no DB write**. The wrapper itself does a bare INSERT into the **scoped `x_1793136_mcp_nonce`**
+  between verify() and execute(); a duplicate (falsy insert OR unique-constraint violation) is a
+  replay → 401. Arbiter = the scoped table's **DB unique index** on `value` (✅ live-verified via
+  the CONCURRENT one-200/one-401 case). now-sdk 4.7.1 creates the physical index but omits the
+  `sys_index` catalog row — index enforces while `sys_index` reads empty; verify functionally.
+- **`executor-install.mjs` = global verify()/execute()/run() CORE + properties ONLY (no tables,
+  no REST endpoint).** The global-REST endpoint is deprecated (gated behind
+  `X_MCP_INSTALL_GLOBAL_REST=1`, default OFF). The canonical surface is the scoped, role-ACL-gated
+  Fluent REST at the two-segment path **`/api/x_1793136_mcp/x_mcp/executor/run`**.
+  **P8 finding (2026-05-31):** a global numeric endpoint `/api/1793136/x_mcp/executor/run` from an
+  *earlier* install had survived and was LIVE — and its verify reject branch was dead code
+  (`if (!new x_mcp_verify().verify(...))` is always false because `verify()` returns an object), so
+  it executed every request with no signature check and no role ACL. `SNOW_EXECUTOR_PATH` had used
+  that numeric form, so the Worker routed through it (the all-green e2e masked it — only the valid
+  path is exercised). Fixed: repoint `SNOW_EXECUTOR_PATH` to the scoped two-segment path; delete
+  the global op + definition (keep the shared global core); `executor-scoped-verify.mjs` now
+  asserts the numeric path is dead (S8b) to lock the regression.
 - **now-sdk 4.7.1 `run_period` `'[object Object]'` ScheduledScript serializer bug.** The SDK's
-  ScheduledScript serializer emits `'[object Object]'` for a structured `run_period`; it affects
-  ONLY the scoped, functionally-unused `MCP Nonce Purge` job (manual P8 `run_period` fixup) — NOT
-  the REST-installed global purge job (whose `run_period` is a plain string).
+  ScheduledScript serializer emits `'[object Object]'` for a structured `run_period`. This affects
+  the scoped `MCP Nonce Purge` job — which is the LIVE purge for the scoped `x_1793136_mcp_nonce`
+  table (not "unused"; there is no global purge job — `executor-install.mjs` creates no tables).
+  Set its interval once in the UI (System Definition → Scheduled Jobs). Replay protection does not
+  depend on the purge — only unbounded table growth does — so this is a hygiene fixup, not a gate.
 - **Content-addressed versioned KEK ring (P3).** `buildKekRing(currentSecret, prevSecret?)` with
   version labels `kek-${sha256(keyBytes)[:8]}`, so a same-label rotation can no longer mask the
   previous key. Threaded for both the token ring (`handlers.ts`) and the snapshot ring (P4).

@@ -50,41 +50,60 @@ the full chain is re-proven live. The specific gates:
    subdomain (e.g. `dev374488`) on the PDI.
 2. **`GlideDigest` SHA-256 UTF-8 encoding** — confirm `getSHA256Base64` hashes the **UTF-8** bytes
    of the script (the `script_sha256` seam, 0.13a); a UTF-16/Latin-1 hash breaks non-ASCII scripts.
-3. **`x_mcp_nonce` unique-index DB enforcement** — the INSERT-as-arbiter race-close is **inert
-   without the DB-enforced unique index**. Confirm a concurrent duplicate `value` INSERT is
-   actually REJECTED (not merely that the `sys_index` row exists).
+3. **`x_1793136_mcp_nonce` unique-index DB enforcement** — the INSERT-as-arbiter race-close is
+   **inert without the DB-enforced unique index**. Confirm a concurrent duplicate `value` INSERT is
+   actually REJECTED (not merely that the `sys_index` row exists). ✅ VERIFIED 2026-05-31: the
+   scoped-verify CONCURRENT case returns one-200/one-401 across repeated runs (the wrapper has no
+   SELECT-before-INSERT, so a 401-loser can only come from a unique-constraint INSERT failure).
+   NOTE: now-sdk 4.7.1 creates the physical DDL index but does **not** write the `sys_index`
+   catalog row — so the index enforces yet `sys_index` reads empty. Verify enforcement
+   functionally (CONCURRENT), never by the catalog row alone.
 4. **Coordinated host + executor redeploy** — the signed canonical changed (6 keys incl. `reason`);
    a half-redeploy = total signature mismatch.
-5. **`SNOW_EXECUTOR_PATH`** must point at the scoped `/api/x_1793136_mcp/...` endpoint.
+5. **`SNOW_EXECUTOR_PATH`** must be the literal two-segment scoped path
+   **`/api/x_1793136_mcp/x_mcp/executor/run`** (namespace `x_1793136_mcp` + service `x_mcp`).
+   The one-segment form `/api/x_1793136_mcp/executor/run` 404s, and the numeric form
+   `/api/1793136/x_mcp/executor/run` was a deprecated **global** endpoint that bypassed signature
+   verification — now retired (see "Nonce replay store" below). ✅ VERIFIED 2026-05-31.
 6. **Per-user OAuth authorize/callback live dance** (`oauth-verify.mjs`) — authorize → callback →
    token stored/reused/refreshed; `reauth_required` when absent.
 7. **KEK rotation drill** — deploy with `TOKEN_KEK_CURRENT`=current passphrase → existing tokens
    still decrypt; simulate rotation (current→prev, new current) → no outage.
 
-## Nonce replay store — live target (P7 finding 24)
+## Nonce replay store — live architecture (P7 finding 24; reconciled 2026-05-31)
 
-The production verifier is the **GLOBAL `x_mcp_verify` core** installed by
-`scripts/executor-install.mjs` (`new Function` + `GlideCertificateEncryption` are global-only,
-DELTAS D11). Its `_consumeNonce` does a bare `INSERT` into the **GLOBAL `x_mcp_nonce` table** and
-treats a duplicate (insert returns falsy OR throws the constraint violation) as a replay. The
-**concurrency arbiter is a DB-enforced UNIQUE INDEX on the value column**, installed as a
-`sys_index` record (mirroring the now-sdk's own output for the scoped table, where the column
-dictionary's `unique` stays false and the index lives in a separate `sys_index`). The installer
-also creates a **`sysauto_script` nonce-purge job** (15-min cadence, 1-hour TTL >> the 120s
-freshness window); that REST-installed job's `run_period` is a plain string, so it is **not**
-affected by the now-sdk 4.7.1 `'[object Object]'` ScheduledScript serializer bug.
+> Supersedes an earlier draft of this section that placed nonce consumption in the global core
+> against a global `x_mcp_nonce` table. That design never shipped: HEAD `8c6e1fd` moved single-use
+> consumption into the **scoped wrapper**, and the live instance confirms it. The text below is
+> the verified live architecture.
 
-The scoped Fluent `x_1793136_mcp_nonce` table + its unique index + its `MCP Nonce Purge`
-ScheduledScript (in `x_mcp.now.ts`) are **reserved/unused by the live core** — kept for a
-possible future scoped-hosted verifier. The now-sdk 4.7.1 serializer bug (P8 manual `run_period`
-fixup) applies only to that scoped, **functionally-unused** ScheduledScript — it is NOT a
-functional blocker for the live purge.
+The request path is the **scoped, role-ACL-gated Fluent wrapper** at
+`/api/x_1793136_mcp/x_mcp/executor/run` (`sn-executor-app/fluent/src/server/x_mcp_executor.js`).
+Its order is: audit → kill → egress → size/413 → **verify → consume-nonce → execute**. HMAC verify
++ `new Function` eval are delegated to the **GLOBAL `x_mcp_verify` core** (those primitives are
+global-only, DELTAS D11), but that core does **verify()/execute()/run() ONLY — no nonce, no DB
+write**. SINGLE-USE NONCE consumption is owned by the wrapper, which does a bare `INSERT` into the
+**scoped `x_1793136_mcp_nonce` table** between verify() and execute() and treats a duplicate
+(falsy insert OR thrown unique-constraint violation) as a replay → 401. Consuming AFTER verify
+means a forged request never burns a nonce; BEFORE execute means a replay never double-executes.
 
-**P8-LIVE GATE (cannot run here):** the race-close is correct **only if** the `x_mcp_nonce` value
-unique index is DB-enforced. The `_consumeNonce` INSERT-as-arbiter logic is inert without that
-constraint, so the live gate is: **confirm a concurrent duplicate `value` INSERT is actually
-REJECTED** (not merely that the `sys_index` row exists) on a live PDI. The global nonce-purge
-`sysauto_script` is likewise new Table-API DDL to verify live.
+The **concurrency arbiter is the scoped table's DB UNIQUE INDEX on `value`** (declared in
+`x_mcp.now.ts`). ✅ VERIFIED live 2026-05-31 via the scoped-verify CONCURRENT case (one-200/
+one-401, repeatable). CAVEAT: now-sdk 4.7.1 creates the **physical** index but does not write the
+`sys_index` catalog row — so enforcement is real while `sys_index` reads empty; verify
+functionally, not by the catalog row. Bounding the table is the scoped `MCP Nonce Purge`
+ScheduledScript (`x_mcp.now.ts`), still subject to the now-sdk 4.7.1 `run_period`
+`'[object Object]'` serializer bug → set its interval once in the UI (TTL >> the 120s freshness
+window; replay protection works regardless — only purge is deferred until set).
+
+**RETIRED — global shadow endpoint (P8 root cause):** a deprecated GLOBAL numeric REST endpoint
+`/api/1793136/x_mcp/executor/run` (no role ACL) had survived an earlier `executor-install` run.
+Its verify reject branch was dead code (`if (!new x_mcp_verify().verify(...))` — `verify()` returns
+an object, so `!obj` is always false), so it executed **every** request with no signature check.
+`SNOW_EXECUTOR_PATH` had used the numeric form, so the Worker routed through it (the all-green e2e
+masked this — it only exercises the valid path). Fixed by repointing `SNOW_EXECUTOR_PATH` to the
+scoped two-segment path and deleting the global op + definition (the shared global *core* stays).
+`scripts/executor-scoped-verify.mjs` now asserts the numeric path is dead (S8b) to lock the regression.
 
 ## Fluent toolchain audit residual (P7 — `sn-executor-app/fluent`)
 

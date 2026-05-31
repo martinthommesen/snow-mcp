@@ -73,14 +73,13 @@ build):
       ASCII-canonical payload (now **6-key incl. signed `reason`**). Byte-identical canonical
       confirmed across host + all 3 executor cores via a Node harness; the **live** HMAC match +
       `GlideDigest` SHA-256 UTF-8 encoding are P8 gates.
-- [~] **S16** cross-scope reach · **T8** nonce replay (now DB-unique-index INSERT-as-arbiter on
-      `x_mcp_nonce`, not the old TOCTOU check-then-insert — the race-close is provable only with
-      the live unique index) · **S9** kill switch (audit-first) · **B6** over-cap output — all
-      re-verified in P8.
-- [~] **NEW P8 cases:** instance-claim mismatch → 401; signed+audited `reason`; null-MAC → clean
-      401; size/kill before nonce-consume; cooperative-timeout/quota.
-- [~] **FULL CHAIN** re-proven in P8 (`deploy:e2e` + `executor-scoped-verify.mjs` against the
-      scoped `/api/x_1793136_mcp/...` endpoint; set `SNOW_EXECUTOR_PATH` accordingly).
+- [x] **S16** cross-scope reach · **T8** nonce replay (DB-unique-index INSERT-as-arbiter on the
+      SCOPED `x_1793136_mcp_nonce`) · **S9** kill switch (audit-first) · **B6** over-cap output —
+      ✅ verified live 2026-05-31 (CONCURRENT one-200/one-401 proves the race-close arbiter).
+- [x] **NEW P8 cases:** instance-claim mismatch → 401; signed+audited `reason`; null-MAC → clean
+      401; size/kill before nonce-consume — ✅ all green in `executor-scoped-verify.mjs` (13/13).
+- [x] **FULL CHAIN** proven 2026-05-31 (`deploy:e2e` 13/13 + `executor-scoped-verify.mjs` 13/13)
+      against the scoped two-segment endpoint **`/api/x_1793136_mcp/x_mcp/executor/run`**.
 
 ## Also done: Phase 1.3 token store + S18
 
@@ -89,9 +88,11 @@ build):
 - [x] §7.7/S18 recoverability classifier (reversible/soft-delete/non-recoverable) + delete-gating
 
 Deltas (recorded in DELTAS): global-scope Scripted REST APIs get a **numeric namespace**
-(`/api/1793136/x_mcp/...`); custom tables can't be created via Table API, so this REST
-install uses `syslog` (audit) + `sys_user_preference` (nonce) — the **production scoped app
-ships the real `x_mcp_audit_log`/`x_mcp_nonce` tables + role ACL via a Studio update set**.
+(`/api/1793136/x_mcp/...`); custom tables can't be created via Table API, so that deprecated REST
+install used `syslog` (audit) + a global nonce store. **That global numeric endpoint is RETIRED
+(P8, 2026-05-31)** — it bypassed verification (dead reject branch) and had no role ACL. The
+**production surface is the scoped Fluent app** at `/api/x_1793136_mcp/x_mcp/executor/run`, which
+ships the real `x_1793136_mcp_audit_log` / `x_1793136_mcp_nonce` tables + role ACL.
 
 ## Remaining (refinements / GA)
 
@@ -105,13 +106,20 @@ ships the real `x_mcp_audit_log`/`x_mcp_nonce` tables + role ACL via a Studio up
       dance + SN-principal endpoint shape re-verified in P8.
 - [ ] GA gate (§7): sub-production instance (not a PDI), pre-1.0 dependency exit.
 
-### Open-pending-live (P8 gates — cannot run here)
+### Open-pending-live (P8 gates) — VERIFIED LIVE 2026-05-31 on dev374488
 
-- [ ] Coordinated host+executor redeploy (the P7 breaking payload change), then re-run
-      `deploy:e2e` + `executor-scoped-verify.mjs` + `oauth-verify.mjs` + the KEK rotation drill.
-- [ ] `instance_name` property shape (fail-closed); `GlideDigest` SHA-256 UTF-8 encoding (0.13a);
-      `x_mcp_nonce` unique-index DB enforcement (the replay-race arbiter).
-- [ ] `SNOW_EXECUTOR_PATH` points at the scoped `/api/x_1793136_mcp/...` endpoint.
+- [x] Coordinated host+executor redeploy (the P7 breaking payload change): `deploy:e2e` 13/13,
+      `executor-scoped-verify.mjs` 13/13 (forged/empty/null/garbage/instance/tamper → 401, valid →
+      200, CONCURRENT one-200/one-401). KEK rotation drill + `oauth-verify.mjs` still pending.
+- [x] `GlideDigest` SHA-256 UTF-8 (0.13a) + `instance_name` shape: implicitly confirmed — a genuine
+      signed request validates end-to-end (valid → 200), which requires correct hash + instance
+      match + freshness + canonical (incl. the `reason` last-key). `x_1793136_mcp_nonce`
+      unique-constraint enforcement confirmed functionally (CONCURRENT); see GA_CHECKLIST note on
+      the now-sdk 4.7.1 `sys_index`-catalog gap (physical index enforces; catalog row absent).
+- [x] `SNOW_EXECUTOR_PATH` points at the scoped endpoint — the literal two-segment path
+      **`/api/x_1793136_mcp/x_mcp/executor/run`**. (P8 root cause: it had used the numeric global
+      form `/api/1793136/x_mcp/executor/run`, a deprecated endpoint that bypassed verify — now
+      retired; see GA_CHECKLIST "Nonce replay store" / DELTAS.)
 
 ## The wall (historical) — what needed credentials / accounts
 

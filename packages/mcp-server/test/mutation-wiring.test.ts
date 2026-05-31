@@ -70,7 +70,7 @@ function rpc(opts: {
     actorPolicy: permissivePolicy([INSTANCE]),
     runBudget: new RunBudget(),
     mutation: opts.mutation,
-    ...(opts.signing ? { signing: SIGNING, executorPath: "/api/x_1793136_mcp/executor/run" } : {}),
+    ...(opts.signing ? { signing: SIGNING, executorPath: "/api/x_1793136_mcp/x_mcp/executor/run" } : {}),
   });
 }
 
@@ -430,7 +430,7 @@ describe("§6b runServerScript binds the resolved effective-user sys_id into the
         now: SIGNING.now,
         ...(resolver ? { resolveEffectiveUserSysId: resolver } : {}),
       },
-      executorPath: "/api/x_1793136_mcp/executor/run",
+      executorPath: "/api/x_1793136_mcp/x_mcp/executor/run",
       mutation: mutationDeps({ runContext: { requestId: "r-eff", runKey: "k1", reason: "rotate" } }),
     });
     return { rpc: r, http };

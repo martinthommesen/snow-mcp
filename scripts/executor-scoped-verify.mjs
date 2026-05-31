@@ -76,6 +76,20 @@ await new Promise((r) => setTimeout(r, 2000));
   check("S8 — REST_Endpoint ACL requires x_1793136_mcp.executor and API enforces it", Boolean(acl?.active === "true" && hasRole && wsAcl?.enforce_acl), `(acl=${!!acl}, role=${hasRole}, enforce=${!!wsAcl?.enforce_acl})`);
 }
 
+// S8b — SHADOW-ENDPOINT REGRESSION LOCK (P8 root cause). A deprecated GLOBAL numeric endpoint
+// POST /api/1793136/x_mcp/executor/run had survived an earlier install; its verify() reject branch
+// was DEAD CODE (`if (!new x_mcp_verify().verify(...))` — verify() returns an object, so `!obj`
+// is always false), so it executed every request with NO signature check and NO role ACL. The
+// Worker hit it because SNOW_EXECUTOR_PATH used the numeric form. It has been retired (op + def
+// deleted). Assert it STAYS dead: an unsigned POST must not execute (route gone => 400/404, never
+// 200). No other test guards this path — the bug was invisible because everything else hits the
+// scoped wrapper. Re-arming X_MCP_INSTALL_GLOBAL_REST=1 or any leftover global op trips this.
+{
+  const r = await api("POST", "/api/1793136/x_mcp/executor/run", { script: "return 1;", actor: {}, actor_sig: "" });
+  check("S8b — GLOBAL numeric shadow endpoint is RETIRED (/api/1793136/x_mcp/executor/run is dead)",
+    r.status === 404 || r.status === 400, `(status ${r.status} — must be 404/400, never 200)`);
+}
+
 // Assign the role to admin (so the broad-identity call is also role-authorized), then execute.
 await api("POST", "/api/now/table/sys_user_has_role", { user: adminId, role: roleId });
 await new Promise((r) => setTimeout(r, 3000)); // role-cache propagation

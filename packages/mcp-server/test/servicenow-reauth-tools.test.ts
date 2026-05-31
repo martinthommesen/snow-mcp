@@ -98,7 +98,7 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
       SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
       // Executor signing wiring so runServerScript reaches signing.resolveEffectiveUserSysId().
       X_MCP_EXECUTOR_HMAC_KEY: btoa(String.fromCharCode(...new Uint8Array(32).fill(7))),
-      SNOW_EXECUTOR_PATH: "/api/x_1793136_mcp/executor/run",
+      SNOW_EXECUTOR_PATH: "/api/x_1793136_mcp/x_mcp/executor/run",
     };
   }
   const resolveAuth = {
@@ -130,7 +130,7 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
         return new Response(JSON.stringify({ result: [{ "role.name": "itil" }, { "role.name": "catalog_admin" }] }), { headers: { "content-type": "application/json" } });
       }
       // The signed executor POST — capture its body and ack.
-      if (url.includes("/api/x_1793136_mcp/executor/run")) {
+      if (url.includes("/api/x_1793136_mcp/x_mcp/executor/run")) {
         postBody = JSON.parse(String(init?.body));
         return new Response(JSON.stringify({ result: { ok: true } }), { headers: { "content-type": "application/json" } });
       }
