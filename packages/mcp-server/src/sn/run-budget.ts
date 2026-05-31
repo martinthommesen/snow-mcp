@@ -11,6 +11,19 @@ export interface RunBudgetLimits {
   attachmentBytes: number;
 }
 
+/**
+ * Per-actor row/byte ceilings (plan §P5). Sourced from ActorPolicy.maxRowsPerRun /
+ * maxBytesPerRun — formerly DEAD fields (set, never read; CODE_REVIEW finding 11). There
+ * is no `config.BUDGETS.perRun` operand for rows/bytes, so these are the SOLE per-run row
+ * /byte caps (the literal "min(config, policy)" reduces to policy-only here). Default to
+ * Number.POSITIVE_INFINITY so an unconfigured (permissive) RunBudget never trips — matching
+ * the legacy observability-only behavior callers rely on.
+ */
+export interface RunBudgetCaps {
+  maxRows?: number;
+  maxBytes?: number;
+}
+
 export class RunBudget {
   rpcCalls = 0;
   serviceNowRequests = 0;
@@ -18,9 +31,13 @@ export class RunBudget {
   bytesReturned = 0;
   attachmentBytes = 0;
   private readonly limits: RunBudgetLimits;
+  private readonly maxRows: number;
+  private readonly maxBytes: number;
 
-  constructor(limits: RunBudgetLimits = BUDGETS.perRun) {
+  constructor(limits: RunBudgetLimits = BUDGETS.perRun, caps: RunBudgetCaps = {}) {
     this.limits = limits;
+    this.maxRows = caps.maxRows ?? Number.POSITIVE_INFINITY;
+    this.maxBytes = caps.maxBytes ?? Number.POSITIVE_INFINITY;
   }
 
   /** One sandbox→host RPC dispatch. */
@@ -41,8 +58,26 @@ export class RunBudget {
     }
   }
 
+  /** Accrue rows returned to the snippet; ENFORCE the per-actor row ceiling (§P5,
+   *  CODE_REVIEW finding 11). Trips the P2 `budgetExceeded` host signal via `coded()`. */
   countRows(n: number): void {
     this.rowsReturned += n;
+    if (this.rowsReturned > this.maxRows) {
+      throw new McpToolError("budget_exceeded", `Per-run row limit (${this.maxRows}) exceeded.`, {
+        dimension: "rowsReturned",
+      });
+    }
+  }
+
+  /** Accrue serialized bytes returned to the snippet; ENFORCE the per-actor byte ceiling
+   *  (§P5, CODE_REVIEW finding 11). `bytesReturned` was formerly never incremented. */
+  countBytes(n: number): void {
+    this.bytesReturned += n;
+    if (this.bytesReturned > this.maxBytes) {
+      throw new McpToolError("budget_exceeded", `Per-run byte limit (${this.maxBytes}) exceeded.`, {
+        dimension: "bytesReturned",
+      });
+    }
   }
 
   countAttachmentBytes(n: number): void {

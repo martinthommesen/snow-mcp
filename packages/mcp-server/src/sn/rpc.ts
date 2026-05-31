@@ -17,6 +17,7 @@ import { mapServiceNowError, encodeSandboxError, McpToolError } from "./errors.j
 import { requireCapability } from "../config.js";
 import { TABLE_PAGE_CAP } from "../config.js";
 import { RunBudget } from "./run-budget.js";
+import { utf8Len } from "../sandbox/serialize.js";
 import {
   assertActorPolicy,
   applyRowFilter,
@@ -192,7 +193,9 @@ export class ServiceNowRPC {
 
     const raw = ((res.json as { result?: unknown[] }).result ?? []) as Record<string, unknown>[];
     const rows = raw.map((r) => maskRow(this.deps.actorPolicy, table, r));
+    // Per-run row + byte enforcement (§P5): measure the MASKED payload the snippet sees.
     this.deps.runBudget.countRows(rows.length);
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(rows)));
     return { rows, partial: rows.length >= limit };
   }
 
@@ -209,7 +212,12 @@ export class ServiceNowRPC {
     const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
     if (mapped) throw mapped;
     const row = (res.json as { result?: Record<string, unknown> }).result;
-    return row ? maskRow(this.deps.actorPolicy, table, row) : null;
+    if (!row) return null;
+    const masked = maskRow(this.deps.actorPolicy, table, row);
+    // Per-run row + byte enforcement (§P5): one row, measured on the masked payload.
+    this.deps.runBudget.countRows(1);
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(masked)));
+    return masked;
   }
 
   async aggregate(args: { table: string; query?: string; groupBy?: string[]; countField?: string }): Promise<unknown> {
@@ -229,7 +237,10 @@ export class ServiceNowRPC {
     const res = await this.deps.http.request({ method: "GET", path: `/api/now/stats/${encodeURIComponent(table)}`, query: q });
     const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
     if (mapped) throw mapped;
-    return (res.json as { result?: unknown }).result ?? null;
+    const result = (res.json as { result?: unknown }).result ?? null;
+    // Per-run byte enforcement (§P5): the serialized aggregate payload the snippet sees.
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result)));
+    return result;
   }
 
   // ── mutating / executor methods: capability-gated; integration mode signs the actor ──
@@ -249,7 +260,10 @@ export class ServiceNowRPC {
     if (!mutation) {
       // Read-only / unit contexts without the live safety wiring: enforce gates only.
       this.deps.runBudget.countServiceNowRequest();
-      return this.patchRow(table, sysId, fields);
+      const result = await this.patchRow(table, sysId, fields);
+      // Per-run byte enforcement (§P5): count the PATCH response (mirrors runServerScript).
+      this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result ?? null)));
+      return result;
     }
 
     const ordinal = ++this.ordinal;
@@ -289,7 +303,7 @@ export class ServiceNowRPC {
     // clean pre-send `budget_exceeded` (never misclassified as a post-send indeterminate).
     this.deps.runBudget.countServiceNowRequest();
 
-    return guardMutation<Record<string, unknown>>(
+    const result = await guardMutation<Record<string, unknown>>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -322,6 +336,12 @@ export class ServiceNowRPC {
         isIndeterminate: isPostSendUnknown,
       },
     );
+    // Per-run byte enforcement (§P5): count the PATCH response AFTER guardMutation resolves.
+    // Counting inside the effect closure would let a byte-cap throw classify as post-send
+    // unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and poison the
+    // ledger for a write that actually succeeded (same after-guard placement as runServerScript).
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result ?? null)));
+    return result;
   }
 
   /** Issue the PATCH and map the response. Shared by the guarded + unwired paths. */
@@ -390,7 +410,11 @@ export class ServiceNowRPC {
       // No live safety wiring (unit contexts) — sign + send only. No host runContext here;
       // the validated snippet reason is the only justification available.
       this.deps.runBudget.countServiceNowRequest();
-      return sendScript(args.reason);
+      const out = await sendScript(args.reason);
+      // Per-run byte enforcement (§P5): count the executor response. AFTER the send, never
+      // inside the effect, so a byte-cap trip can't be misclassified as post-send unknown.
+      this.deps.runBudget.countBytes(utf8Len(JSON.stringify(out ?? null)));
+      return out;
     }
 
     // run_code hard-requires a non-empty tool-level reason for admin_script (run_code.ts:68)
@@ -425,7 +449,7 @@ export class ServiceNowRPC {
     // Per-run SN-request budget for the executor POST — counted PRE-guard (clean pre-send).
     this.deps.runBudget.countServiceNowRequest();
 
-    return guardMutation<unknown>(
+    const result = await guardMutation<unknown>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -445,6 +469,12 @@ export class ServiceNowRPC {
         isIndeterminate: isPostSendUnknown,
       },
     );
+    // Per-run byte enforcement (§P5): count the executor response AFTER guardMutation
+    // resolves. Counting inside the effect closure would let a byte-cap throw classify as
+    // post-send unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and
+    // poison the ledger for a script that actually succeeded.
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result ?? null)));
+    return result;
   }
 
   // Encode the typed error code into the thrown message so it survives the sandbox

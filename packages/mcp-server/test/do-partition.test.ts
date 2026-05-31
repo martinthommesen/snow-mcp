@@ -46,16 +46,17 @@ describe("Phase 0.12 — BudgetDO global counter coordinates through ONE object"
     const ref1 = ns.get(ns.idFromName(day));
     const ref2 = ns.get(ns.idFromName(day)); // independent stub, SAME object
 
-    await ref1.increment("uniqueWorkers", 3);
-    const total = await ref2.increment("uniqueWorkers", 2); // sees ref1's increment
-    expect(total).toBe(5);
+    // §P5: increment now takes a dimension MAP (+ optional userId) and returns void; the
+    // global counter is read back via get(). Both refs see the SAME global object.
+    await ref1.increment({ uniqueWorkers: 3 });
+    await ref2.increment({ uniqueWorkers: 2 }); // sees ref1's increment
     expect(await ref1.get("uniqueWorkers")).toBe(5);
   });
 
   it("different date keys are independent objects", async () => {
     const ns = E.BUDGET_DO;
     const a = ns.get(ns.idFromName("2026-05-31"));
-    await a.increment("uniqueWorkers", 7);
+    await a.increment({ uniqueWorkers: 7 });
     const b = ns.get(ns.idFromName("2026-06-01"));
     expect(await b.get("uniqueWorkers")).toBe(0);
   });
@@ -86,6 +87,84 @@ describe("Phase 4.5 / S14 — BudgetDO atomic reserve-before-load (global cap)",
     const granted = results.filter((r) => r.ok).length;
     expect(granted).toBe(10);
     expect(await obj.get("uniqueWorkers")).toBe(10); // never over-committed
+  });
+});
+
+// ─── Phase P5 — BudgetDO global + per-user, atomic accrual, admission ──────────
+describe("Phase P5 — BudgetDO concurrent increments do not lose updates (mutex)", () => {
+  it("100 concurrent increments through one object all land (no lost read-check-write)", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-01"));
+    // increment() formerly had NO mutex (CODE_REVIEW finding 18) and raced reserveCritical,
+    // losing updates. With the promise-chain mutex, every increment must land.
+    await Promise.all(Array.from({ length: 100 }, () => obj.increment({ rowsReturned: 1 })));
+    expect(await obj.get("rowsReturned")).toBe(100);
+  });
+
+  it("concurrent reserve + increment on the same dimension never lose an update", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-02"));
+    const cap = { sandboxRpcCalls: 1_000_000 };
+    const ops: Promise<unknown>[] = [];
+    for (let i = 0; i < 50; i++) {
+      ops.push(obj.reserve({ sandboxRpcCalls: 1 }, cap));
+      ops.push(obj.increment({ sandboxRpcCalls: 1 }));
+    }
+    await Promise.all(ops);
+    // 50 reserves (+1 each) + 50 increments (+1 each) = 100, none lost to interleaving.
+    expect(await obj.get("sandboxRpcCalls")).toBe(100);
+  });
+});
+
+describe("Phase P5 — BudgetDO per-user isolation (global = sum of users)", () => {
+  it("per-user tallies are isolated and the global counter is their sum", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-03"));
+    await obj.increment({ rowsReturned: 30, bytesReturned: 300 }, "userA");
+    await obj.increment({ rowsReturned: 12, bytesReturned: 120 }, "userB");
+    // Per-user views are isolated.
+    expect(await obj.getUser("userA", "rowsReturned")).toBe(30);
+    expect(await obj.getUser("userB", "rowsReturned")).toBe(12);
+    expect(await obj.getUser("userA", "bytesReturned")).toBe(300);
+    // The GLOBAL counter is the enforced ceiling = sum across users (shared-fate).
+    expect(await obj.get("rowsReturned")).toBe(42);
+    expect(await obj.get("bytesReturned")).toBe(420);
+  });
+
+  it("reserve() also updates the per-user view in the same gate", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-04"));
+    await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 1 }, undefined, "userC");
+    expect(await obj.getUser("userC", "uniqueWorkers")).toBe(1);
+    expect(await obj.getUser("userC", "serviceNowRequests")).toBe(1);
+    expect(await obj.get("uniqueWorkers")).toBe(1);
+  });
+});
+
+describe("Phase P5 — BudgetDO daily rows/bytes admission check (tier 1)", () => {
+  it("denies the next run when the day's accrued rows are already at/over cap", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-05"));
+    const cap = { rowsReturned: 100 };
+    // Prior runs accrued rows to the cap (post-run accrual path).
+    await obj.increment({ rowsReturned: 100 });
+    // The NEXT run reserves only uniqueWorkers/requests (rows can't be pre-reserved), but the
+    // admission check must DENY it because the day is already at the rows cap.
+    const r = await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 1 }, cap, "userD");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.dimension).toBe("rowsReturned");
+    // Nothing was committed by the denied reserve.
+    expect(await obj.get("uniqueWorkers")).toBe(0);
+  });
+
+  it("admits the next run while the day is under the rows/bytes cap", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-06"));
+    const cap = { rowsReturned: 100, bytesReturned: 1000 };
+    await obj.increment({ rowsReturned: 99, bytesReturned: 999 });
+    const r = await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 1 }, cap, "userE");
+    expect(r.ok).toBe(true);
+    expect(await obj.get("uniqueWorkers")).toBe(1);
   });
 });
 

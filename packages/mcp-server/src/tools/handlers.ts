@@ -14,7 +14,8 @@ import { describeTable, listTables, type DiscoveryDeps } from "../sn/discovery.j
 import { permissivePolicy, type ActorPolicy } from "../authz/actor-policy.js";
 import { McpToolError, toToolResult } from "../sn/errors.js";
 import { RunBudget } from "../sn/run-budget.js";
-import { DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
+import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
+import { MODE_RISK } from "@servicenow-codemode/shared";
 import { SchemaCache } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
 import { getServiceNowBearer, type SnOAuthConfig } from "../auth/servicenow-oauth.js";
@@ -85,6 +86,21 @@ function utcDateKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/**
+ * Parse an env-supplied mode ceiling (§P5). An UNSET var defaults to `admin_script` to
+ * preserve today's behavior (no tenant/instance ceiling configured → scope is the cap). But a
+ * value that IS SET yet is not a valid Mode FAILS CLOSED to `read_only` (the most restrictive
+ * ceiling): an operator typo on a security ceiling must visibly lock the instance down, never
+ * silently grant the widest access. A minimal, safe membership check; the formal unknown-mode
+ * validator lands in P6a (effective-mode.ts).
+ */
+function parseMaxMode(value: string | undefined): Mode {
+  if (value === undefined) return "admin_script"; // unset → scope is the cap (no ceiling configured)
+  // OWN-property check (not `in`, which would let prototype keys like "toString" through).
+  // Set-but-invalid → fail closed to the most restrictive ceiling (loud operator typo, not silent widen).
+  return Object.prototype.hasOwnProperty.call(MODE_RISK, value) ? (value as Mode) : "read_only";
+}
+
 export interface AuthContext {
   /** Highest mode the client's OAuth scope permits (auth.props.maxMode, §2.0.1/§2.4). */
   scopeMaxMode: Mode;
@@ -138,13 +154,43 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     http = new NotConnectedHttpClient();
   }
 
-  const reserveDailyBudget = env.BUDGET_DO
-    ? async (): Promise<{ ok: boolean; dimension?: string }> => {
+  // BudgetDO accessor — ONE object per UTC day (global cap; §2.10/§P5). The per-user view is
+  // updated in the same input gate by passing `userId` to reserve()/increment().
+  const budgetObj = env.BUDGET_DO
+    ? () => {
         const ns = env.BUDGET_DO!;
-        const obj = ns.get(ns.idFromName(utcDateKey())) as unknown as {
-          reserve: (req: Record<string, number>) => Promise<{ ok: boolean; dimension?: string }>;
+        return ns.get(ns.idFromName(utcDateKey())) as unknown as {
+          reserve: (req: Record<string, number>, capOverride?: Record<string, number>, userId?: string) => Promise<{ ok: boolean; dimension?: string }>;
+          increment: (req: Record<string, number>, userId?: string) => Promise<void>;
         };
-        return obj.reserve({ uniqueWorkers: 1 });
+      }
+    : undefined;
+
+  // PRE-RUN reserve (§P5 tier 1): reserve a unique Worker AND one ServiceNow request slot,
+  // plus the daily rows/bytes ADMISSION check (BudgetDO denies the next run when the day is
+  // already over the rows/bytes cap). Per-user tally updated in the same gate via `userId`.
+  const reserveDailyBudget = budgetObj
+    ? async (): Promise<{ ok: boolean; dimension?: string }> =>
+        budgetObj().reserve({ uniqueWorkers: 1, serviceNowRequests: 1 }, undefined, userId)
+    : undefined;
+
+  // POST-RUN accrual (§P5 tier 3): fold the per-run actuals into the daily global + per-user
+  // counters. Called on every run_code exit path. The dimension names map RunBudget.snapshot()
+  // onto BudgetDimension; uniqueWorkers was already reserved pre-run (not re-accrued here).
+  const accrueDailyBudget = budgetObj
+    ? async (snapshot: Record<string, number>): Promise<void> => {
+        await budgetObj().increment(
+          {
+            sandboxRpcCalls: snapshot.rpcCalls ?? 0,
+            // reserveDailyBudget pre-committed serviceNowRequests:1; the snapshot already
+            // includes that slot, so accrue only the EXCESS to avoid double-counting (mirrors
+            // uniqueWorkers, which is reserved pre-run and excluded from accrual entirely).
+            serviceNowRequests: Math.max(0, (snapshot.serviceNowRequests ?? 0) - 1),
+            rowsReturned: snapshot.rowsReturned ?? 0,
+            bytesReturned: snapshot.bytesReturned ?? 0,
+          },
+          userId,
+        );
       }
     : undefined;
 
@@ -258,8 +304,15 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   const runCodeDeps: RunCodeDeps = {
     loader: env.LOADER,
     scopeMaxMode, // from the client's OAuth scope (§2.0.1)
-    tenantMaxMode: "admin_script", // no tenant ceiling configured; scope is the cap (ceilings: P5)
-    instanceMaxMode: "admin_script",
+    // Mode ceilings (§P5): env-configurable. UNSET defaults to admin_script (preserves today's
+    // "scope is the cap" behavior); a SET-but-invalid value fails closed to read_only — never
+    // widens the ceiling (parseMaxMode).
+    tenantMaxMode: parseMaxMode(env.TENANT_MAX_MODE),
+    instanceMaxMode: parseMaxMode(env.INSTANCE_MAX_MODE),
+    // Per-run budget meter carrying the actor's row/byte caps (§P5). The dead
+    // maxRowsPerRun/maxBytesPerRun policy fields now BITE here (permissivePolicy =
+    // MAX_SAFE_INTEGER, so they only bite under a restrictive policy — P6b).
+    makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun }),
     buildRpc: (effectiveMode: Mode, runBudget: RunBudget, runContext: RunContext) =>
       new ServiceNowRPC({
         http, instanceHost, effectiveMode, actorPolicy: policy, runBudget,
@@ -267,6 +320,7 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
         mutation: buildMutationDeps(runContext),
       }),
     ...(reserveDailyBudget ? { reserveDailyBudget } : {}),
+    ...(accrueDailyBudget ? { accrueDailyBudget } : {}),
   };
 
   function discoveryDeps(): DiscoveryDeps {

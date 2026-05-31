@@ -43,10 +43,28 @@ export interface RunCodeDeps {
    * production; optional so tests/unauthenticated boots can omit it.
    */
   reserveDailyBudget?: () => Promise<{ ok: boolean; dimension?: string }>;
+  /**
+   * Build the per-run budget meter (§P5). Handlers backs this with the actor's
+   * maxRowsPerRun/maxBytesPerRun caps from ActorPolicy; absent (tests/read-only boots) =>
+   * an uncapped RunBudget (observability-only, legacy behavior). The instance is held by
+   * run_code so its `snapshot()` of actual spend can be accrued post-run.
+   */
+  makeRunBudget?: () => RunBudget;
+  /**
+   * Post-run daily accrual of ACTUAL spend (§P5 tier 3). Called on EVERY exit path (success
+   * AND error, in a finally) with the per-run snapshot, so spent rows/requests/bytes are
+   * always accrued into the daily BudgetDO. Backed by BUDGET_DO.increment in production;
+   * optional so tests/unauthenticated boots can omit it.
+   */
+  accrueDailyBudget?: (snapshot: Record<string, number>) => Promise<void>;
   timeoutMs?: number;
 }
 
 export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<ToolTextResult> {
+  // Held at function scope so the finally can accrue actual spend (§P5 tier 3). Undefined
+  // when an early throw (size/mode/reason/reserve/transpile) fires before the budget exists
+  // — nothing was spent, so accrual is skipped.
+  let runBudget: RunBudget | undefined;
   try {
     // 1) size check (pre-transpile, pre-auth-cheap-reject)
     if (utf8Len(input.code) > SIZE_LIMITS.maxCodeBytes) {
@@ -102,7 +120,7 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
       ...(input.idempotencyKey !== undefined ? { runKey: input.idempotencyKey } : {}),
     };
-    const runBudget = new RunBudget();
+    runBudget = deps.makeRunBudget?.() ?? new RunBudget();
     const rpc = deps.buildRpc(effectiveMode, runBudget, runContext);
     const executor = createExecutor(deps.loader, deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs });
     const exec = await executeSnippet(executor, js, [{ name: "servicenow", fns: rpc.fns() }]);
@@ -158,5 +176,23 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
     };
   } catch (e) {
     return toToolResult(e);
+  } finally {
+    // POST-RUN ACCRUAL (§P5 tier 3): accrue ACTUAL spend on EVERY exit path (success AND
+    // error) so the daily BudgetDO always reflects what was spent. Skip when no budget was
+    // ever created (early throw — nothing spent). Best-effort: an accrual failure must never
+    // mask the real return value / thrown error, so it is swallowed here.
+    if (runBudget && deps.accrueDailyBudget) {
+      try {
+        await deps.accrueDailyBudget(runBudget.snapshot());
+      } catch (e) {
+        // Swallow so accrual failure never masks the real run result/error — BUT this is NOT
+        // merely a metering gap: budget.ts's admission check reads dim:rowsReturned/
+        // dim:bytesReturned, which are written ONLY by this (now-failed) accrual. So a
+        // PERSISTENT BUDGET_DO failure silently DISABLES the daily rows/bytes ceiling — it
+        // degrades to per-run enforcement, backstopped only by the hard uniqueWorkers daily
+        // cap (reserved pre-run). Emit an observable signal so that silent disable is detectable.
+        console.error("accrueDailyBudget failed:", e instanceof Error ? e.message : String(e));
+      }
+    }
   }
 }

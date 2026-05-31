@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runCode, type RunCodeDeps } from "../src/tools/run_code.js";
 import { ServiceNowRPC } from "../src/sn/rpc.js";
 import { RunBudget } from "../src/sn/run-budget.js";
+import { BUDGETS } from "../src/config.js";
 import { permissivePolicy, type ActorPolicy } from "../src/authz/actor-policy.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { McpToolError } from "../src/sn/errors.js";
@@ -21,16 +22,41 @@ class MockHttp implements SnHttpClient {
   calls: SnRequest[] = [];
   async request(req: SnRequest): Promise<SnResponse> {
     this.calls.push(req);
+    // tableGet hits /api/now/table/incident/{sys_id} — match the single-record path FIRST
+    // (more specific than the collection path) and return a single object, not an array.
+    if (req.method === "GET" && /^\/api\/now\/table\/incident\/[^/]+$/.test(req.path)) {
+      return { status: 200, json: { result: { sys_id: "a1", number: "INC0001", caller_id: "u9" } } };
+    }
     if (req.method === "GET" && req.path.startsWith("/api/now/table/incident")) {
       return { status: 200, json: { result: [{ sys_id: "a1", number: "INC0001", caller_id: "u9" }] } };
     }
+    // aggregate hits /api/now/stats/{table} — return a non-trivial stats payload.
+    if (req.method === "GET" && req.path.startsWith("/api/now/stats/")) {
+      return { status: 200, json: { result: { stats: { count: "42" } } } };
+    }
     if (req.method === "PATCH") return { status: 200, json: { result: { sys_id: "a1", updated: true } } };
+    // executor POST (runServerScript) — return a non-trivial payload so the byte cap trips.
+    if (req.method === "POST") return { status: 200, json: { result: { ok: true, value: "executor-output" } } };
     return { status: 200, json: { result: [] } };
   }
 }
 
+// Minimal executor signing config (mirrors mutation-wiring.test.ts) so runServerScript can
+// reach its send + byte-metering path. Opt-in via the `signing` flag (default off) so this
+// never changes how the other tests build their RPC.
+const SIGNING = {
+  claims: {
+    mcp_actor_user_id: "operator", mcp_actor_email: "op@x.com", snow_effective_user_sys_id: "",
+    instance: INSTANCE, request_id: "req-1",
+  },
+  hmacKey: new Uint8Array(32).fill(7),
+  nonce: () => crypto.randomUUID(),
+  now: () => 1_700_000_000_000,
+};
+
 function deps(opts: {
   scope?: Mode; tenant?: Mode; instance?: Mode; policy?: ActorPolicy; http?: MockHttp;
+  makeRunBudget?: () => RunBudget; signing?: boolean;
 }): RunCodeDeps {
   const http = opts.http ?? new MockHttp();
   const policy = opts.policy ?? permissivePolicy([INSTANCE]);
@@ -40,8 +66,12 @@ function deps(opts: {
     tenantMaxMode: opts.tenant ?? "admin_script",
     instanceMaxMode: opts.instance ?? "admin_script",
     timeoutMs: 5000,
+    ...(opts.makeRunBudget ? { makeRunBudget: opts.makeRunBudget } : {}),
     buildRpc: (effectiveMode, runBudget: RunBudget) =>
-      new ServiceNowRPC({ http, instanceHost: INSTANCE, effectiveMode, actorPolicy: policy, runBudget }),
+      new ServiceNowRPC({
+        http, instanceHost: INSTANCE, effectiveMode, actorPolicy: policy, runBudget,
+        ...(opts.signing ? { signing: SIGNING, executorPath: "/api/x_mcp/executor/run" } : {}),
+      }),
   };
 }
 
@@ -279,5 +309,175 @@ describe("Phase 4 — run_code pipeline", () => {
     expect(res.structuredContent?.truncated).toBe(true);
     expect(new TextEncoder().encode(res.content[0]!.text).length).toBeLessThanOrEqual(262144);
     expect(res.content[0]!.text).not.toContain("�");
+  });
+
+  // ─── Phase P5 — per-run row/byte cap → host-attested budget_exceeded ──────────
+
+  it("§P5 — a finite per-run ROW cap trips budget_exceeded (host-attested) mid-snippet", async () => {
+    // MockHttp returns 1 incident row per query; a cap of 2 rows trips on the 3rd query. The
+    // throw is a host signal (coded() records budgetExceeded), so the attested code is
+    // budget_exceeded with dimension rowsReturned — not the snippet's uncaught run_error.
+    const code = `async () => { for (let i = 0; i < 5; i++) { await servicenow.tableQuery({ table: "incident" }); } return "done"; }`;
+    const res = await runCode(
+      { code },
+      deps({
+        scope: "read_only", tenant: "read_only", instance: "read_only",
+        makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxRows: 2 }),
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("rowsReturned");
+  });
+
+  it("§P5 — a finite per-run BYTE cap trips budget_exceeded (host-attested) mid-snippet", async () => {
+    // Each incident row serializes to well over 1 byte; a 1-byte cap trips on the first query.
+    const code = `async () => { for (let i = 0; i < 5; i++) { await servicenow.tableQuery({ table: "incident" }); } return "done"; }`;
+    const res = await runCode(
+      { code },
+      deps({
+        scope: "read_only", tenant: "read_only", instance: "read_only",
+        makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxBytes: 1 }),
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("bytesReturned");
+  });
+
+  it("§P5 — post-run accrual is called on a SUCCESS path with the actual spend", async () => {
+    let accrued: Record<string, number> | undefined;
+    const base = deps({ scope: "read_only", tenant: "read_only", instance: "read_only" });
+    const res = await runCode(
+      { code: `async () => { const r = await servicenow.tableQuery({ table: "incident" }); return r.rows.length; }` },
+      { ...base, accrueDailyBudget: async (snap) => { accrued = snap; } },
+    );
+    expect(res.isError).toBe(false);
+    expect(accrued?.rowsReturned).toBe(1); // one masked row was returned to the snippet
+    expect((accrued?.bytesReturned ?? 0)).toBeGreaterThan(0); // bytes are now metered
+    expect((accrued?.serviceNowRequests ?? 0)).toBeGreaterThan(0);
+  });
+
+  it("§P5 — post-run accrual is STILL called on an ERROR path (finally)", async () => {
+    let accrued: Record<string, number> | undefined;
+    const base = deps({
+      scope: "read_only", tenant: "read_only", instance: "read_only",
+      makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxRows: 1 }),
+    });
+    // Loop past the 1-row cap so the run errors with budget_exceeded; accrual must still fire.
+    const res = await runCode(
+      { code: `async () => { for (let i = 0; i < 5; i++) { await servicenow.tableQuery({ table: "incident" }); } return "done"; }` },
+      { ...base, accrueDailyBudget: async (snap) => { accrued = snap; } },
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect(accrued).toBeDefined(); // accrued even though the run threw
+    expect((accrued?.rowsReturned ?? 0)).toBeGreaterThan(0);
+  });
+
+  it("§P5 — accrual is NOT called when an early throw fires before the budget exists", async () => {
+    let called = false;
+    const base = deps({});
+    // Oversize code throws code_size BEFORE the RunBudget is created — nothing spent.
+    const big = `async () => { /* ${"x".repeat(70_000)} */ return 1; }`;
+    const res = await runCode({ code: big }, { ...base, accrueDailyBudget: async () => { called = true; } });
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("code_size");
+    expect(called).toBe(false);
+  });
+
+  it("§P5 — a tenantMaxMode ceiling caps the effective mode below the OAuth scope", async () => {
+    // scope allows admin_script, but the tenant ceiling is read_only → requesting write is
+    // denied at effective-mode resolution (the ceiling now BITES; it was hardcoded before).
+    const res = await runCode(
+      { code: `async () => 1`, mode: "write" },
+      deps({ scope: "admin_script", tenant: "read_only", instance: "admin_script" }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("mode_not_permitted");
+  });
+
+  // ─── Phase P5 — byte/row metering is LIVE on all four snippet-visible surfaces ────
+  // The happy-path metering tests above exercise tableQuery; these prove tableGet,
+  // aggregate, and runServerScript are metered too (not just tableQuery).
+
+  it("§P5 — tableGet trips the per-run BYTE cap (host-attested budget_exceeded)", async () => {
+    // One tableGet returns a single masked row > 1 byte; a 1-byte cap trips on that call.
+    const res = await runCode(
+      { code: `async () => { await servicenow.tableGet({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }); return "done"; }` },
+      deps({
+        scope: "read_only", tenant: "read_only", instance: "read_only",
+        makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxBytes: 1 }),
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("bytesReturned");
+  });
+
+  it("§P5 — tableGet trips the per-run ROW cap (host-attested budget_exceeded)", async () => {
+    // tableGet counts one row; a 0-row cap trips countRows before countBytes.
+    const res = await runCode(
+      { code: `async () => { await servicenow.tableGet({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }); return "done"; }` },
+      deps({
+        scope: "read_only", tenant: "read_only", instance: "read_only",
+        makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxRows: 0 }),
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("rowsReturned");
+  });
+
+  it("§P5 — aggregate trips the per-run BYTE cap (host-attested budget_exceeded)", async () => {
+    // aggregate returns a stats payload > 1 byte; a 1-byte cap trips on that call.
+    const res = await runCode(
+      { code: `async () => { await servicenow.aggregate({ table: "incident" }); return "done"; }` },
+      deps({
+        scope: "read_only", tenant: "read_only", instance: "read_only",
+        makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxBytes: 1 }),
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("bytesReturned");
+  });
+
+  it("§P5 — tableUpdate trips the per-run BYTE cap (host-attested budget_exceeded)", async () => {
+    // The unwired tableUpdate path (write mode, no mutation wiring) returns the PATCH result;
+    // a 1-byte cap trips on the response. This is the NEW byte-metering surface (FIX 4) — the
+    // last snippet-visible return that was previously not metered. Without it the run succeeds.
+    const res = await runCode(
+      {
+        code: `async () => { await servicenow.tableUpdate({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fields: { state: 2 }, idempotencyKey: "k1" }); return "done"; }`,
+        mode: "write", // requested explicitly; default is read_only, which would capability-deny the write.
+      },
+      deps({
+        scope: "write", tenant: "write", instance: "write",
+        makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxBytes: 1 }),
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("bytesReturned");
+  });
+
+  it("§P5 — runServerScript trips the per-run BYTE cap (host-attested budget_exceeded)", async () => {
+    // The executor response > 1 byte; a 1-byte cap trips after the send (signing opt-in so the
+    // run reaches the send + byte-metering path; admin_script + tool-level reason are required).
+    const res = await runCode(
+      {
+        code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')", reason: "rotate", idempotencyKey: "k1" }); return "done"; }`,
+        mode: "admin_script",
+        reason: "rotate keys",
+      },
+      deps({
+        scope: "admin_script", tenant: "admin_script", instance: "admin_script", signing: true,
+        makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxBytes: 1 }),
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("budget_exceeded");
+    expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("bytesReturned");
   });
 });
