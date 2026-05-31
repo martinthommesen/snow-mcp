@@ -109,6 +109,9 @@ check("audit-first row written to x_1793136_mcp_audit_log (audit_id returned)", 
 //    (the loser's _consumeNonce sees the duplicate — falsy insert OR thrown constraint — and
 //    the wrapper closes 'rejected' -> 401). "At least one rejected" is NOT sufficient: we
 //    assert the XOR (exactly one 200) AND that the loser is specifically a 401.
+// concurrencyArbitrated is the AUTHORITATIVE proof that the nonce unique constraint enforces — it
+// is read by case 1b below (the sys_index catalog row is only a secondary, unreliable signal).
+let concurrencyArbitrated = false;
 {
   const sameNonce = "concur-" + Math.random().toString(36).slice(2);
   // Build ONE signed payload, send the SAME object twice (identical nonce + body + sig).
@@ -118,18 +121,28 @@ check("audit-first row written to x_1793136_mcp_audit_log (audit_id returned)", 
   const loser = [a, b].find((r) => r.status !== 200);
   const exactlyOneOk = oks.length === 1;
   const loserIs401 = loser?.status === 401 && loser?.body?.error === "actor_signature_invalid";
+  concurrencyArbitrated = exactlyOneOk && loserIs401;
   check("CONCURRENT replay: exactly ONE 200, the other 401 (DB-unique INSERT serializes the race)",
-    exactlyOneOk && loserIs401, `(statuses ${a.status}/${b.status})`);
+    concurrencyArbitrated, `(statuses ${a.status}/${b.status})`);
 }
-// 1b) The unique index that arbitrates the race MUST exist on the SCOPED x_1793136_mcp_nonce table
-//     the live wrapper writes (plan §P7 nonce-store fix). now-sdk install deploys it as index_name
-//     x_1793136_mcp_nonce_value_uq (confirmed in dist/app/dictionary/x_1793136_mcp_nonce.xml).
-//     Without the index the race is open even though the INSERT-as-arbiter code is present. The
-//     `unique` attribute readback is unreliable across families, so existence + the case-1
-//     rejection is the proof; we assert the sys_index row exists.
+// 1b) The unique constraint that arbitrates the race MUST be enforced on the SCOPED
+//     x_1793136_mcp_nonce table the live wrapper writes (plan §P7 nonce-store fix). The
+//     AUTHORITATIVE proof is case 1 itself: the wrapper has NO SELECT-before-INSERT, so the only
+//     path to a 401-loser is insert() failing on a DB unique constraint — without it, both
+//     concurrent identical-nonce INSERTs would 200. The `sys_index` CATALOG row is only a
+//     SECONDARY signal and an unreliable one: now-sdk 4.7.1 creates the physical DDL index but
+//     does not always write the sys_index row (confirmed live — index enforces yet the catalog
+//     row is absent), and the table is ACL-blocked from direct probing. So an absent catalog row
+//     is NOT evidence of a missing index. Pass when EITHER the catalog row exists OR case 1 proved
+//     the arbiter enforces; fail only if neither holds (i.e. uniqueness genuinely is not enforced).
 {
   const idx = (await api("GET", "/api/now/table/sys_index?sysparm_query=table=x_1793136_mcp_nonce^index_name=x_1793136_mcp_nonce_value_uq&sysparm_limit=1&sysparm_fields=sys_id,unique")).json?.result?.[0];
-  check("x_1793136_mcp_nonce unique index exists (the concurrency arbiter behind case 1)", Boolean(idx?.sys_id), `(sys_index ${idx?.sys_id ?? "MISSING"}, unique=${idx?.unique})`);
+  const catalogRow = Boolean(idx?.sys_id);
+  check("x_1793136_mcp_nonce unique constraint enforces (concurrency arbiter behind case 1)",
+    catalogRow || concurrencyArbitrated,
+    catalogRow
+      ? `(sys_index ${idx.sys_id}, unique=${idx.unique})`
+      : `(sys_index catalog row absent — now-sdk 4.7.1 metadata gap; enforcement PROVEN by case 1 CONCURRENT one-200/one-401)`);
 }
 
 // 2) INSTANCE-CLAIM mismatch -> 401. A VALIDLY-signed actor (good HMAC) whose signed `instance`
