@@ -59,7 +59,23 @@ export interface TableRowsResult {
   partial: boolean;
 }
 
+/**
+ * Host-attested, monotonic signals raised when the HOST (not the snippet) hits a
+ * terminal condition during a run (plan §P2). Set once, never cleared: a snippet that
+ * catches the thrown error cannot un-set the signal, so run_code can attest these codes
+ * even after a catch. Only `budgetExceeded`/`reauthRequired` are host-attested — a
+ * snippet's forged `throw new Error("[[…]]")` never transits the host RPC path and so
+ * never sets a signal.
+ */
+export interface HostSignals {
+  budgetExceeded?: { dimension?: string };
+  reauthRequired?: { authorizeUrl?: string };
+}
+
 export class ServiceNowRPC {
+  /** Host-attested signals for this run; a fresh instance is built per run (§P2). */
+  readonly hostSignals: HostSignals = {};
+
   constructor(private readonly deps: ServiceNowRpcDeps) {}
 
   // ── shared gate (the order is a security property, §3.1) ──
@@ -193,11 +209,22 @@ export class ServiceNowRPC {
   }
 
   // Encode the typed error code into the thrown message so it survives the sandbox
-  // boundary (codemode keeps only err.message) and can be re-surfaced with `code` intact.
+  // boundary (codemode keeps only err.message). Before the lossy re-throw, record the
+  // host-attested signal for budget/reauth conditions (§P2): these monotonic signals —
+  // captured here at the single host RPC chokepoint, carrying `detail` that
+  // encodeSandboxError would drop — are how run_code attests `code` without trusting the
+  // snippet-controlled message a forged `throw new Error("[[…]]")` could supply.
   private async coded<T>(p: Promise<T>): Promise<T> {
     try {
       return await p;
     } catch (e) {
+      if (e instanceof McpToolError) {
+        if (e.code === "budget_exceeded") {
+          this.hostSignals.budgetExceeded ??= { dimension: e.detail?.dimension as string | undefined };
+        } else if (e.code === "reauth_required") {
+          this.hostSignals.reauthRequired ??= { authorizeUrl: e.detail?.authorizeUrl as string | undefined };
+        }
+      }
       throw new Error(encodeSandboxError(e));
     }
   }

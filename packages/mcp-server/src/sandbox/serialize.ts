@@ -6,6 +6,22 @@ export function utf8Len(s: string): number {
   return new TextEncoder().encode(s).length;
 }
 
+/**
+ * Truncate `s` to at most `maxBytes` UTF-8 bytes, never splitting a multi-byte sequence
+ * (plan §P2). Encode → byte-slice at `maxBytes` → back off any trailing continuation
+ * bytes (`10xxxxxx`) plus the lead byte they belong to → decode the whole-sequence prefix.
+ * Backing off BEFORE decode avoids a replacement char (U+FFFD, 3 bytes) pushing the
+ * result back over the cap.
+ */
+export function truncateUtf8(s: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(s);
+  if (bytes.length <= maxBytes) return s;
+  let end = maxBytes;
+  // Walk back off continuation bytes (0b10xxxxxx) to the start of the boundary sequence.
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+
 export interface SerializedResult {
   text: string;
   truncated: boolean;
@@ -23,8 +39,9 @@ export function serializeResult(value: unknown, maxBytes: number): SerializedRes
   }
   const totalBytes = utf8Len(json);
   if (totalBytes > maxBytes) {
-    // Truncate the JSON text to a sample; flag truncation (never re-parse the slice).
-    return { text: json.slice(0, maxBytes), truncated: true, totalBytes };
+    // Byte-safe truncation: cap at maxBytes UTF-8 bytes without splitting a sequence
+    // (§P2). Flag truncation (never re-parse the slice).
+    return { text: truncateUtf8(json, maxBytes), truncated: true, totalBytes };
   }
   return { text: json, truncated: false, totalBytes };
 }

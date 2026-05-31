@@ -94,14 +94,39 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
 
     // 5) serialize / finalize
     const budget = runBudget.snapshot();
-    if (exec.error) {
-      // Recover the typed code if an McpToolError crossed the sandbox boundary (§3.5).
-      const parsed = parseSandboxError(exec.error);
-      const code = parsed.code ?? "run_error";
+
+    // Host-attested error code (§P2). The attested `code` is derived ONLY from monotonic
+    // host signals, never from the snippet-controlled error text — a forged
+    // `throw new Error("[[reauth_required]] https://evil")` raises no signal and cannot
+    // taint `code`. Priority: budget_exceeded → reauth_required → (any error) run_error.
+    // Signals are checked BEFORE success: a snippet that triggers a host condition then
+    // swallows it and returns cleanly still surfaces the attested code.
+    const signals = rpc.hostSignals;
+    if (signals.budgetExceeded) {
+      const dimension = signals.budgetExceeded.dimension;
       return {
-        content: [{ type: "text", text: `[${code}] ${parsed.message}` }],
+        content: [{ type: "text", text: `[budget_exceeded] Per-run ${dimension ?? "budget"} cap exceeded.` }],
         isError: true,
-        structuredContent: { code, error: parsed.message, logs: exec.logs ?? [], budget },
+        structuredContent: { code: "budget_exceeded", logs: exec.logs ?? [], budget, ...(dimension ? { detail: { dimension } } : {}) },
+      };
+    }
+    if (signals.reauthRequired) {
+      const authorizeUrl = signals.reauthRequired.authorizeUrl;
+      return {
+        content: [{ type: "text", text: "[reauth_required] ServiceNow re-authentication required." }],
+        isError: true,
+        structuredContent: { code: "reauth_required", logs: exec.logs ?? [], budget, ...(authorizeUrl ? { detail: { authorizeUrl } } : {}) },
+      };
+    }
+    if (exec.error) {
+      // No host signal: the host cannot vouch for any `[[code]]` in the snippet-controlled
+      // message (it may be forged, or the snippet may have caught a host error and thrown
+      // its own). Attest `run_error`; keep the parsed message as ADVISORY text only.
+      const parsed = parseSandboxError(exec.error);
+      return {
+        content: [{ type: "text", text: `[run_error] ${parsed.message}` }],
+        isError: true,
+        structuredContent: { code: "run_error", error: parsed.message, logs: exec.logs ?? [], budget },
       };
     }
     const ser = serializeResult(exec.result, SIZE_LIMITS.maxOutputBytes);

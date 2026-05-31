@@ -29,4 +29,35 @@ export type ErrorCode =
   | "code_size"
   | "transpile_error"
   | "timeout"
+  | "run_error"
   | "internal_error";
+
+/**
+ * Runtime tuple of every {@link ErrorCode}, for membership checks (plan §P2). Kept in
+ * sync with the union above. `run_error` is the host-attested fallback for an uncaught
+ * snippet/RPC error whose typed code the host cannot vouch for.
+ */
+export const ERROR_CODES = [
+  "capability_denied",
+  "mode_not_permitted",
+  "actor_policy_denied",
+  "budget_exceeded",
+  "path_denied",
+  "instance_hibernating",
+  "reauth_required",
+  "executor_disabled",
+  "run_server_script_disabled",
+  "actor_signature_invalid",
+  "code_size",
+  "transpile_error",
+  "timeout",
+  "run_error",
+  "internal_error",
+] as const satisfies readonly ErrorCode[];
+
+// Compile-time exhaustiveness guard (P2): `satisfies` above proves every entry IS an
+// ErrorCode; this proves the converse — if a future ErrorCode is added to the union
+// without being appended to ERROR_CODES, `Exclude` resolves to that member and this
+// line fails to typecheck (so parseSandboxError's membership check can never silently
+// drop a real code). Tuple-wrapped to avoid `never` distribution. No runtime effect.
+true satisfies [Exclude<ErrorCode, (typeof ERROR_CODES)[number]>] extends [never] ? true : false;

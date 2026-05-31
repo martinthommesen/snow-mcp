@@ -2,7 +2,9 @@
 // plus a human message; helpers map HTTP/ServiceNow failures to codes and render an
 // MCP tool result. Pure host logic — unit-verified locally.
 
-import type { ErrorCode } from "@servicenow-codemode/shared";
+import { ERROR_CODES, type ErrorCode } from "@servicenow-codemode/shared";
+
+const ERROR_CODE_SET: ReadonlySet<string> = new Set(ERROR_CODES);
 
 export class McpToolError extends Error {
   readonly code: ErrorCode;
@@ -20,14 +22,17 @@ export class McpToolError extends Error {
 export function toToolResult(err: unknown): {
   content: { type: "text"; text: string }[];
   isError: true;
-  structuredContent: { code: ErrorCode; message: string };
+  structuredContent: { code: ErrorCode; message: string; detail?: Record<string, unknown> };
 } {
   const code: ErrorCode = err instanceof McpToolError ? err.code : "internal_error";
   const message = err instanceof Error ? err.message : String(err);
+  // Carry structured detail (e.g. reauth_required.authorizeUrl, budget_exceeded.dimension)
+  // through the non-sandbox throw path so preflight conditions survive (plan §P2).
+  const detail = err instanceof McpToolError ? err.detail : undefined;
   return {
     content: [{ type: "text", text: `[${code}] ${message}` }],
     isError: true,
-    structuredContent: { code, message },
+    structuredContent: detail !== undefined ? { code, message, detail } : { code, message },
   };
 }
 
@@ -45,7 +50,12 @@ export function encodeSandboxError(err: unknown): string {
 
 export function parseSandboxError(message: string): { code?: ErrorCode; message: string } {
   const m = CODE_PREFIX.exec(message);
-  if (m) return { code: m[1] as ErrorCode, message: m[2]! };
+  // Membership-check the parsed prefix against the known union (advisory hygiene only —
+  // §P2). A snippet-forged or non-union `[[…]]` tag yields no `code`. The host never
+  // attests this code: it is only used for the advisory message below. Host-attested
+  // codes come from monotonic host signals in run_code, never from this parse.
+  if (m && ERROR_CODE_SET.has(m[1]!)) return { code: m[1] as ErrorCode, message: m[2]! };
+  if (m) return { message: m[2]! };
   return { message };
 }
 
