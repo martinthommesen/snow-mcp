@@ -48,13 +48,12 @@ export const x_1793136_mcp_audit_log = Table({
     },
 })
 
-// ⚠️ RESERVED / NOT WRITTEN BY THE LIVE VERIFIER (finding 24). The production verifier is the
-// GLOBAL x_mcp_verify core installed by scripts/executor-install.mjs (new Function +
-// GlideCertificateEncryption are global-only, D11), and its _consumeNonce writes the GLOBAL
-// x_mcp_nonce table (UNIQUE-indexed + purged by that installer) — NOT this scoped table. This
-// table + its unique index below + the purge job further down are kept for a possible future
-// scoped-hosted core, but no deployed code path writes them today. The LIVE replay store is
-// global x_mcp_nonce. (Do not treat this table's index/purge as the live replay defense.)
+// ⚠️ THE LIVE REPLAY-DEFENSE STORE (plan §P7 nonce-store fix; finding 24). Single-use nonce
+// consumption is owned by the SCOPED executor wrapper (server/x_mcp_executor.js), which INSERTs
+// into THIS table after delegating HMAC verify to the global core. now-sdk install deploys the
+// table + its UNIQUE index correctly (app-deploy DDL), unlike the Table API used by
+// scripts/executor-install.mjs, which 403s on table/index creation even for admin — which is why
+// the nonce store MUST be this scoped table, not a global one.
 export const x_1793136_mcp_nonce = Table({
     $id: Now.ID['t_nonce'],
     name: 'x_1793136_mcp_nonce',
@@ -63,16 +62,15 @@ export const x_1793136_mcp_nonce = Table({
         value: StringColumn({ label: 'Value', maxLength: 128 }),
         created: DateTimeColumn({ label: 'Created' }),
     },
-    // UNIQUE index on `value` (plan §P7) — the intended race arbiter for a scoped-hosted core's
-    // check-then-insert _consumeNonce. UNUSED by the live global core (which uses the global
-    // x_mcp_nonce table's unique index instead); reserved against a future scoped core.
+    // UNIQUE index on `value` (plan §P7) — the DB race arbiter for the wrapper's INSERT-as-arbiter
+    // single-use consume: two concurrent identical signed requests cannot both insert the nonce.
     index: [{ name: 'x_1793136_mcp_nonce_value_uq', unique: true, element: 'value' }],
 })
 
-// Actor verification is delegated to the GLOBAL x_mcp_verify Script Include
-// (GlideCertificateEncryption is global-only; plan §0.13a). The executor resource calls
-// `new global.x_mcp_verify()`. The global helper — AND the live nonce store it writes (global
-// x_mcp_nonce) — are installed by scripts/executor-install.mjs.
+// HMAC verification + script eval are delegated to the GLOBAL x_mcp_verify Script Include
+// (GlideCertificateEncryption + new Function are global-only; plan §0.13a) via its verify()/
+// execute() split — installed by scripts/executor-install.mjs. SINGLE-USE NONCE consumption stays
+// in scope: the wrapper INSERTs into x_1793136_mcp_nonce (above) between verify() and execute().
 
 // ─── Audit-table hardening (plan §P7 item 5; finding 25) ──────────────────────
 // Restrict reading + writing the audit log to x_1793136_mcp.admin ONLY (separation of duty:
@@ -104,12 +102,7 @@ Acl({
 })
 
 // ─── Scheduled nonce-purge (TTL) job (plan §P7 item 5; finding 24) ────────────
-// ⚠️ RESERVED / UNUSED BY THE LIVE PATH: this job purges the SCOPED x_1793136_mcp_nonce table,
-// which the live global verifier does NOT write (see the table note above). The LIVE nonce
-// purge runs against the GLOBAL x_mcp_nonce table and is installed by
-// scripts/executor-install.mjs (a REST-installed sysauto_script whose run_period is a plain
-// string, so it is NOT subject to the now-sdk serializer bug noted below). This scoped job is
-// kept paired with the reserved scoped table for a future scoped-hosted core.
+// THE LIVE nonce purge: bounds the scoped x_1793136_mcp_nonce table the wrapper writes.
 // The nonce table grows one row per executor call and is never read after the freshness
 // window (120s). Purge rows older than 1 hour every 15 minutes so the table stays bounded
 // (the 1-hour cutoff is far longer than the freshness window, so a still-relevant nonce is

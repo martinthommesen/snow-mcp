@@ -1,14 +1,19 @@
 // Install + verify the x_mcp executor on the live instance (Phase 5; user-authorized).
 // Global-scope adaptation of sn-executor-app/ (a proper scoped app ships via Studio).
 //
-// DEFAULT INSTALL (plan §P7): the GLOBAL x_mcp_verify HELPER + its backing store/index/purge
-// (x_mcp_audit_log, x_mcp_nonce + UNIQUE index, the nonce-purge job) + properties ONLY. The
-// canonical request endpoint is the SCOPED Fluent role-ACL-gated REST (x_1793136_mcp), which
-// delegates to global.x_mcp_verify.run(). The global-REST endpoint here is DEPRECATED (D11):
-// it is gated ONLY by HMAC (no role ACL), a second live executor surface contradicting the
-// scoped wrapper's role gate. It is installed + self-tested ONLY when opted in explicitly:
+// DEFAULT INSTALL (plan §P7 nonce-store fix): the GLOBAL x_mcp_verify HELPER + properties ONLY.
+// NO TABLES are created here — ServiceNow blocks creating tables/indexes via the inbound Table API
+// even for admin (sys_db_object/sys_dictionary/sys_index POST -> 403). The nonce store + its UNIQUE
+// index + the purge job are OWNED BY THE SCOPED FLUENT APP (x_1793136_mcp_nonce), which now-sdk
+// install deploys correctly (app-deploy creates tables+indexes the right way, bypassing the 403).
+// The audit table is likewise the scoped x_1793136_mcp_audit_log (written by the scoped wrapper);
+// no global code writes a global x_mcp_audit_log. The canonical request endpoint is the SCOPED
+// Fluent role-ACL-gated REST (x_1793136_mcp), which does verify -> consume-nonce -> execute. The
+// global-REST endpoint here is DEPRECATED (D11): gated ONLY by HMAC (no role ACL). It mirrors the
+// scoped wrapper's verify -> consume-nonce(scoped table) -> execute order; installed + self-tested
+// ONLY when opted in explicitly:
 //
-//   node scripts/executor-install.mjs                          # helper + tables only
+//   node scripts/executor-install.mjs                          # helper + properties only
 //   X_MCP_INSTALL_GLOBAL_REST=1 node scripts/executor-install.mjs  # + deprecated endpoint + self-test
 import { readFileSync } from "node:fs";
 import { canonicalize, hmacSha256Base64, sha256Base64 } from "../packages/mcp-server/dist/auth/actor.js";
@@ -47,30 +52,9 @@ async function setProperty(name, value, type = "string") {
   if (ex) { await api("PATCH", `/api/now/table/sys_properties/${ex.sys_id}`, { value }); return "updated"; }
   await api("POST", "/api/now/table/sys_properties", { name, value, type }); return "created";
 }
-async function ensureTable(name, label) {
-  const ex = (await api("GET", `/api/now/table/sys_db_object?sysparm_query=name=${name}&sysparm_limit=1&sysparm_fields=sys_id`)).result?.[0];
-  if (ex) return "exists";
-  const r = await api("POST", "/api/now/table/sys_db_object", { name, label });
-  return `created(${r.status})`;
-}
-async function ensureColumn(table, element, internal_type, column_label, max_length) {
-  const ex = (await api("GET", `/api/now/table/sys_dictionary?sysparm_query=name=${table}^element=${element}&sysparm_limit=1&sysparm_fields=sys_id`)).result?.[0];
-  if (ex) return;
-  await api("POST", "/api/now/table/sys_dictionary", { name: table, element, internal_type, column_label, max_length: String(max_length ?? 255) });
-}
-// Ensure a single-column UNIQUE INDEX (finding 24 race arbiter). We create a sys_index record —
-// the SAME mechanism the now-sdk emits for the scoped table (dist .../dictionary/x_1793136_mcp_nonce.xml
-// renders `<index name="..._value_uq" unique="true"><element name="value"/></index>` with the
-// column's sys_dictionary.unique left FALSE). A DB-enforced unique index is what makes a duplicate
-// INSERT fail; the sys_dictionary `unique` attribute is a different, less-certain mechanism, so we
-// mirror the SDK's proven sys_index form. P8-LIVE GATE: enforcement (a concurrent duplicate insert
-// is actually REJECTED) must be confirmed on a live PDI — it cannot be exercised from this script.
-async function ensureUniqueIndex(table, indexName, element) {
-  const ex = (await api("GET", `/api/now/table/sys_index?sysparm_query=table=${table}^index_name=${indexName}&sysparm_limit=1&sysparm_fields=sys_id`)).result?.[0];
-  const body = { table, index_name: indexName, name: indexName, unique: "true", col_name_string: element };
-  if (ex) { await api("PATCH", `/api/now/table/sys_index/${ex.sys_id}`, body); return "updated"; }
-  const r = await api("POST", "/api/now/table/sys_index", body); return `created(${r.status})`;
-}
+// NOTE: ensureTable/ensureColumn/ensureUniqueIndex are intentionally GONE — the SCOPED Fluent app
+// owns the nonce table + its UNIQUE index + the purge job (now-sdk deploys them; the Table API
+// 403s on DDL even for admin). This installer creates NO tables.
 async function ensureScriptInclude(name, script) {
   const ex = (await api("GET", `/api/now/table/sys_script_include?sysparm_query=name=${name}&sysparm_limit=1&sysparm_fields=sys_id`)).result?.[0];
   const body = { name, api_name: `global.${name}`, script, active: "true", access: "public", client_callable: "false" };
@@ -79,12 +63,12 @@ async function ensureScriptInclude(name, script) {
 }
 
 // --- Script Include: x_mcp_verify (GLOBAL scope) ---
-// This IS the canonical global core (plan §P7) and the LIVE production verifier (D11). The
-// class body MUST stay byte-consistent with sn-executor-app/script-include/x_mcp_verify.js
-// EXCEPT _consumeNonce: that reference targets the scoped x_1793136_mcp_nonce table, but the
-// LIVE core writes the GLOBAL x_mcp_nonce table this script creates + UNIQUE-indexes below
-// (the scoped table is reserved/unused by this core; finding 24). Same replay semantics; the
-// live store's race-safety comes from the DB unique constraint, not check-then-insert.
+// This IS the canonical global core (plan §P7) and the LIVE production verifier (D11). The class
+// body MUST stay byte-consistent with sn-executor-app/script-include/x_mcp_verify.js: verify()
+// (HMAC + script-bind + instance-claim + freshness; NO nonce, NO eval), execute() (new Function
+// eval), run() (verify-then-execute back-compat). SINGLE-USE NONCE consumption is NOT here — the
+// scoped wrapper owns it (INSERT-as-arbiter into the scoped x_1793136_mcp_nonce table). The nonce
+// STAYS in the signed canonical (the HMAC still covers it); only its single-use INSERT moved.
 // Properties are read from the scoped-aligned x_1793136_mcp.executor.* namespace (set below).
 const verifyScript = `var x_mcp_verify = Class.create();
 x_mcp_verify.prototype = {
@@ -115,60 +99,55 @@ x_mcp_verify.prototype = {
   _constantTimeEquals: function(a, b) { if (a == null || b == null) return false; if (a.length !== b.length) return false; var d = 0; for (var i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i); return d === 0; },
   _thisInstance: function() { return gs.getProperty('instance_name', ''); },
   _instanceMatches: function(claimed) { var name = String(this._thisInstance() || ''); if (!name) return false; var c = String(claimed || ''); if (!c) return false; return c === name || c.indexOf(name + '.') === 0; },
-  _verify: function(script, actor, sig) {
-    if (!sig) return false;
+  // verify(): HMAC + script-bind + instance-claim + freshness. NO nonce single-use, NO eval —
+  // the caller consumes the nonce (INSERT-as-arbiter on the scoped x_1793136_mcp_nonce table)
+  // between verify() and execute(). The nonce STAYS in the signed canonical (HMAC covers it).
+  verify: function(script, actor, sig) {
+    if (!sig) return { verified: false };
     var expHash = new GlideDigest().getSHA256Base64(String(script || ''));
-    if (expHash !== String(actor.script_sha256 || '')) return false;
-    if (!this._instanceMatches(actor.instance)) return false;
+    if (expHash !== String(actor.script_sha256 || '')) return { verified: false };
+    if (!this._instanceMatches(actor.instance)) return { verified: false };
     var now = new GlideDateTime().getNumericValue();
     var issued = parseInt(actor.issued_at, 10);
-    if (isNaN(issued) || Math.abs(now - issued) > this.FRESHNESS_MS) return false;
+    if (isNaN(issued) || Math.abs(now - issued) > this.FRESHNESS_MS) return { verified: false };
     var canon = this._canonical(actor);
     var keyCur = gs.getProperty('x_1793136_mcp.executor.hmac_secret', '');
     var keyPrev = gs.getProperty('x_1793136_mcp.executor.hmac_secret_prev', '');
     var ok = keyCur && this._constantTimeEquals(this._hmacBase64(keyCur, canon), sig);
     if (!ok && keyPrev) ok = this._constantTimeEquals(this._hmacBase64(keyPrev, canon), sig);
-    if (!ok) return false;
-    return this._consumeNonce(String(actor.nonce || ''));
+    if (!ok) return { verified: false };
+    return { verified: true };
   },
-  // LIVE NONCE STORE (finding 24): this GLOBAL core is the production verifier (D11), so the
-  // nonce ledger it writes is the live replay defense — the global x_mcp_nonce table (created +
-  // UNIQUE-indexed on its value column below). The DB unique constraint is the concurrency
-  // arbiter: a bare INSERT is the only check, so two concurrent identical signed requests can't
-  // both win. A duplicate value either makes insert() return falsy OR throws the constraint
-  // violation — BOTH are a replay -> return false (clean verified:false -> 401). No
-  // check-then-insert TOCTOU. (The scoped x_1793136_mcp_nonce table/index the Fluent app ships
-  // is NOT written by this live core — it is reserved/unused; see x_mcp.now.ts.)
-  _consumeNonce: function(nonce) {
-    if (!nonce) return false;
-    try {
-      var row = new GlideRecord('x_mcp_nonce'); row.initialize(); row.value = nonce; row.created = new GlideDateTime();
-      return !!row.insert(); // unique-index collision => falsy => replay
-    } catch (e) { return false; } // unique-index collision thrown => replay
-  },
-  // GLOBAL core for scoped delegation (plan §0.13a/§P7): scoped apps cannot use new Function
-  // or GlideCertificateEncryption, so the scoped executor calls global.x_mcp_verify.run().
-  // Returns { verified, ok, error, serialized }. The scoped wrapper owns audit/kill-switch.
-  run: function(code, actor, sig) {
-    if (!this._verify(code, actor, sig)) return { verified: false };
+  // execute(): eval the verified script (new Function is global-only). Caller MUST verify +
+  // consume the nonce first. Returns { serialized, error }; never throws (catches internally).
+  execute: function(code) {
     var result, err = null;
     try { var fn = new Function('gs','GlideRecord','GlideRecordSecure','GlideAggregate','"use strict";\\n' + code); result = fn(gs, GlideRecord, GlideRecordSecure, GlideAggregate); }
     catch (e) { err = String(e); }
     var serialized = null;
     try { serialized = JSON.stringify(result === undefined ? null : result); }
     catch (se) { err = err || ('unserializable: ' + String(se)); serialized = null; }
-    return { verified: true, ok: !err, error: err, serialized: serialized };
+    return { serialized: serialized, error: err };
+  },
+  // run(): verify-then-execute back-compat, NO nonce single-use. The scoped wrapper does NOT use
+  // run() — it calls verify()/consume/execute() so the nonce INSERT lands between the two.
+  run: function(code, actor, sig) {
+    if (!this.verify(code, actor, sig).verified) return { verified: false };
+    var out = this.execute(code);
+    return { verified: true, ok: !out.error, error: out.error, serialized: out.serialized };
   },
   type: 'x_mcp_verify'
 };`;
 
 // --- Executor Scripted REST operation script (global scope, §10) ---
-// DEPRECATED (D11): the production endpoint is the scoped Fluent wrapper x_1793136_mcp,
-// which delegates to global.x_mcp_verify.run(). This global-REST endpoint is kept only as a
-// non-SDK reference install. It mirrors the wrapper's GATE-BEFORE-DELEGATE ordering: audit ->
-// kill-switch -> egress -> size/413 -> run() (so a rejected call never burns its nonce). It
-// delegates verify+eval to the canonical core's run() (the old verify()+inline-eval split is
-// gone). Audit -> syslog (JSON message) because the global install can't create custom tables.
+// DEPRECATED (D11): the production endpoint is the scoped Fluent wrapper x_1793136_mcp. This
+// global-REST endpoint is kept only as a non-SDK reference install. It mirrors the wrapper's NEW
+// ordering: audit -> kill-switch -> egress -> size/413 -> verify() -> consume-nonce -> execute().
+// SINGLE-USE NONCE is consumed HERE (INSERT-as-arbiter into the SCOPED x_1793136_mcp_nonce table —
+// global scope can write a scoped table via GlideRecord, and that table is the deployed unique-
+// indexed store): verify before consume (a forged call never burns a nonce), consume before
+// execute (a replay never executes). Audit -> syslog (JSON) because the global install can't
+// create custom tables.
 const execScript = `function utf8Len(s){var n=0;for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);if(c<0x80)n+=1;else if(c<0x800)n+=2;else if(c>=0xD800&&c<=0xDBFF){n+=4;i++;}else n+=3;}return n;}
 function utf8Slice(s, maxBytes){var n=0;for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);var w=(c<0x80)?1:(c<0x800)?2:(c>=0xD800&&c<=0xDBFF)?4:3;if(n+w>maxBytes)return s.slice(0,i);n+=w;if(w===4)i++;}return s;}
 (function process(request, response) {
@@ -188,16 +167,22 @@ function utf8Slice(s, maxBytes){var n=0;for(var i=0;i<s.length;i++){var c=s.char
   var maxB = parseInt(gs.getProperty('x_1793136_mcp.executor.max_bytes', '32768'), 10);
   var bytes = utf8Len(code);
   if (bytes === 0 || bytes > maxB) { close('error', { error_class: 'code_size' }); response.setStatus(413); response.setBody({ error: 'code_size', audit_id: auditId + '' }); return; }
-  // DELEGATE verify + eval to the canonical core (reason is read inside run() from actor.reason).
-  // try/catch mirrors the scoped wrapper (finding 31 symmetry): _consumeNonce ends in an INSERT
-  // against the UNIQUE index on x_mcp_nonce.value; a concurrent replay can throw the constraint
-  // violation. Without this guard the throw escapes run() and leaves the audit row stuck at
-  // 'running'. A nonce collision IS a replay, so close 'rejected' + 401 either way.
-  var out;
-  try { out = new x_mcp_verify().run(code, actor, sig); }
-  catch (re) { close('rejected', { error_class: 'nonce_consume_failed' }); response.setStatus(401); response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return; }
-  if (!out.verified) { close('rejected', { error_class: 'actor_signature_invalid' }); response.setStatus(401); response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return; }
+  // VERIFY (HMAC; no nonce, no eval). try/catch is defense-in-depth (finding 31): if verify throws,
+  // close 'rejected' + 401 instead of leaving the audit row stuck 'running'.
+  var v;
+  try { v = new x_mcp_verify().verify(code, actor, sig); }
+  catch (re) { close('rejected', { error_class: 'verify_failed' }); response.setStatus(401); response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return; }
+  if (!v.verified) { close('rejected', { error_class: 'actor_signature_invalid' }); response.setStatus(401); response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return; }
+  // SINGLE-USE NONCE: INSERT-as-arbiter into the SCOPED x_1793136_mcp_nonce table (DB UNIQUE index).
+  // Empty nonce -> 401 (never insert a '' row). A duplicate insert (falsy or thrown) is a replay.
+  var nonceVal = String(actor.nonce || '');
+  if (!nonceVal) { close('rejected', { error_class: 'actor_signature_invalid' }); response.setStatus(401); response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return; }
+  var ng = new GlideRecord('x_1793136_mcp_nonce'); ng.initialize(); ng.value = nonceVal; ng.created = new GlideDateTime();
+  var nid; try { nid = ng.insert(); } catch (ne) { nid = null; }
+  if (!nid) { close('rejected', { error_class: 'nonce_replay' }); response.setStatus(401); response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return; }
   ad.actor_verified = true; ad.reason = String(actor.reason || '');
+  // EXECUTE the verified script (execute() catches internally, never throws).
+  var out = new x_mcp_verify().execute(code);
   var err = out.error, status = err ? 'error' : 'ok', serialized = out.serialized;
   var maxOut = parseInt(gs.getProperty('x_1793136_mcp.executor.max_output_bytes', '65536'), 10);
   if (serialized && utf8Len(serialized) > maxOut) { if (status === 'ok') status = 'truncated'; close(status, { output_size: utf8Len(serialized), error_class: err ? err.split(':')[0] : '' }); response.setStatus(200); response.setBody({ ok: !err, result: null, result_sample: utf8Slice(serialized, maxOut), truncated: true, error: err, audit_id: auditId + '' }); return; }
@@ -214,52 +199,22 @@ log("run_server_script_enabled:", await setProperty("x_1793136_mcp.executor.run_
 log("max_bytes:", await setProperty("x_1793136_mcp.executor.max_bytes", "32768", "integer"));
 log("max_output_bytes:", await setProperty("x_1793136_mcp.executor.max_output_bytes", "65536", "integer"));
 
-// 2) Tables + columns
-log("x_mcp_audit_log table:", await ensureTable("x_mcp_audit_log", "MCP Audit Log"));
-for (const [el, ty, lbl, ml] of [
-  ["snow_user", "string", "SN User", 64], ["snow_user_name", "string", "SN User Name", 128],
-  ["mcp_actor_user_id", "string", "MCP Actor", 128], ["mcp_actor_email", "string", "MCP Actor Email", 255],
-  ["request_id", "string", "Request ID", 128], ["actor_verified", "boolean", "Actor Verified", 40],
-  ["code_hash", "string", "Code Hash", 64], ["code_size", "integer", "Code Size", 40],
-  ["started_at", "glide_date_time", "Started", 40], ["duration", "integer", "Duration", 40],
-  ["status", "string", "Status", 40], ["output_size", "integer", "Output Size", 40], ["error_class", "string", "Error Class", 128],
-]) await ensureColumn("x_mcp_audit_log", el, ty, lbl, ml);
-// x_mcp_nonce IS the live replay-defense store written by the global core's _consumeNonce
-// (finding 24). The UNIQUE INDEX on the value column is the concurrency arbiter: a duplicate
-// insert fails at the DB, so two concurrent identical signed requests can't both consume the
-// nonce. (Index enforcement is a P8-live gate — see ensureUniqueIndex.)
-log("x_mcp_nonce table:", await ensureTable("x_mcp_nonce", "MCP Nonce"));
-await ensureColumn("x_mcp_nonce", "value", "string", "Value", 128);
-await ensureColumn("x_mcp_nonce", "created", "glide_date_time", "Created", 40);
-log("x_mcp_nonce value unique index:", await ensureUniqueIndex("x_mcp_nonce", "x_mcp_nonce_value_uq", "value"));
+// 2) NO TABLES. The Table API 403s on DDL (sys_db_object/sys_dictionary/sys_index POST) even for
+// admin, so we create NO tables here. The nonce store (x_1793136_mcp_nonce) + its UNIQUE index +
+// the purge job, and the audit log (x_1793136_mcp_audit_log), are OWNED BY THE SCOPED FLUENT APP
+// (now-sdk install deploys them — see sn-executor-app/fluent/src/fluent/x_mcp.now.ts). The scoped
+// wrapper consumes the nonce in-scope; this global core no longer touches any nonce table.
 
-// 3) Script Include
+// 3) Script Include (the global verify()/execute()/run() core for scoped delegation).
 log("x_mcp_verify script include:", await ensureScriptInclude("x_mcp_verify", verifyScript));
-
-// 3b) Nonce-purge scheduled job (TTL) — bounds x_mcp_nonce (finding 24). Purge rows older than
-// 1 hour every 15 minutes (cutoff >> the 120s freshness window, so a live nonce is never cut).
-// A REST-installed sysauto_script sets run_period DIRECTLY (a string), so the now-sdk 4.7.1
-// '[object Object]' serializer bug that afflicts the scoped Fluent ScheduledScript does NOT
-// apply here. Targets x_mcp_nonce — the table the LIVE verifier writes (not scoped _mcp_nonce).
-const purgeScript = `(function () {
-  var gr = new GlideRecord('x_mcp_nonce');
-  gr.addQuery('created', '<', gs.hoursAgoStart(1));
-  gr.deleteMultiple();
-})();`;
-{
-  const ex = (await api("GET", "/api/now/table/sysauto_script?sysparm_query=name=MCP Nonce Purge&sysparm_limit=1&sysparm_fields=sys_id")).result?.[0];
-  const jobBody = { name: "MCP Nonce Purge", script: purgeScript, active: "true", run_type: "periodically", run_period: "1970-01-01 00:15:00" };
-  if (ex) { await api("PATCH", `/api/now/table/sysauto_script/${ex.sys_id}`, jobBody); log("nonce purge job: updated"); }
-  else { const r = await api("POST", "/api/now/table/sysauto_script", jobBody); log("nonce purge job:", r.status); }
-}
 
 // 4) Scripted REST API + operation — DEPRECATED, opt-in ONLY (default OFF, plan §P7).
 // The canonical request endpoint is the scoped Fluent role-ACL-gated REST; this global-REST
 // surface is HMAC-only (no role ACL) and is installed solely as a non-SDK reference when the
-// operator explicitly opts in. The default install ships ONLY the global helper + tables.
+// operator explicitly opts in. The default install ships ONLY the global helper + properties.
 if (!INSTALL_GLOBAL_REST) {
   console.log("\nGlobal-REST endpoint: SKIPPED (deprecated; set X_MCP_INSTALL_GLOBAL_REST=1 to install + self-test).");
-  console.log("\nHelper install complete (x_mcp_verify + tables/index/purge + properties). Request endpoint is the scoped Fluent REST.");
+  console.log("\nHelper install complete (x_mcp_verify core + properties; NO tables — the scoped Fluent app owns the nonce+audit tables). Request endpoint is the scoped Fluent REST.");
   process.exit(0);
 }
 let def = (await api("GET", "/api/now/table/sys_ws_definition?sysparm_query=service_id=x_mcp&sysparm_limit=1&sysparm_fields=sys_id")).result?.[0];

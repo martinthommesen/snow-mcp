@@ -1,8 +1,11 @@
 // Executor resource (scoped app x_1793136_mcp). Scoped apps CANNOT use new Function or
-// GlideCertificateEncryption (global-only), so verification + execution are DELEGATED to
-// the GLOBAL x_mcp_verify.run() (plan §0.13a). The scoped app owns the role-gated REST
-// endpoint (REST_Endpoint ACL = S8), the audit-first row (x_1793136_mcp_audit_log), the
-// kill switch, the byte cap, and the safe truncation envelope.
+// GlideCertificateEncryption (global-only), so HMAC verification + script eval are DELEGATED to
+// the GLOBAL x_mcp_verify (plan §0.13a) via its verify()/execute() split. The scoped app owns the
+// role-gated REST endpoint (REST_Endpoint ACL = S8), the audit-first row (x_1793136_mcp_audit_log),
+// the kill switch, the byte cap, the safe truncation envelope, AND single-use nonce consumption —
+// the INSERT-as-arbiter into the scoped x_1793136_mcp_nonce table (the deployable unique-indexed
+// store; plan §P7 nonce-store fix). Order: audit -> kill -> egress -> size/413 -> verify ->
+// consume-nonce -> execute, so a forged request never burns a nonce and a replay never executes.
 function utf8Len(s) {
     var n = 0
     for (var i = 0; i < s.length; i++) {
@@ -95,28 +98,27 @@ function utf8Slice(s, maxBytes) {
     // QUOTA (maximum execution time), which kills the whole transaction. Do not represent
     // timeout_ms as an in-script kill.
 
-    // DELEGATE verify + eval to the global core (new Function + GlideCertificateEncryption).
-    // The LIVE global core (scripts/executor-install.mjs) is what runs here; its _consumeNonce
-    // ends in row.insert() against the UNIQUE index on the GLOBAL x_mcp_nonce.value table (NOT
-    // the scoped x_1793136_mcp_nonce, which that core does not write — see x_mcp.now.ts). The
-    // core catches a duplicate-key throw internally, but this try/catch stays as defense-in-
-    // depth: if a future core lets the constraint violation escape run(), the throw would leave
-    // the audit row stuck at 'running' with a 500 — reintroducing the finding-31 (audit never
-    // closes) bug on the finding-24 (nonce race) path. A nonce collision IS a replay, so close
-    // to 'rejected' + 401 either way (plan §P7 items 3b/4).
-    var out
+    // VERIFY -> CONSUME NONCE -> EXECUTE (plan §P7 nonce-store fix). The global core does HMAC +
+    // eval (new Function + GlideCertificateEncryption are global-only), but SINGLE-USE NONCE
+    // consumption is owned HERE, in scope, against the scoped x_1793136_mcp_nonce table — the only
+    // reliably-creatable unique-indexed nonce store (now-sdk deploys its table+UNIQUE index; the
+    // global x_mcp_nonce table could not be created via the Table API). The interleave is:
+    //   verify() (no nonce, no eval) -> INSERT-as-arbiter nonce -> execute().
+    // The try/catch around verify() is defense-in-depth (finding 31): if verify ever throws, close
+    // the audit row to 'rejected' + 401 instead of leaving it stuck 'running' with a 500.
+    var v
     try {
         // eslint-disable-next-line no-unsupported-node-builtins
-        out = new global.x_mcp_verify().run(code, actor, sig)
+        v = new global.x_mcp_verify().verify(code, actor, sig)
     } catch (re) {
         audit.status = 'rejected'
-        audit.error_class = 'nonce_consume_failed'
+        audit.error_class = 'verify_failed'
         audit.update()
         response.setStatus(401)
         response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
         return
     }
-    if (!out.verified) {
+    if (!v.verified) {
         audit.status = 'rejected'
         audit.error_class = 'actor_signature_invalid'
         audit.update()
@@ -124,12 +126,52 @@ function utf8Slice(s, maxBytes) {
         response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
         return
     }
+
+    // SINGLE-USE NONCE (finding 24): INSERT-as-arbiter into the scoped x_1793136_mcp_nonce table.
+    // The DB UNIQUE index on `value` is the concurrency arbiter — only one of two concurrent
+    // identical signed requests can insert the nonce; the loser's insert() returns falsy (or
+    // throws the constraint violation), which is a REPLAY -> 401, NO execute. Consuming AFTER
+    // verify avoids burning a nonce on a forged request; BEFORE execute avoids double-execution
+    // on replay. The 413/size gate above already ran, so an oversized call never burns its nonce.
+    var nonceVal = String(actor.nonce || '')
+    if (!nonceVal) {
+        audit.status = 'rejected'
+        audit.error_class = 'actor_signature_invalid'
+        audit.update()
+        response.setStatus(401)
+        response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
+        return
+    }
+    var ng = new GlideRecord('x_1793136_mcp_nonce')
+    ng.initialize()
+    ng.value = nonceVal
+    ng.created = new GlideDateTime()
+    var nid
+    try {
+        nid = ng.insert()
+    } catch (ne) {
+        nid = null // unique-index collision thrown => replay
+    }
+    if (!nid) {
+        audit.status = 'rejected'
+        audit.error_class = 'nonce_replay'
+        audit.update()
+        response.setStatus(401)
+        response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
+        return
+    }
+
     audit.actor_verified = true
     // Persist the SIGNED, verified justification (plan §P7 item 1/4): actor.reason is integrity-
     // bound by the HMAC the core just checked, so it is now trusted attribution — not an unsigned
     // POST field. The host no longer sends a top-level body.reason.
     audit.reason = String(actor.reason || '')
 
+    // EXECUTE the verified script (eval is global-only). execute() catches internally and never
+    // throws, so the audit row always closes below — no 'running'-stuck row on the execute path.
+    var out
+    // eslint-disable-next-line no-unsupported-node-builtins
+    out = new global.x_mcp_verify().execute(code)
     var err = out.error
     var status = err ? 'error' : 'ok'
     var serialized = out.serialized

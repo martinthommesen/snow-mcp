@@ -19,10 +19,18 @@
 //   actor.instance != this instance (cross-instance replay); issued_at outside ±freshness;
 //   replayed nonce (seen in the nonce table within the window).
 //
-// PUBLIC API: run(code, actor, sig) = verify + eval. Returns
-//   { verified:false }                                  — verification failed (wrapper -> 401)
-//   { verified:true, ok, error, serialized }            — verified; eval result/serialization
-// (The legacy `.verify()`-only split is gone; the scoped wrapper calls `.run()`.)
+// PUBLIC API (plan §P7 nonce-store fix):
+//   verify(code, actor, sig) -> { verified:boolean, error? }   — HMAC + script-bind + instance-
+//                                                                claim + freshness. NO nonce
+//                                                                single-use, NO eval.
+//   execute(code)            -> { serialized, error }          — new Function eval + serialize.
+//   run(code, actor, sig)    -> { verified:false } | { verified:true, ok, error, serialized }
+//                                                              — verify-then-execute (NO nonce);
+//                                                                back-compat for direct callers.
+// SINGLE-USE NONCE consumption is now owned by the SCOPED Fluent wrapper (it INSERTs into the
+// scoped x_1793136_mcp_nonce table, which has a DB UNIQUE index — the live, deployable store).
+// The core no longer touches any nonce table (the global x_mcp_nonce table could not be created
+// via the Table API). The nonce STAYS in the signed canonical — the HMAC still covers it.
 
 var x_mcp_verify = Class.create();
 x_mcp_verify.prototype = {
@@ -100,10 +108,12 @@ x_mcp_verify.prototype = {
     return c === name || c.indexOf(name + '.') === 0;
   },
 
-  // Returns true only if the signature is valid, fresh, script-bound, instance-bound, and
-  // non-replayed. Internal — callers use run().
-  _verify: function (script, actor, sig) {
-    if (!sig) return false;
+  // PUBLIC: verify the signed actor (HMAC + script-bind + instance-claim + freshness). NO nonce
+  // single-use and NO eval — the scoped wrapper interleaves verify -> consume-nonce -> execute so
+  // the single-use INSERT lands on the deployable scoped x_1793136_mcp_nonce table (plan §P7).
+  // Returns { verified:true } or { verified:false }.
+  verify: function (script, actor, sig) {
+    if (!sig) return { verified: false };
 
     // (a) script binding.
     // ⚠️ 0.13a seam: GlideDigest.getSHA256Base64(String) must hash the UTF-8 bytes of the
@@ -111,15 +121,15 @@ x_mcp_verify.prototype = {
     // If SN hashes UTF-16/Latin-1, non-ASCII scripts break signatures. Source-only here;
     // proven on a live PDI at P8 (see docs/OPEN_QUESTIONS.md). ASCII scripts are unaffected.
     var expectedHash = new GlideDigest().getSHA256Base64(String(script || ''));
-    if (expectedHash !== String(actor.script_sha256 || '')) return false;
+    if (expectedHash !== String(actor.script_sha256 || '')) return { verified: false };
 
     // (b) instance claim — reject cross-instance replay (a payload signed for another PDI).
-    if (!this._instanceMatches(actor.instance)) return false;
+    if (!this._instanceMatches(actor.instance)) return { verified: false };
 
     // (c) freshness
     var now = new GlideDateTime().getNumericValue();
     var issued = parseInt(actor.issued_at, 10);
-    if (isNaN(issued) || Math.abs(now - issued) > this.FRESHNESS_MS) return false;
+    if (isNaN(issued) || Math.abs(now - issued) > this.FRESHNESS_MS) return { verified: false };
 
     // (d) signature (current key, then previous key during rotation)
     var canonical = this._canonical(actor);
@@ -127,38 +137,16 @@ x_mcp_verify.prototype = {
     var keyPrev = gs.getProperty('x_1793136_mcp.executor.hmac_secret_prev', '');
     var ok = keyCur && this._constantTimeEquals(this._hmacBase64(keyCur, canonical), sig);
     if (!ok && keyPrev) ok = this._constantTimeEquals(this._hmacBase64(keyPrev, canonical), sig);
-    if (!ok) return false;
+    if (!ok) return { verified: false };
 
-    // (e) nonce replay defense — insert; duplicate insert => replay.
-    return this._consumeNonce(String(actor.nonce || ''));
+    // Nonce single-use is NOT checked here — the caller consumes it (INSERT-as-arbiter on the
+    // scoped x_1793136_mcp_nonce table) AFTER this returns verified:true and BEFORE execute().
+    return { verified: true };
   },
 
-  // ⚠️ REFERENCE-ONLY NONCE STORE. This canonical source targets the SCOPED x_1793136_mcp_nonce
-  // table, but this file is NOT deployed — the LIVE verifier is the GLOBAL core in
-  // scripts/executor-install.mjs, whose _consumeNonce writes the GLOBAL x_mcp_nonce table and
-  // treats a duplicate INSERT (falsy OR thrown unique-constraint violation) as a replay (that
-  // INSERT-as-arbiter is the concurrency-safe form; finding 24). Keep this reference and the
-  // live blob's _consumeNonce semantically aligned — both reject a replayed nonce — but the
-  // live store + its DB unique constraint live in executor-install.mjs.
-  _consumeNonce: function (nonce) {
-    if (!nonce) return false;
-    var existing = new GlideRecord('x_1793136_mcp_nonce');
-    existing.addQuery('value', nonce);
-    existing.setLimit(1);
-    existing.query();
-    if (existing.next()) return false; // replay
-
-    var row = new GlideRecord('x_1793136_mcp_nonce');
-    row.initialize();
-    row.value = nonce;
-    row.created = new GlideDateTime();
-    return !!row.insert();
-  },
-
-  // PUBLIC: verify the signed actor, then eval the script (plan §P7 item 2). The scoped
-  // wrapper owns audit/kill-switch/egress/size BEFORE calling this; this owns verify + eval.
-  run: function (code, actor, sig) {
-    if (!this._verify(code, actor, sig)) return { verified: false };
+  // PUBLIC: eval the verified script (plan §P7 item 2). Caller MUST have called verify() and
+  // consumed the nonce first. Returns { serialized, error }.
+  execute: function (code) {
     var result, err = null;
     try {
       var fn = new Function('gs', 'GlideRecord', 'GlideRecordSecure', 'GlideAggregate', '"use strict";\n' + code);
@@ -173,7 +161,16 @@ x_mcp_verify.prototype = {
       err = err || ('unserializable: ' + String(se));
       serialized = null;
     }
-    return { verified: true, ok: !err, error: err, serialized: serialized };
+    return { serialized: serialized, error: err };
+  },
+
+  // PUBLIC back-compat: verify-then-execute, NO nonce single-use (the wrapper owns that). The
+  // scoped wrapper does NOT call run() — it calls verify() / consume / execute() in order so the
+  // nonce INSERT lands between verify and execute. Kept for any direct caller.
+  run: function (code, actor, sig) {
+    if (!this.verify(code, actor, sig).verified) return { verified: false };
+    var out = this.execute(code);
+    return { verified: true, ok: !out.error, error: out.error, serialized: out.serialized };
   },
 
   type: 'x_mcp_verify',

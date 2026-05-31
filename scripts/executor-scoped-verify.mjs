@@ -121,14 +121,15 @@ check("audit-first row written to x_1793136_mcp_audit_log (audit_id returned)", 
   check("CONCURRENT replay: exactly ONE 200, the other 401 (DB-unique INSERT serializes the race)",
     exactlyOneOk && loserIs401, `(statuses ${a.status}/${b.status})`);
 }
-// 1b) The unique index that arbitrates the race MUST exist on the GLOBAL x_mcp_nonce table the
-//     LIVE core writes (NOT the scoped x_1793136_mcp_nonce, which the core leaves unused). Without
-//     the index the race is open even though the INSERT-as-arbiter code is present. The `unique`
-//     attribute readback is unreliable across families, so existence + the case-1 rejection is the
-//     proof; we assert the sys_index row exists.
+// 1b) The unique index that arbitrates the race MUST exist on the SCOPED x_1793136_mcp_nonce table
+//     the live wrapper writes (plan §P7 nonce-store fix). now-sdk install deploys it as index_name
+//     x_1793136_mcp_nonce_value_uq (confirmed in dist/app/dictionary/x_1793136_mcp_nonce.xml).
+//     Without the index the race is open even though the INSERT-as-arbiter code is present. The
+//     `unique` attribute readback is unreliable across families, so existence + the case-1
+//     rejection is the proof; we assert the sys_index row exists.
 {
-  const idx = (await api("GET", "/api/now/table/sys_index?sysparm_query=table=x_mcp_nonce^index_name=x_mcp_nonce_value_uq&sysparm_limit=1&sysparm_fields=sys_id,unique")).json?.result?.[0];
-  check("x_mcp_nonce unique index exists (the concurrency arbiter behind case 1)", Boolean(idx?.sys_id), `(sys_index ${idx?.sys_id ?? "MISSING"}, unique=${idx?.unique})`);
+  const idx = (await api("GET", "/api/now/table/sys_index?sysparm_query=table=x_1793136_mcp_nonce^index_name=x_1793136_mcp_nonce_value_uq&sysparm_limit=1&sysparm_fields=sys_id,unique")).json?.result?.[0];
+  check("x_1793136_mcp_nonce unique index exists (the concurrency arbiter behind case 1)", Boolean(idx?.sys_id), `(sys_index ${idx?.sys_id ?? "MISSING"}, unique=${idx?.unique})`);
 }
 
 // 2) INSTANCE-CLAIM mismatch -> 401. A VALIDLY-signed actor (good HMAC) whose signed `instance`
