@@ -4,6 +4,7 @@ import { createServer } from "./server.js";
 import { buildHandlers } from "./tools/handlers.js";
 import { serviceNowAuthHandler } from "./auth/servicenow-auth-handler.js";
 import { isOriginAllowed, originDeniedResponse, type OriginConfig } from "./observability/origin.js";
+import { serviceNowCallbackHandler } from "./auth/servicenow-callback-handler.js";
 import type { Mode } from "@servicenow-codemode/shared";
 
 // Durable Objects must be exported from the entry module (plan §2.10).
@@ -83,8 +84,12 @@ const apiHandler = {
       if (!isOriginAllowed(request, originConfig(env))) return originDeniedResponse();
       const props = ((ctx as { props?: unknown }).props as Record<string, unknown>) ?? {};
       const scopeMaxMode = (props.maxMode as Mode) ?? "read_only";
+      // The worker's own public origin (request-derived) so handlers can build the §6b reauth
+      // ticket URL `${origin}/servicenow/authorize?ticket=…`. It matches the callback's derived
+      // redirect_uri (same host) — see servicenow-callback-handler.ts.
+      const workerOrigin = new URL(request.url).origin;
       // Per-request server (§2.3); auth props flow to tools via getMcpAuthContext().
-      return await createMcpHandler(createServer(buildHandlers(env, { scopeMaxMode, props })), {
+      return await createMcpHandler(createServer(buildHandlers(env, { scopeMaxMode, props, workerOrigin })), {
         authContext: { props },
       })(request, env, ctx);
     } catch (e) {
@@ -122,6 +127,12 @@ export default {
       if (isAuthSurfacePath(new URL(request.url).pathname) && !isOriginAllowed(request, originConfig(env))) {
         return originDeniedResponse();
       }
+      // Per-user ServiceNow OAuth routes (§6b) live OUTSIDE /mcp and are NOT served by the
+      // OAuthProvider's defaultHandler — route them here (behind the origin guard above), and
+      // fall through to the provider for everything else. Identity is carried in via the
+      // host-HMAC ticket, never assumed (the routes have no ctx.props).
+      const snRoute = await serviceNowCallbackHandler(request, env as unknown as Parameters<typeof serviceNowCallbackHandler>[1]);
+      if (snRoute) return snRoute;
       return await provider.fetch(request, env, ctx);
     } catch (e) {
       console.error("top-level fetch error:", e instanceof Error ? e.message : String(e));

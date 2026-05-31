@@ -37,6 +37,14 @@ export interface RunCodeDeps {
    */
   buildRpc: (effectiveMode: Mode, runBudget: RunBudget, runContext: RunContext) => ServiceNowRPC;
   /**
+   * Pre-sandbox per-user auth preflight (§6b). Called BEFORE the daily reserve / transpile /
+   * executor so a per_user_oauth caller with no usable ServiceNow token short-circuits with a
+   * host-attested `reauth_required` (+authorizeUrl) before any billable Dynamic Worker spins.
+   * Throws McpToolError on a missing/corrupt token; resolves quietly when a usable token exists
+   * or in integration_user (a no-op there). Optional so tests/non-OAuth boots can omit it.
+   */
+  preflightAuth?: () => Promise<void>;
+  /**
    * Atomic daily budget reserve-before-load (§4.5). Called BEFORE the executor is
    * created, so an exhausted caller never creates a billable Dynamic Worker. Returns
    * { ok:false, dimension } when a daily cap would be exceeded. Backed by BudgetDO in
@@ -85,6 +93,14 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
     // admin_script requires a mandatory reason (§3.5; approval gate is layered above).
     if (effectiveMode === "admin_script" && !input.reason?.trim()) {
       throw new McpToolError("capability_denied", "admin_script requires a non-empty `reason`.");
+    }
+
+    // 2.6) per-user auth preflight (§6b). Must precede the daily reserve + executor so a
+    //      per_user_oauth caller with no usable ServiceNow token reauths BEFORE any billable
+    //      Worker (or budget reservation) — host-attested reauth_required, carrying authorizeUrl
+    //      via the McpToolError detail (toToolResult propagates it). No-op in integration_user.
+    if (deps.preflightAuth) {
+      await deps.preflightAuth();
     }
 
     // 2.5) daily budget RESERVE-BEFORE-LOAD (§3.1/§4.5). Must precede transpile/executor

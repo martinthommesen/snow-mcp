@@ -10,6 +10,11 @@ export interface SnTokens {
   refresh_token?: string;
   /** epoch ms when the access token expires. */
   expires_at?: number;
+  /** ServiceNow principal resolved after the code exchange/refresh (§6b). The per-user sys_id
+   *  feeds the signed actor's `snow_effective_user_sys_id`; roles seed 6b-2's roleHash. They
+   *  ride the same AAD-bound encrypted envelope as the tokens (tamper-evident, no extra store). */
+  sys_id?: string;
+  roles?: string[];
 }
 
 /** Minimal slice of TokenStoreDO this adapter needs (keeps it test-injectable). */

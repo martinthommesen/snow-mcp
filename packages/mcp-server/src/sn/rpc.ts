@@ -53,8 +53,16 @@ export interface ServiceNowRpcDeps {
   effectiveMode: Mode;
   actorPolicy: ActorPolicy;
   runBudget: RunBudget;
-  /** integration_user only: claims + key to sign mutating/executor calls (§2.0). */
-  signing?: { claims: ActorClaims; hmacKey: Uint8Array; nonce: () => string; now: () => number };
+  /** Host-signed actor for mutating/executor calls (§2.0). Always host-signed when the executor
+   *  is configured, orthogonal to credential mode. In per_user_oauth, `resolveEffectiveUserSysId`
+   *  fills the `snow_effective_user_sys_id` claim lazily at sign time (§6b option (b)). */
+  signing?: {
+    claims: ActorClaims;
+    hmacKey: Uint8Array;
+    nonce: () => string;
+    now: () => number;
+    resolveEffectiveUserSysId?: () => Promise<string>;
+  };
   /** Executor endpoint path (instance-specific; global-scope APIs get a numeric namespace). */
   executorPath?: string;
   /**
@@ -377,8 +385,9 @@ export class ServiceNowRPC {
     validateIdempotencyKey(args.idempotencyKey);
     requireCapability(this.deps.effectiveMode, "runServerScript");
     if (!this.deps.signing) {
-      // per_user_oauth mode does not sign (native attribution); integration_user must.
-      throw new Error("runServerScript requires signed-actor configuration in integration_user mode.");
+      // The executor call is ALWAYS host-signed when the executor is configured (orthogonal to
+      // credential mode — see the method header). No signing config => the executor is unwired.
+      throw new Error("runServerScript requires signed-actor configuration (executor not configured).");
     }
     const signing = this.deps.signing;
     this.deps.runBudget.countRpcCall();
@@ -387,8 +396,12 @@ export class ServiceNowRPC {
     // snippet's args.reason. Used for the executor-side audit (P7) POST body, the requestHash,
     // the approval context, and the host audit row.
     const sendScript = async (reason: string): Promise<unknown> => {
+      // §6b: in per_user_oauth, resolve the effective user's sys_id at sign time and bind it into
+      // the signed claims (the executor verifies it). Empty/absent (or integration_user) keeps
+      // the base claim "" — native attribution / shared-credential, unchanged from today.
+      const effectiveSysId = signing.resolveEffectiveUserSysId ? await signing.resolveEffectiveUserSysId() : "";
       const signed = await signActor({
-        claims: signing.claims,
+        claims: effectiveSysId ? { ...signing.claims, snow_effective_user_sys_id: effectiveSysId } : signing.claims,
         script: args.script,
         issuedAt: signing.now(),
         nonce: signing.nonce(),

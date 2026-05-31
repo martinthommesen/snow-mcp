@@ -19,7 +19,8 @@ import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
 import { MODE_RISK } from "@servicenow-codemode/shared";
 import { SchemaCache } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
-import { getServiceNowBearer, type SnOAuthConfig } from "../auth/servicenow-oauth.js";
+import { getServiceNowBearer, preflightAuth, resolveSnPrincipal, type SnOAuthConfig } from "../auth/servicenow-oauth.js";
+import { mintTicket } from "../auth/servicenow-ticket.js";
 import { buildKekRing } from "../auth/crypto.js";
 import type { MutationDeps } from "../sn/rpc.js";
 import { auditKey, type RunContext, type AuditIdentity, type LedgerHandle } from "../sn/mutation-guard.js";
@@ -51,6 +52,9 @@ export interface HandlerEnv {
   SNOW_OAUTH_CLIENT_ID?: string;
   SNOW_OAUTH_CLIENT_SECRET?: string;
   TOKEN_DO?: DurableObjectNamespace;
+  // Host secret for the per-user OAuth reauth ticket (§6b). Reused (not a new required secret);
+  // also the OAuthProvider state secret. Optional: absent + per_user_oauth ⇒ no ticket minted.
+  OAUTH_PROVIDER_SECRET?: string;
   TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
   SNAPSHOT_KEK?: string; // one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
   // Versioned KEK ring (P3): current + optional previous, for token + snapshot stores.
@@ -106,6 +110,9 @@ export interface AuthContext {
   /** Highest mode the client's OAuth scope permits (auth.props.maxMode, §2.0.1/§2.4). */
   scopeMaxMode: Mode;
   props?: Record<string, unknown>;
+  /** The worker's own public origin (request-derived in apiHandler), used to build the §6b
+   *  reauth ticket URL `${origin}/servicenow/authorize?ticket=…`. Absent in non-HTTP callers. */
+  workerOrigin?: string;
 }
 
 export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandlers {
@@ -133,7 +140,29 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   const oauthReady = Boolean(env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST);
   const devConnected = Boolean(env.SNOW_INSTANCE_HOST && env.SNOW_DEV_ROPC_USERNAME && env.SNOW_DEV_ROPC_PASSWORD);
 
+  // §6b reauth ticket: in per_user_oauth, a missing/corrupt token must surface a click-through
+  // reauth link (the host-HMAC ticket URL = `${workerOrigin}/servicenow/authorize?ticket=…`).
+  // Minting is async + memoized (one per buildHandlers); the ticket carries the userId from the
+  // authenticated /mcp request. Absent secret/origin (or integration_user) ⇒ undefined URL (the
+  // reauth_required still fires, just without a link). The ticket is short-lived (10 min).
+  let authorizeUrlPromise: Promise<string | undefined> | undefined;
+  const reauthAuthorizeUrl = (): Promise<string | undefined> => {
+    if (credentialMode !== "per_user_oauth" || !auth?.workerOrigin || !env.OAUTH_PROVIDER_SECRET) {
+      return Promise.resolve(undefined);
+    }
+    authorizeUrlPromise ??= (async () => {
+      const ticket = await mintTicket(
+        { userId, instanceHost, nonce: crypto.randomUUID(), exp: Date.now() + 10 * 60 * 1000 },
+        env.OAUTH_PROVIDER_SECRET!,
+      );
+      return `${auth.workerOrigin}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`;
+    })();
+    return authorizeUrlPromise;
+  };
+
   let http: SnHttpClient;
+  let oauthStore: (() => Promise<TokenStore>) | undefined;
+  let oauthCfg: SnOAuthConfig | undefined;
   if (oauthReady) {
     const stub = env.TOKEN_DO!.get(env.TOKEN_DO!.idFromName(`${userId}|${instanceHost}`)) as unknown as {
       putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>; revokeAll(): Promise<void>;
@@ -143,15 +172,16 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
       ...(env.SNOW_DEV_ROPC_USERNAME ? { ropcUsername: env.SNOW_DEV_ROPC_USERNAME } : {}),
       ...(env.SNOW_DEV_ROPC_PASSWORD ? { ropcPassword: env.SNOW_DEV_ROPC_PASSWORD } : {}),
     };
+    oauthCfg = cfg;
+    // Versioned, content-addressed KEK ring (P3): TOKEN_KEK_CURRENT (+ optional TOKEN_KEK_PREV)
+    // so a key rotation never bricks stored tokens. Built lazily + reused per call.
+    oauthStore = async () => new TokenStore(stub, await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV), userId, instanceHost);
     http = new SnFetchClient({
       instanceHost, allowlist: { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] },
       getAuthorization: async () => {
-        // Versioned, content-addressed KEK ring (P3): TOKEN_KEK_CURRENT (+ optional
-        // TOKEN_KEK_PREV) so a key rotation never bricks stored tokens. P4 will build the
-        // snapshot ring the same way: buildKekRing(env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK, env.SNAPSHOT_KEK_PREV).
-        const ring = await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV);
-        const store = new TokenStore(stub, ring, userId, instanceHost);
-        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), credentialMode));
+        const store = await oauthStore!();
+        // per_user_oauth: missing/corrupt token ⇒ reauth_required (+authorizeUrl), never ROPC.
+        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), credentialMode, await reauthAuthorizeUrl()));
       },
     });
   } else if (devConnected) {
@@ -203,6 +233,35 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
       }
     : undefined;
 
+  // §6b — resolve the per-user SN principal's sys_id, lazily, at runServerScript sign time
+  // (option (b): the sys_id is consumed ONLY by the signed `snow_effective_user_sys_id` claim,
+  // so resolving it here avoids a per-/mcp-request decrypt for reads/writes that never sign).
+  // Reads the principal stored alongside the token (persisted by the §6b callback / a prior
+  // resolve); if absent, resolves it live with the current bearer and persists it. Only in
+  // per_user_oauth — integration_user has no per-user principal (stays "").
+  const resolveEffectiveSysId = oauthReady && oauthStore && oauthCfg && credentialMode === "per_user_oauth"
+    ? async (): Promise<string> => {
+        const store = await oauthStore!();
+        const tokens = await store.get("servicenow").catch(() => null);
+        if (!tokens) return "";
+        if (tokens.sys_id) return tokens.sys_id;
+        const principal = await resolveSnPrincipal(oauthCfg!, tokens.access_token);
+        if (!principal) return "";
+        // Compare-and-merge (P6b-1 FIX 2): re-read immediately before rotate and merge ONLY
+        // sys_id/roles onto the LATEST stored value. A concurrent getAuthorization() refresh may
+        // have rotated access_token between our read and here; writing back the token we first
+        // read would clobber that fresher access_token (last-writer-wins). If the re-read returns
+        // null (token revoked mid-flight) we skip the rotate and just return the resolved sys_id.
+        const latest = await store.get("servicenow").catch(() => null);
+        if (latest) {
+          latest.sys_id = principal.sys_id;
+          latest.roles = principal.roles;
+          await store.rotate("servicenow", latest);
+        }
+        return principal.sys_id;
+      }
+    : undefined;
+
   // Executor signing (§2.0): host HMAC-signs the actor payload the x_mcp executor verifies.
   const executorReady = Boolean(env.X_MCP_EXECUTOR_HMAC_KEY && env.SNOW_EXECUTOR_PATH);
   const signing = executorReady
@@ -217,6 +276,8 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
         hmacKey: b64ToBytes(env.X_MCP_EXECUTOR_HMAC_KEY!),
         nonce: () => crypto.randomUUID(),
         now: () => Date.now(),
+        // §6b: resolve the effective user's sys_id at sign time (per_user_oauth only).
+        ...(resolveEffectiveSysId ? { resolveEffectiveUserSysId: resolveEffectiveSysId } : {}),
       }
     : undefined;
 
@@ -310,6 +371,13 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     };
   }
 
+  // §6b pre-sandbox reauth preflight: in per_user_oauth, short-circuit with host-attested
+  // reauth_required (+authorizeUrl) BEFORE the billable Worker when no usable token exists.
+  // No-op in integration_user / non-OAuth boots (oauthStore absent).
+  const preflightAuthDep = oauthStore
+    ? async (): Promise<void> => preflightAuth(await oauthStore!(), credentialMode, await reauthAuthorizeUrl())
+    : undefined;
+
   const runCodeDeps: RunCodeDeps = {
     loader: env.LOADER,
     scopeMaxMode, // from the client's OAuth scope (§2.0.1)
@@ -328,6 +396,7 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
         ...(signing ? { signing, executorPath: env.SNOW_EXECUTOR_PATH! } : {}),
         mutation: buildMutationDeps(runContext),
       }),
+    ...(preflightAuthDep ? { preflightAuth: preflightAuthDep } : {}),
     ...(reserveDailyBudget ? { reserveDailyBudget } : {}),
     ...(accrueDailyBudget ? { accrueDailyBudget } : {}),
   };

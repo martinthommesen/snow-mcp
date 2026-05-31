@@ -1,14 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 
-// TokenStoreDO (plan §2.7, §2.10) — encrypted ServiceNow tokens, isolated per
-// (userId, instanceHost). Addressed by `idFromName("<userId>|<instanceHost>")`, so
-// partitioning is inherent in the stub address.
+// TokenStoreDO (plan §2.7, §2.10) — ServiceNow tokens, isolated per (userId, instanceHost).
+// Addressed by `idFromName("<userId>|<instanceHost>")`, so partitioning is inherent in the
+// stub address.
 //
-// SKELETON: stores opaque values to prove per-(user,instance) isolation (Phase 0.12).
-// The AES-GCM versioned envelope + AAD + KEK rotation is Phase 1.3 — NOT built here.
-// Until then this MUST NOT be used for real tokens (no encryption yet).
+// This DO stores OPAQUE values only. The AES-GCM versioned envelope + AAD + KEK rotation that
+// makes those values real tokens lives in the TokenStore ADAPTER (auth/token-store.ts), which
+// seals before putToken() and opens after getToken(): the plaintext token never reaches DO
+// storage. This object therefore needs no crypto of its own — it provides per-(user,instance)
+// isolation + revoke, and the adapter provides confidentiality + tamper-evidence.
 export class TokenStoreDO extends DurableObject {
-  /** Store an opaque token record under a token_type slot. */
+  /** Store an opaque (already-sealed) token record under a token_type slot. */
   async putToken(tokenType: string, opaque: string): Promise<void> {
     await this.ctx.storage.put(`tok:${tokenType}`, opaque);
   }

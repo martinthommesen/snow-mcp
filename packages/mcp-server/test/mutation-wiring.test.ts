@@ -405,3 +405,51 @@ describe("P4 — write field-mask + update-key validation hold on the guarded pa
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 });
+
+// ─── §6b — the resolved per-user SN principal sys_id reaches the SIGNED actor ──
+// Option (b) wiring: in per_user_oauth, signing.resolveEffectiveUserSysId() fills the
+// `snow_effective_user_sys_id` claim lazily at sign time. integration_user (no resolver) keeps
+// the base "" claim. These assert the NEW behavior end-to-end through signActor → POST body.
+describe("§6b runServerScript binds the resolved effective-user sys_id into the signed actor", () => {
+  const SCRIPT = "return gs.getUserName();";
+
+  function signingRpc(resolver?: () => Promise<string>): { rpc: ServiceNowRPC; http: MockHttp } {
+    const http = new MockHttp();
+    const r = new ServiceNowRPC({
+      http, instanceHost: INSTANCE, effectiveMode: "admin_script",
+      actorPolicy: permissivePolicy([INSTANCE]),
+      runBudget: new RunBudget(),
+      signing: {
+        claims: { ...SIGNING.claims }, // base snow_effective_user_sys_id: ""
+        hmacKey: SIGNING.hmacKey,
+        nonce: SIGNING.nonce,
+        now: SIGNING.now,
+        ...(resolver ? { resolveEffectiveUserSysId: resolver } : {}),
+      },
+      executorPath: "/api/x_1793136_mcp/executor/run",
+      mutation: mutationDeps({ runContext: { requestId: "r-eff", runKey: "k1", reason: "rotate" } }),
+    });
+    return { rpc: r, http };
+  }
+
+  it("per_user_oauth: the signed actor carries the resolved sys_id (not the base \"\")", async () => {
+    const { rpc: r, http } = signingRpc(async () => "EFFECTIVE_SYS_ID");
+    await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
+    const post = http.calls.find((c) => c.method === "POST")!;
+    expect((post.body as { actor: { snow_effective_user_sys_id: string } }).actor.snow_effective_user_sys_id).toBe("EFFECTIVE_SYS_ID");
+  });
+
+  it("integration_user (no resolver): the signed actor keeps snow_effective_user_sys_id \"\"", async () => {
+    const { rpc: r, http } = signingRpc(); // no resolveEffectiveUserSysId
+    await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
+    const post = http.calls.find((c) => c.method === "POST")!;
+    expect((post.body as { actor: { snow_effective_user_sys_id: string } }).actor.snow_effective_user_sys_id).toBe("");
+  });
+
+  it("a resolver that yields \"\" (principal unresolved) keeps the base claim \"\"", async () => {
+    const { rpc: r, http } = signingRpc(async () => "");
+    await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
+    const post = http.calls.find((c) => c.method === "POST")!;
+    expect((post.body as { actor: { snow_effective_user_sys_id: string } }).actor.snow_effective_user_sys_id).toBe("");
+  });
+});
