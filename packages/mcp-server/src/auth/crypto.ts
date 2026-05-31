@@ -119,3 +119,42 @@ export async function deriveKeyBytes(secret: string): Promise<Uint8Array> {
   const digest = await crypto.subtle.digest("SHA-256", enc.encode(secret) as BufferSource);
   return new Uint8Array(digest);
 }
+
+function hex(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += bytes[i]!.toString(16).padStart(2, "0");
+  return s;
+}
+
+/**
+ * Content-addressed KEK version label: `kek-${hex(sha256(keyBytes)).slice(0,8)}`. Distinct
+ * keys are overwhelmingly unlikely to share a label (32-bit content address), which avoids
+ * the constant-"current" same-label collision that defeated rotation before P3. A label
+ * collision is harmless: GCM authentication — not the label — decides decryption, so a wrong
+ * key can never produce a valid open(); a collision only adds a candidate to open()'s loop.
+ * The label is stable across deploys for a given passphrase (P3).
+ */
+async function kekLabel(keyBytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", keyBytes as BufferSource));
+  return `kek-${hex(digest).slice(0, 8)}`;
+}
+
+/**
+ * Build a rotation-capable KEK ring from a current passphrase (+ optional previous) using
+ * content-addressed version labels (P3). Reused for BOTH the token ring (wired now) and the
+ * snapshot ring (P4 consumes this same helper). Fails closed if no current secret is given.
+ *
+ * Migration safety: a legacy envelope stamped `kekVersion:"current"` matches neither
+ * content-addressed label, so `open()`'s try-all fallback still decrypts it as long as
+ * `currentSecret` derives the same bytes the old `TOKEN_KEK` passphrase did.
+ */
+export async function buildKekRing(currentSecret: string, prevSecret?: string): Promise<KekRing> {
+  if (!currentSecret) throw new Error("KEK ring requires a current secret (fail closed).");
+  const currentBytes = await deriveKeyBytes(currentSecret);
+  const ring: KekRing = { current: { version: await kekLabel(currentBytes), keyBytes: currentBytes } };
+  if (prevSecret) {
+    const prevBytes = await deriveKeyBytes(prevSecret);
+    ring.previous = { version: await kekLabel(prevBytes), keyBytes: prevBytes };
+  }
+  return ring;
+}

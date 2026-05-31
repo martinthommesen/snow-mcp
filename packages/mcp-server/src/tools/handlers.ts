@@ -18,7 +18,7 @@ import { DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
 import { SchemaCache } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
 import { getServiceNowBearer, type SnOAuthConfig } from "../auth/servicenow-oauth.js";
-import { deriveKeyBytes, type KekRing } from "../auth/crypto.js";
+import { buildKekRing } from "../auth/crypto.js";
 import type { Mode } from "@servicenow-codemode/shared";
 
 class NotConnectedHttpClient implements SnHttpClient {
@@ -82,7 +82,10 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   //     TokenStoreDO (§2.7, §7.5). Preferred.
   //  2. Dev Basic-Auth fallback.
   //  3. Not connected -> fail closed.
-  const oauthReady = Boolean(env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && env.TOKEN_KEK && env.SNOW_INSTANCE_HOST);
+  // TOKEN_KEK is a one-release alias for TOKEN_KEK_CURRENT (P3 migration).
+  const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
+  const credentialMode = env.SERVICENOW_CREDENTIAL_MODE ?? "integration_user";
+  const oauthReady = Boolean(env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST);
   const devConnected = Boolean(env.SNOW_INSTANCE_HOST && env.SNOW_DEV_ROPC_USERNAME && env.SNOW_DEV_ROPC_PASSWORD);
 
   let http: SnHttpClient;
@@ -98,10 +101,12 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     http = new SnFetchClient({
       instanceHost, allowlist: { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] },
       getAuthorization: async () => {
-        // Derive the AES key from the KEK passphrase (any string) lazily (async).
-        const ring: KekRing = { current: { version: "current", keyBytes: await deriveKeyBytes(env.TOKEN_KEK!) } };
+        // Versioned, content-addressed KEK ring (P3): TOKEN_KEK_CURRENT (+ optional
+        // TOKEN_KEK_PREV) so a key rotation never bricks stored tokens. P4 will build the
+        // snapshot ring the same way: buildKekRing(env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK, env.SNAPSHOT_KEK_PREV).
+        const ring = await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV);
         const store = new TokenStore(stub, ring, userId, instanceHost);
-        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now()));
+        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), credentialMode));
       },
     });
   } else if (devConnected) {

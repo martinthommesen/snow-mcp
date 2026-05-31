@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { seal, open, tokenAad, type KekRing } from "../src/auth/crypto.js";
+import { seal, open, tokenAad, buildKekRing, deriveKeyBytes, type KekRing } from "../src/auth/crypto.js";
 
 // ─── §2.7 — AES-256-GCM token envelope (S7 fragments) ─────────────────────────
 // WebCrypto, fully verified locally.
@@ -46,5 +46,42 @@ describe("§2.7 token envelope", () => {
     const env = await seal("tok", aad, ringV1);
     const newRing: KekRing = { current: { version: "2026-07", keyBytes: key(9) } };
     await expect(open(env, aad, newRing)).rejects.toThrow();
+  });
+});
+
+// ─── P3 — content-addressed versioned KEK ring (closes finding 28 wiring) ─────
+describe("§P3 buildKekRing", () => {
+  it("uses content-addressed labels (not the constant 'current'); distinct keys differ", async () => {
+    const ringA = await buildKekRing("passphrase-A");
+    const ringB = await buildKekRing("passphrase-B");
+    expect(ringA.current.version).toMatch(/^kek-[0-9a-f]{8}$/);
+    expect(ringA.current.version).not.toBe("current");
+    expect(ringB.current.version).not.toBe(ringA.current.version);
+    // Same passphrase → stable label across deploys.
+    expect((await buildKekRing("passphrase-A")).current.version).toBe(ringA.current.version);
+  });
+
+  it("round-trips across a rotation: seal under current, open after current→prev + new current", async () => {
+    const oldRing = await buildKekRing("old-pass");
+    const env = await seal("tok", aad, oldRing);
+    const rotated = await buildKekRing("new-pass", "old-pass"); // current=new, previous=old
+    expect(rotated.previous?.version).toBe(oldRing.current.version);
+    expect(await open(env, aad, rotated)).toBe("tok");
+  });
+
+  it("migration: a legacy envelope stamped kekVersion:'current' still opens under the new ring", async () => {
+    // Old code sealed with version label "current" and key = deriveKeyBytes(passphrase).
+    const legacyRing: KekRing = { current: { version: "current", keyBytes: await deriveKeyBytes("legacy-pass") } };
+    const legacyEnv = await seal("legacy-token", aad, legacyRing);
+    expect(legacyEnv.kekVersion).toBe("current");
+    // New ring built from the SAME passphrase → label is content-addressed (matches neither),
+    // so open()'s try-all fallback decrypts it.
+    const newRing = await buildKekRing("legacy-pass");
+    expect(newRing.current.version).not.toBe("current");
+    expect(await open(legacyEnv, aad, newRing)).toBe("legacy-token");
+  });
+
+  it("fails closed when no current secret is given (missing KEK)", async () => {
+    await expect(buildKekRing("")).rejects.toThrow(/fail closed/i);
   });
 });

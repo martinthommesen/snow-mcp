@@ -4,6 +4,10 @@
 // `getServiceNowBearer` mints on first use, refreshes when expired, and persists rotations.
 
 import type { SnTokens, TokenStore } from "./token-store.js";
+import { McpToolError } from "../sn/errors.js";
+
+/** Which ServiceNow credential model the bearer is sourced from (P3 corrupt/missing branch). */
+export type CredentialMode = "per_user_oauth" | "integration_user";
 
 export interface SnOAuthConfig {
   instanceHost: string;
@@ -51,9 +55,37 @@ export function refreshGrant(cfg: SnOAuthConfig, refreshToken: string, now: numb
 /**
  * Return a valid ServiceNow Bearer access token for `store`'s (user, instance): reuse the
  * stored token, refresh it if expired (persisting the rotation), or mint via ROPC if none.
+ *
+ * `mode` (default `integration_user`) governs ONLY the corrupt/undecryptable-token branch
+ * (P3 fail-closed re-mint): a decrypt failure must never escape past the recovery path.
+ *  - `integration_user` → recover by re-minting via ROPC (no throw).
+ *  - `per_user_oauth`    → raise `reauth_required`, NEVER ROPC.
+ * The full reuse/refresh/authorize mode-split (incl. the missing-token per_user path, which
+ * still ROPCs here) lands in P6b's `getServiceNowBearer(mode)` signature.
  */
-export async function getServiceNowBearer(cfg: SnOAuthConfig, store: TokenStore, now: number): Promise<string> {
-  const existing = await store.get("servicenow");
+export async function getServiceNowBearer(
+  cfg: SnOAuthConfig,
+  store: TokenStore,
+  now: number,
+  mode: CredentialMode = "integration_user",
+): Promise<string> {
+  // Fail-closed re-mint: an undecryptable stored token (e.g. after a botched KEK rotation)
+  // must not propagate past recovery. Treat a decrypt failure as "no usable token".
+  let existing: SnTokens | null;
+  try {
+    existing = await store.get("servicenow");
+  } catch (e) {
+    // Observability (P3 review): the catch covers EVERY store.get() failure, not only a
+    // botched-rotation decrypt — open() raises an AAD mismatch FIRST (crypto.ts), which is
+    // the tamper / cross-user-misroute signal. integration_user recovery re-mints and
+    // overwrites, so without this line that signal would vanish silently. The message
+    // carries only GCM/AAD error text — no token plaintext or key material.
+    console.error("getServiceNowBearer: stored token unreadable, recovering per mode:", e instanceof Error ? e.message : String(e));
+    if (mode === "per_user_oauth") {
+      throw new McpToolError("reauth_required", "ServiceNow token could not be decrypted — re-authenticate.");
+    }
+    existing = null; // integration_user: fall through to a fresh ROPC mint.
+  }
   if (existing && (existing.expires_at === undefined || existing.expires_at > now)) {
     return existing.access_token;
   }

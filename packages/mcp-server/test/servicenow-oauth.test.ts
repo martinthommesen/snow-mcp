@@ -2,6 +2,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { getServiceNowBearer, type SnOAuthConfig } from "../src/auth/servicenow-oauth.js";
 import { TokenStore } from "../src/auth/token-store.js";
+import { McpToolError } from "../src/sn/errors.js";
 import type { KekRing } from "../src/auth/crypto.js";
 
 // ─── §2.8 / §7.5 — ServiceNow OAuth token mint / reuse / refresh ──────────────
@@ -52,5 +53,37 @@ describe("§2.8 getServiceNowBearer", () => {
     expect(tok).toBe("NEW");
     expect(calls).toEqual([{ grant: "refresh_token" }]);
     expect((await s.get("servicenow"))?.refresh_token).toBe("RKEEP"); // carried forward
+  });
+});
+
+// ─── P3 — fail-closed re-mint on an undecryptable stored token (closes finding 29) ──
+// Seal a token under ring A, then read it back through a store over the SAME (user|instance)
+// DO but a different KEK (key mismatch → store.get() throws). The decrypt failure must never
+// escape past recovery: integration_user re-mints; per_user_oauth raises reauth_required.
+const ringA: KekRing = { current: { version: "current", keyBytes: new Uint8Array(32).fill(1) } };
+const ringB: KekRing = { current: { version: "current", keyBytes: new Uint8Array(32).fill(2) } };
+const corruptStore = (u: string) => {
+  const id = NS.idFromName(`${u}|inst1`);
+  return { writer: new TokenStore(NS.get(id), ringA, u, "inst1"), reader: new TokenStore(NS.get(id), ringB, u, "inst1") };
+};
+
+describe("§P3 getServiceNowBearer — corrupt token fail-closed re-mint", () => {
+  it("integration_user: an undecryptable token is re-minted via ROPC (no throw)", async () => {
+    const { writer, reader } = corruptStore("oaCorruptIU");
+    await writer.put("servicenow", { access_token: "UNDECRYPTABLE", refresh_token: "R", expires_at: 10_000 });
+    const { fetchImpl, calls } = mockFetch({ password: { access_token: "REMINT", refresh_token: "RT", expires_in: 1800 } });
+    const tok = await getServiceNowBearer(baseCfg(fetchImpl), reader, 5_000, "integration_user");
+    expect(tok).toBe("REMINT");
+    expect(calls).toEqual([{ grant: "password" }]); // re-minted, never refreshed the corrupt token
+  });
+
+  it("per_user_oauth: an undecryptable token raises reauth_required and NEVER hits the network", async () => {
+    const { writer, reader } = corruptStore("oaCorruptPU");
+    await writer.put("servicenow", { access_token: "UNDECRYPTABLE", refresh_token: "R", expires_at: 10_000 });
+    const { fetchImpl, calls } = mockFetch({ password: { access_token: "SHOULD_NOT_MINT" } });
+    const err = await getServiceNowBearer(baseCfg(fetchImpl), reader, 5_000, "per_user_oauth").catch((e) => e);
+    expect(err).toBeInstanceOf(McpToolError);
+    expect((err as McpToolError).code).toBe("reauth_required");
+    expect(calls).toEqual([]); // no ROPC, no refresh
   });
 });
