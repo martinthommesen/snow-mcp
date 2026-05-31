@@ -66,7 +66,9 @@ describe("Phase 4 — run_code pipeline", () => {
 
   it("capability gate fires INSIDE the sandbox when read_only calls a write method", async () => {
     const res = await runCode(
-      { code: `async () => { await servicenow.tableUpdate({ table: "incident", sys_id: "a1", fields: { state: 2 }, idempotencyKey: "k1" }); return "did-write"; }` },
+      // sys_id is a valid 32-hex id so P1 input validation passes and the run reaches
+      // the capability gate (the actual subject of this test).
+      { code: `async () => { await servicenow.tableUpdate({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fields: { state: 2 }, idempotencyKey: "k1" }); return "did-write"; }` },
       deps({ scope: "read_only", tenant: "read_only", instance: "read_only" }),
     );
     expect(res.isError).toBe(true);
@@ -109,6 +111,18 @@ describe("Phase 4 — run_code pipeline", () => {
     const row = JSON.parse(res.content[0]!.text);
     expect(row.number).toBe("INC0001");
     expect(row.caller_id).toBeUndefined();
+  });
+
+  it("P1 — a bad sys_id from inside the sandbox surfaces typed path_denied", async () => {
+    // The validation throw must survive the sandbox boundary with its typed code intact
+    // (McpToolError -> coded() -> [[path_denied]] -> parseSandboxError), the same way the
+    // capability gate above does.
+    const res = await runCode(
+      { code: `async () => { await servicenow.tableGet({ table: "incident", sys_id: "../sys_user/x" }); return "got"; }` },
+      deps({ scope: "read_only", tenant: "read_only", instance: "read_only" }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("path_denied");
   });
 
   it("rejects oversize code as code_size (pre-transpile)", async () => {

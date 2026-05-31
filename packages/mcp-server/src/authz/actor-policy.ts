@@ -6,6 +6,7 @@
 // access natively.)
 
 import { McpToolError } from "../sn/errors.js";
+import { assertMandatoryRowFilterSafe } from "../sn/validate.js";
 import { MODE_RISK, type Mode } from "@servicenow-codemode/shared";
 
 export interface ActorPolicy {
@@ -31,6 +32,18 @@ export function permissivePolicy(allowedInstances: string[]): ActorPolicy {
     maxRowsPerRun: Number.MAX_SAFE_INTEGER,
     maxBytesPerRun: Number.MAX_SAFE_INTEGER,
   };
+}
+
+/**
+ * Validate a policy's mandatory `rowFilters` at load time (P1): a mandatory filter that
+ * itself contains a structural operator (`^NQ`/`^OR`/`^EQ`) is self-defeating, since the
+ * caller query is AND-ed AFTER it and such an operator would let rows escape the filter.
+ * Call when a (restrictive) policy is constructed from config (wired in P6b's loader).
+ */
+export function assertPolicyRowFiltersSafe(policy: ActorPolicy): void {
+  for (const [table, filter] of Object.entries(policy.rowFilters ?? {})) {
+    assertMandatoryRowFilterSafe(table, filter);
+  }
 }
 
 function tableAllowed(policy: ActorPolicy, table: string): boolean {
@@ -68,23 +81,31 @@ export function applyRowFilter(policy: ActorPolicy, table: string, userQuery: st
   return userQuery ? `${mandatory}^${userQuery}` : mandatory;
 }
 
-/** Strip masked fields from a record (response filtering, §2.12). */
+/** True if a field reference `f` is covered by a mask `m`: exact match OR a dot-walk
+ *  descendant (mask `caller_id` also covers `caller_id.value`, `caller_id.name`). */
+function isMaskedBy(field: string, mask: string): boolean {
+  return field === mask || field.startsWith(`${mask}.`);
+}
+
+/** Strip masked fields from a record (response filtering, §2.12). Dot-aware: a mask on
+ *  `caller_id` also strips dot-walked keys like `caller_id.value`. */
 export function maskRow(policy: ActorPolicy, table: string, row: Record<string, unknown>): Record<string, unknown> {
   const masked = policy.fieldMasks[table];
   if (!masked || masked.length === 0) return row;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(row)) {
-    if (!masked.includes(k)) out[k] = v;
+    if (!masked.some((m) => isMaskedBy(k, m))) out[k] = v;
   }
   return out;
 }
 
-/** Reject requested fields that are masked (request filtering, §2.12). */
+/** Reject requested fields that are masked (request filtering, §2.12). Dot-aware: a
+ *  request for `caller_id.name` is denied when `caller_id` is masked. */
 export function assertRequestedFieldsAllowed(policy: ActorPolicy, table: string, fields: string[] | undefined): void {
   if (!fields) return;
   const masked = policy.fieldMasks[table];
   if (!masked || masked.length === 0) return;
-  const violating = fields.filter((f) => masked.includes(f));
+  const violating = fields.filter((f) => masked.some((m) => isMaskedBy(f, m)));
   if (violating.length > 0) {
     throw new McpToolError("actor_policy_denied", `Fields not permitted for this actor on "${table}": ${violating.join(", ")}.`);
   }

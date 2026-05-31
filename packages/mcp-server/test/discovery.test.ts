@@ -9,8 +9,10 @@ const INSTANCE = "inst1.service-now.com";
 
 class MockHttp implements SnHttpClient {
   calls: SnRequest[] = [];
+  constructor(private readonly responder?: (req: SnRequest) => SnResponse) {}
   async request(req: SnRequest): Promise<SnResponse> {
     this.calls.push(req);
+    if (this.responder) return this.responder(req);
     if (req.path === "/api/now/table/sys_dictionary") {
       return {
         status: 200,
@@ -48,6 +50,26 @@ describe("describe_table", () => {
   it("denies a table outside the actor's allowlist", async () => {
     const policy: ActorPolicy = { ...permissivePolicy([INSTANCE]), tables: { allow: [/^incident$/] } };
     await expect(describeTable(deps(new MockHttp(), policy), "sys_user")).rejects.toThrow(McpToolError);
+  });
+
+  it("drops a malicious super_class.name from the nameIN chain (re-validation is load-bearing)", async () => {
+    // tableHierarchy re-validates each parent's super_class.name before it enters the
+    // `nameIN${chain.map(esc).join(",")}` join. `esc` strips ^/= but NOT commas, so a
+    // malicious parent like "evil,sys_user" would comma-inject the describe query if the
+    // TABLE_NAME_RE re-validation were absent (CODE_REVIEW.md:552-559).
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        return { status: 200, json: { result: [{ "super_class.name": "evil,sys_user" }] } };
+      }
+      return { status: 200, json: { result: [] } }; // sys_dictionary describe fetch
+    });
+    await describeTable(deps(http), "incident");
+    const describeCall = http.calls.find((c) => c.path === "/api/now/table/sys_dictionary");
+    expect(describeCall).toBeDefined();
+    const q = describeCall!.query!.sysparm_query;
+    // The malicious parent is dropped: only the validated root remains in the chain.
+    expect(q).toBe("nameINincident^elementISNOTEMPTY");
+    expect(q).not.toContain("sys_user");
   });
 });
 

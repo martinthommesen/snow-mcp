@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { canonicalizeInstanceHost, UrlNotAllowed } from "../src/sn/url-allowlist.js";
 import { checkScriptedRestPath, PathDenied } from "../src/sn/scripted-rest-denylist.js";
+import { SnFetchClient } from "../src/sn/http.js";
 
 // ─── S15 — URL allowlist / SSRF canonicalization (Phase 2.4) ──────────────────
 const allow = { allowedHostSuffixes: ["service-now.com"] } as const;
@@ -70,5 +71,41 @@ describe("B2 — scriptedRest cannot reach the executor or tamper config/audit",
     ]) {
       expect(() => checkScriptedRestPath(p)).toThrow(PathDenied);
     }
+  });
+});
+
+// ─── P1 — SnFetchClient transport path hardening (defense in depth) ────────────
+describe("P1 — SnFetchClient rejects traversal before any fetch", () => {
+  function client(): { c: SnFetchClient; fetched: string[] } {
+    const fetched: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      fetched.push(String(url));
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const c = new SnFetchClient({
+      instanceHost: "dev1.service-now.com",
+      allowlist: { allowedHostSuffixes: ["service-now.com"] },
+      getAuthorization: async () => "Bearer t",
+      fetchImpl,
+    });
+    return { c, fetched };
+  }
+
+  it("rejects literal and percent-encoded dot-segment traversal in the raw path", async () => {
+    const { c, fetched } = client();
+    for (const path of [
+      "/api/now/table/incident/../sys_properties",
+      "/api/now/table/incident/%2e%2e/sys_properties",
+      "/api/now/table/incident/%2E%2E/sys_properties",
+    ]) {
+      await expect(c.request({ method: "GET", path })).rejects.toThrow(/unsafe ServiceNow path/);
+    }
+    expect(fetched).toEqual([]); // never reached the network
+  });
+
+  it("allows an ordinary /api path through to fetch", async () => {
+    const { c, fetched } = client();
+    await c.request({ method: "GET", path: "/api/now/table/incident" });
+    expect(fetched[0]).toContain("/api/now/table/incident");
   });
 });

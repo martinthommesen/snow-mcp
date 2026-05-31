@@ -13,7 +13,7 @@
 
 import type { Mode } from "@servicenow-codemode/shared";
 import type { SnHttpClient } from "./http.js";
-import { mapServiceNowError, encodeSandboxError } from "./errors.js";
+import { mapServiceNowError, encodeSandboxError, McpToolError } from "./errors.js";
 import { requireCapability } from "../config.js";
 import { TABLE_PAGE_CAP } from "../config.js";
 import { RunBudget } from "./run-budget.js";
@@ -25,6 +25,16 @@ import {
   type ActorPolicy,
 } from "../authz/actor-policy.js";
 import { signActor, type ActorClaims } from "../auth/actor.js";
+import {
+  validateTableName,
+  validateSysId,
+  validateLimit,
+  validateFields,
+  validateUpdateFields,
+  validateIdempotencyKey,
+  validateReason,
+  validateUserQuery,
+} from "./validate.js";
 
 export interface ServiceNowRpcDeps {
   http: SnHttpClient;
@@ -60,13 +70,23 @@ export class ServiceNowRPC {
     this.deps.runBudget.countRpcCall();
   }
 
+  /** Does a mandatory row filter apply to this table (restrictive policy active)? */
+  private hasMandatoryFilter(table: string): boolean {
+    return Boolean(this.deps.actorPolicy.rowFilters?.[table]);
+  }
+
   async tableQuery(args: TableQueryArgs): Promise<TableRowsResult> {
-    this.gateRead(args.table, args.fields);
-    const query = applyRowFilter(this.deps.actorPolicy, args.table, args.query ?? "");
-    const limit = Math.min(args.limit ?? TABLE_PAGE_CAP, TABLE_PAGE_CAP);
+    // Validate untrusted sandbox input BEFORE the gate / any path interpolation (P1).
+    const table = validateTableName(args.table);
+    const reqFields = validateFields(args.fields);
+    const userQuery = validateUserQuery(args.query, this.hasMandatoryFilter(table));
+    const reqLimit = validateLimit(args.limit);
+    this.gateRead(table, reqFields);
+    const query = applyRowFilter(this.deps.actorPolicy, table, userQuery);
+    const limit = reqLimit ?? TABLE_PAGE_CAP;
 
     // sys_id is always fetched internally — the keyset cursor needs it (§1.7).
-    const fields = args.fields ? Array.from(new Set(["sys_id", ...args.fields])) : undefined;
+    const fields = reqFields ? Array.from(new Set(["sys_id", ...reqFields])) : undefined;
     const q: Record<string, string> = {
       sysparm_limit: String(limit),
       sysparm_exclude_reference_link: "true",
@@ -75,37 +95,47 @@ export class ServiceNowRPC {
     if (fields) q.sysparm_fields = fields.join(",");
 
     this.deps.runBudget.countServiceNowRequest();
-    const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${args.table}`, query: q });
+    const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}`, query: q });
     const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
     if (mapped) throw mapped;
 
     const raw = ((res.json as { result?: unknown[] }).result ?? []) as Record<string, unknown>[];
-    const rows = raw.map((r) => maskRow(this.deps.actorPolicy, args.table, r));
+    const rows = raw.map((r) => maskRow(this.deps.actorPolicy, table, r));
     this.deps.runBudget.countRows(rows.length);
     return { rows, partial: rows.length >= limit };
   }
 
   async tableGet(args: { table: string; sys_id: string; fields?: string[] }): Promise<Record<string, unknown> | null> {
-    this.gateRead(args.table, args.fields);
+    const table = validateTableName(args.table);
+    const sysId = validateSysId(args.sys_id);
+    const reqFields = validateFields(args.fields);
+    this.gateRead(table, reqFields);
     const q: Record<string, string> = { sysparm_exclude_reference_link: "true" };
-    if (args.fields) q.sysparm_fields = Array.from(new Set(["sys_id", ...args.fields])).join(",");
+    if (reqFields) q.sysparm_fields = Array.from(new Set(["sys_id", ...reqFields])).join(",");
     this.deps.runBudget.countServiceNowRequest();
-    const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${args.table}/${args.sys_id}`, query: q });
+    const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`, query: q });
     if (res.status === 404) return null;
     const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
     if (mapped) throw mapped;
     const row = (res.json as { result?: Record<string, unknown> }).result;
-    return row ? maskRow(this.deps.actorPolicy, args.table, row) : null;
+    return row ? maskRow(this.deps.actorPolicy, table, row) : null;
   }
 
   async aggregate(args: { table: string; query?: string; groupBy?: string[]; countField?: string }): Promise<unknown> {
-    this.gateRead(args.table);
-    const query = applyRowFilter(this.deps.actorPolicy, args.table, args.query ?? "");
+    const table = validateTableName(args.table);
+    const userQuery = validateUserQuery(args.query, this.hasMandatoryFilter(table));
+    // groupBy / countField are field references: validate AND mask-check (no masked
+    // field may be grouped/counted on — same boundary as requested read fields).
+    const groupBy = validateFields(args.groupBy);
+    const countFields = args.countField !== undefined ? validateFields([args.countField]) : undefined;
+    const fieldRefs = [...(groupBy ?? []), ...(countFields ?? [])];
+    this.gateRead(table, fieldRefs.length > 0 ? fieldRefs : undefined);
+    const query = applyRowFilter(this.deps.actorPolicy, table, userQuery);
     const q: Record<string, string> = { sysparm_count: "true" };
     if (query) q.sysparm_query = query;
-    if (args.groupBy) q.sysparm_group_by = args.groupBy.join(",");
+    if (groupBy) q.sysparm_group_by = groupBy.join(",");
     this.deps.runBudget.countServiceNowRequest();
-    const res = await this.deps.http.request({ method: "GET", path: `/api/now/stats/${args.table}`, query: q });
+    const res = await this.deps.http.request({ method: "GET", path: `/api/now/stats/${encodeURIComponent(table)}`, query: q });
     const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
     if (mapped) throw mapped;
     return (res.json as { result?: unknown }).result ?? null;
@@ -113,11 +143,17 @@ export class ServiceNowRPC {
 
   // ── mutating / executor methods: capability-gated; integration mode signs the actor ──
   async tableUpdate(args: { table: string; sys_id: string; fields: Record<string, unknown>; idempotencyKey: string }): Promise<Record<string, unknown>> {
-    assertActorPolicy(this.deps.actorPolicy, { instance: this.deps.instanceHost, table: args.table, mode: this.deps.effectiveMode });
+    const table = validateTableName(args.table);
+    const sysId = validateSysId(args.sys_id);
+    const fields = validateUpdateFields(args.fields);
+    validateIdempotencyKey(args.idempotencyKey);
+    assertActorPolicy(this.deps.actorPolicy, { instance: this.deps.instanceHost, table, mode: this.deps.effectiveMode });
     requireCapability(this.deps.effectiveMode, "writeTables");
+    // Masked fields may not be WRITTEN either (the mask applies to request AND response, §2.12).
+    assertRequestedFieldsAllowed(this.deps.actorPolicy, table, Object.keys(fields));
     this.deps.runBudget.countRpcCall();
     this.deps.runBudget.countServiceNowRequest();
-    const res = await this.deps.http.request({ method: "PATCH", path: `/api/now/table/${args.table}/${args.sys_id}`, body: args.fields });
+    const res = await this.deps.http.request({ method: "PATCH", path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`, body: fields });
     const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
     if (mapped) throw mapped;
     return (res.json as { result?: Record<string, unknown> }).result ?? {};
@@ -126,6 +162,11 @@ export class ServiceNowRPC {
   /** Arbitrary server-side script via the x_mcp executor (admin_script only). Builds
    *  the host-signed actor payload (§2.0) that the executor verifies in-scope. */
   async runServerScript(args: { script: string; reason: string; idempotencyKey: string }): Promise<unknown> {
+    if (typeof args.script !== "string" || args.script.length === 0) {
+      throw new McpToolError("path_denied", "runServerScript requires a non-empty script string.");
+    }
+    const reason = validateReason(args.reason);
+    validateIdempotencyKey(args.idempotencyKey);
     requireCapability(this.deps.effectiveMode, "runServerScript");
     if (!this.deps.signing) {
       // per_user_oauth mode does not sign (native attribution); integration_user must.
@@ -143,7 +184,7 @@ export class ServiceNowRPC {
     const res = await this.deps.http.request({
       method: "POST",
       path: this.deps.executorPath ?? "/api/x_mcp/executor/run",
-      body: { script: args.script, actor: signed.actor, actor_sig: signed.actor_sig, reason: args.reason },
+      body: { script: args.script, actor: signed.actor, actor_sig: signed.actor_sig, reason },
     });
     // Executor surfaces 503 (disabled) / 401 (bad signature) as typed conditions.
     const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });

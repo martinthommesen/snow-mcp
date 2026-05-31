@@ -56,7 +56,18 @@ export class SnFetchClient implements SnHttpClient {
     if (!req.path.startsWith("/api/") || req.path.includes("://") || req.path.includes("@")) {
       throw new Error(`unsafe ServiceNow path: ${req.path}`);
     }
+    // Reject dot-segment traversal in the raw path (literal or percent-encoded) before
+    // URL parsing normalizes it away (defense in depth behind the RPC identifier checks).
+    const lowered = req.path.toLowerCase();
+    if (lowered.includes("..") || lowered.includes("%2e")) {
+      throw new Error(`unsafe ServiceNow path: ${req.path}`);
+    }
     const url = new URL(`https://${this.host}${req.path}`);
+    // After normalization, the pathname must STILL be under /api/ — catches any residual
+    // traversal/normalization that escaped the raw-string checks above.
+    if (!url.pathname.startsWith("/api/")) {
+      throw new Error(`unsafe ServiceNow path: ${req.path}`);
+    }
     for (const [k, v] of Object.entries(req.query ?? {})) url.searchParams.set(k, v);
 
     const authorization = await this.opts.getAuthorization();

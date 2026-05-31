@@ -8,6 +8,7 @@ import type { SnHttpClient } from "./http.js";
 import { mapServiceNowError } from "./errors.js";
 import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
 import { assertActorPolicy, type ActorPolicy } from "../authz/actor-policy.js";
+import { validateTableName } from "./validate.js";
 import type { RunBudget } from "./run-budget.js";
 import type { Mode } from "@servicenow-codemode/shared";
 
@@ -31,13 +32,19 @@ export interface DiscoveryDeps {
   runBudget: RunBudget;
 }
 
+// Mirror of the validate.ts table-name grammar; used to gate hierarchy parents so a
+// malformed super_class.name never reaches the `nameIN` join.
+const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
+
 function esc(v: string): string {
   // Encoded-query value sanitation: strip ^ and = which would break the query grammar.
   return v.replace(/[\^=]/g, "");
 }
 
 /** Resolve a table's inheritance chain (incident -> task -> ...) so describe_table
- *  includes inherited fields. Bounded loop; each hop is one ServiceNow request. */
+ *  includes inherited fields. Bounded loop; each hop is one ServiceNow request. The
+ *  root is a validated table name; each super_class name is re-validated before it
+ *  enters the chain so the `nameIN` join cannot be comma-injected. */
 async function tableHierarchy(deps: DiscoveryDeps, table: string): Promise<string[]> {
   const chain: string[] = [];
   let current: string | undefined = table;
@@ -59,18 +66,21 @@ async function tableHierarchy(deps: DiscoveryDeps, table: string): Promise<strin
     if (mapped) throw mapped;
     const row = (res.json as { result?: Record<string, unknown>[] }).result?.[0];
     const superName = row ? String(row["super_class.name"] ?? "") : "";
-    current = superName || undefined;
+    // Only continue if the parent name is itself a valid table identifier (defense in
+    // depth: a malformed super_class.name never reaches the nameIN join).
+    current = superName && TABLE_NAME_RE.test(superName) ? superName : undefined;
   }
   return chain;
 }
 
 /** Field schema for one table (sys_dictionary), INCLUDING inherited fields. Enforces ActorPolicy. */
 export async function describeTable(deps: DiscoveryDeps, table: string): Promise<FieldInfo[]> {
-  assertActorPolicy(deps.actorPolicy, { instance: deps.instanceHost, table, mode: deps.effectiveMode });
+  const validTable = validateTableName(table); // rejects "incident,sys_user" comma-injection (P1)
+  assertActorPolicy(deps.actorPolicy, { instance: deps.instanceHost, table: validTable, mode: deps.effectiveMode });
   requireCapability(deps.effectiveMode, "readTables");
   deps.runBudget.countRpcCall();
 
-  const chain = await tableHierarchy(deps, table);
+  const chain = await tableHierarchy(deps, validTable);
   const nameIn = chain.map(esc).join(",");
 
   deps.runBudget.countServiceNowRequest();
@@ -89,7 +99,7 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
 
   const rows = ((res.json as { result?: Record<string, unknown>[] }).result ?? []);
   deps.runBudget.countRows(rows.length);
-  const masked = new Set(deps.actorPolicy.fieldMasks[table] ?? []);
+  const masked = new Set(deps.actorPolicy.fieldMasks[validTable] ?? []);
   const byName = new Map<string, FieldInfo>();
   for (const r of rows) {
     const name = String(r.element ?? "");
