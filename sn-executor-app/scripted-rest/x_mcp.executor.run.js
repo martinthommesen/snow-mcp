@@ -2,6 +2,16 @@
 // Reference implementation from DEVELOPMENT_PLAN §10 (v4): SYNCHRONOUS; audit-FIRST +
 // fail-closed; VERIFIES the signed actor; UTF-8 byte cap; SAFE serialize.
 //
+// ⚠️ DEPRECATED (plan §P7; DELTAS D10/D11). The PRODUCTION executor is the scoped Fluent
+//    wrapper sn-executor-app/fluent/src/server/x_mcp_executor.js, which GATES audit ->
+//    kill-switch -> egress -> size BEFORE delegating verify+eval to global x_mcp_verify.run()
+//    (gate-before-delegate). This reference VERIFIES FIRST (line ~45), so an oversized but
+//    validly-signed call BURNS its nonce before the 413 — the bug P7 fixes by keeping the
+//    Fluent wrapper's ordering. Also: it calls the OLD `.verify()` API, which the unified
+//    canonical core (script-include/x_mcp_verify.js) no longer exposes (only `.run()`). Kept
+//    only as a non-SDK historical reference; do NOT install this. Eval + crypto are
+//    global-only, so a self-contained scoped executor like this cannot actually run.
+//
 // ⚠️ UNVERIFIED IN THIS BUILD — requires a live PDI to install, run, and prove
 //    (Phase 1.8 spike / Phase 5; gates S8/S9/S16/B1/B6). See docs/OPEN_QUESTIONS.md.
 

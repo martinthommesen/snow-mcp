@@ -354,7 +354,11 @@ describe("P4 — second-approval gate wired into runServerScript", () => {
     // Snippet supplies a DIFFERENT (shape-valid) reason — it must NOT be the audited/sent value.
     await r.runServerScript({ script: SCRIPT, reason: "SNIPPET-REASON", idempotencyKey: "x" });
     const post = http.calls.find((c) => c.method === "POST")!;
-    expect((post.body as { reason: string }).reason).toBe("HOST-REASON");
+    // P7 item 1: reason is now SIGNED into the actor payload (integrity-bound), not sent as
+    // an unsigned top-level body.reason. The executor verifies + audits actor.reason.
+    const body = post.body as { actor: { reason: string }; reason?: string };
+    expect(body.actor.reason).toBe("HOST-REASON");
+    expect(body.reason).toBeUndefined();
     expect(rows.every((x) => x.reason === "HOST-REASON")).toBe(true);
     expect(rows.some((x) => x.reason === "SNIPPET-REASON")).toBe(false);
   });

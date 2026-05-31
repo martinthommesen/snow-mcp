@@ -405,12 +405,16 @@ export class ServiceNowRPC {
         script: args.script,
         issuedAt: signing.now(),
         nonce: signing.nonce(),
+        // Host-authoritative justification, integrity-bound by the signature (plan §P7
+        // item 1). The executor verifies + audits this signed `actor.reason`; we no longer
+        // send an unsigned top-level `body.reason` (forgeable independent of the signature).
+        reason,
         hmacKey: signing.hmacKey,
       });
       const res = await this.deps.http.request({
         method: "POST",
         path: this.deps.executorPath ?? "/api/x_mcp/executor/run",
-        body: { script: args.script, actor: signed.actor, actor_sig: signed.actor_sig, reason },
+        body: { script: args.script, actor: signed.actor, actor_sig: signed.actor_sig },
       });
       // Executor surfaces 503 (disabled) / 401 (bad signature) as typed conditions.
       const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
@@ -438,6 +442,13 @@ export class ServiceNowRPC {
     if (!reason?.trim()) {
       throw new McpToolError("capability_denied", "admin_script requires a non-empty host-level `reason`.");
     }
+    // This host reason is SIGNED into the actor canonical (signActor below) and persisted to the
+    // executor audit `reason` column (StringColumn maxLength 1024). Validate it (length<=1024, no
+    // control chars) BEFORE it is hashed/signed/sent so the signed+audited value matches the
+    // column contract — a too-long/control-char reason would otherwise ride into the HMAC and be
+    // silently truncated/garbled on write. Validate, never mutate (mutating after signing would
+    // break the HMAC).
+    validateReason(reason);
 
     const ordinal = ++this.ordinal;
     const actorUserId = signing.claims.mcp_actor_user_id;

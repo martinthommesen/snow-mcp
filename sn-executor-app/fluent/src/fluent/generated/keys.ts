@@ -5,6 +5,14 @@ declare global {
         namespace Internal {
             interface Keys extends KeysRegistry {
                 explicit: {
+                    acl_audit_read: {
+                        table: 'sys_security_acl'
+                        id: '7f3d6f66f3b14376b166cfbdd7883d13'
+                    }
+                    acl_audit_write: {
+                        table: 'sys_security_acl'
+                        id: '1d5af512b8ff40d298db336ef79c60f0'
+                    }
                     acl_executor: {
                         table: 'sys_security_acl'
                         id: '638c1394dc714abdbb97f8f7b23d57ba'
@@ -17,6 +25,10 @@ declare global {
                         table: 'sys_module'
                         id: '2602f92483974a63a4189909a96e8c0d'
                     }
+                    job_nonce_purge: {
+                        table: 'sysauto_script'
+                        id: '3a287b0551cd43c9923117dfbfb13db9'
+                    }
                     p_egress: {
                         table: 'sys_properties'
                         id: '1dcf5154374b48a9bee4ee304c5040f5'
@@ -24,6 +36,14 @@ declare global {
                     p_enabled: {
                         table: 'sys_properties'
                         id: 'b39be9c926f149cca8b01403ac479b59'
+                    }
+                    p_hmac: {
+                        table: 'sys_properties'
+                        id: '39c44f1928324c2ea0e058b024966061'
+                    }
+                    p_hmac_prev: {
+                        table: 'sys_properties'
+                        id: '632b71c0cb2844a6b8ea6b3d9794a383'
                     }
                     p_maxb: {
                         table: 'sys_properties'
@@ -99,6 +119,14 @@ declare global {
                         key: {
                             name: 'x_1793136_mcp_audit_log'
                             element: 'actor_verified'
+                        }
+                    },
+                    {
+                        table: 'sys_index'
+                        id: '27cbefcc28fe4822ae25b9fe5fb8adae'
+                        key: {
+                            logical_table_name: 'x_1793136_mcp_nonce'
+                            col_name_string: 'value'
                         }
                     },
                     {
@@ -284,11 +312,37 @@ declare global {
                         }
                     },
                     {
+                        table: 'sys_security_acl_role'
+                        id: 'a6e0167eec5041528416f38de658ab0a'
+                        key: {
+                            sys_security_acl: '1d5af512b8ff40d298db336ef79c60f0'
+                            sys_user_role: {
+                                id: '2cd1043150cc40da97b3dd4dae45f3ae'
+                                key: {
+                                    name: 'x_1793136_mcp.admin'
+                                }
+                            }
+                        }
+                    },
+                    {
                         table: 'sys_dictionary'
                         id: 'ae38cb433f524fb2b5d725310705a4c5'
                         key: {
                             name: 'x_1793136_mcp_audit_log'
                             element: 'mcp_actor_email'
+                        }
+                    },
+                    {
+                        table: 'sys_security_acl_role'
+                        id: 'ae6d0503965e493eb264b63d464e47e0'
+                        key: {
+                            sys_security_acl: '7f3d6f66f3b14376b166cfbdd7883d13'
+                            sys_user_role: {
+                                id: '2cd1043150cc40da97b3dd4dae45f3ae'
+                                key: {
+                                    name: 'x_1793136_mcp.admin'
+                                }
+                            }
                         }
                     },
                     {
@@ -361,6 +415,14 @@ declare global {
                     },
                     {
                         table: 'sys_dictionary'
+                        id: 'dde62391dcfb4f9da9a2598bf75677db'
+                        key: {
+                            name: 'x_1793136_mcp_audit_log'
+                            element: 'reason'
+                        }
+                    },
+                    {
+                        table: 'sys_dictionary'
                         id: 'e2a40b16b169497aba1e267782af0fb9'
                         key: {
                             name: 'x_1793136_mcp_audit_log'
@@ -372,6 +434,15 @@ declare global {
                         id: 'e422231ff93d442a93273c0c10747541'
                         key: {
                             name: 'x_1793136_mcp_nonce'
+                        }
+                    },
+                    {
+                        table: 'sys_documentation'
+                        id: 'e47068c725a149e2a8be145bc29f3966'
+                        key: {
+                            name: 'x_1793136_mcp_audit_log'
+                            element: 'reason'
+                            language: 'en'
                         }
                     },
                     {

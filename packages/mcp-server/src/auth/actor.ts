@@ -17,6 +17,9 @@ export interface SignedActorPayload extends ActorClaims {
   script_sha256: string;
   issued_at: number; // epoch ms
   nonce: string;
+  // Host-authoritative justification, integrity-bound by the signature (plan §P7 item 1).
+  // The executor verifies it and audits THIS signed value — never an unsigned POST field.
+  reason: string;
 }
 
 export interface SignedActor {
@@ -25,6 +28,9 @@ export interface SignedActor {
 }
 
 // Stable key order — MUST match the executor's verifier (§2.0). Do not reorder.
+// `reason` is appended LAST (after `nonce`); the executor `_canonical` in
+// script-include/x_mcp_verify.js, fluent/src/server/x_mcp_verify.js, and the
+// executor-install.mjs blob MUST list the keys in this identical order (B1).
 const CANONICAL_KEYS: readonly (keyof SignedActorPayload)[] = [
   "mcp_actor_user_id",
   "mcp_actor_email",
@@ -34,6 +40,7 @@ const CANONICAL_KEYS: readonly (keyof SignedActorPayload)[] = [
   "script_sha256",
   "issued_at",
   "nonce",
+  "reason",
 ];
 
 // Engine-independent, ASCII-ONLY string escaper. The bytes that get HMAC'd must be
@@ -104,6 +111,8 @@ export interface SignActorInput {
   script: string;
   issuedAt: number; // epoch ms — caller supplies (testable, no hidden clock)
   nonce: string; // caller supplies a unique value
+  // Host-authoritative justification, signed alongside the claims (plan §P7 item 1).
+  reason: string;
   hmacKey: Uint8Array;
 }
 
@@ -115,6 +124,7 @@ export async function signActor(input: SignActorInput): Promise<SignedActor> {
     script_sha256,
     issued_at: input.issuedAt,
     nonce: input.nonce,
+    reason: input.reason,
   };
   const actor_sig = await hmacSha256Base64(canonicalize(payload), input.hmacKey);
   return { actor: payload, actor_sig };

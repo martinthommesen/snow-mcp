@@ -29,3 +29,47 @@ Maps each "production ready" criterion to current evidence. ✅ done · 🟡 par
 - **Per-user ServiceNow tokens** wired end-to-end (the TokenStore adapter + crypto are done
   and unit-verified; wiring into the OAuth callback is the remaining integration).
 - Recovery **snapshot store + scheduled purge** (policy in RETENTION.md; crypto verified).
+
+## Nonce replay store — live target (P7 finding 24)
+
+The production verifier is the **GLOBAL `x_mcp_verify` core** installed by
+`scripts/executor-install.mjs` (`new Function` + `GlideCertificateEncryption` are global-only,
+DELTAS D11). Its `_consumeNonce` does a bare `INSERT` into the **GLOBAL `x_mcp_nonce` table** and
+treats a duplicate (insert returns falsy OR throws the constraint violation) as a replay. The
+**concurrency arbiter is a DB-enforced UNIQUE INDEX on the value column**, installed as a
+`sys_index` record (mirroring the now-sdk's own output for the scoped table, where the column
+dictionary's `unique` stays false and the index lives in a separate `sys_index`). The installer
+also creates a **`sysauto_script` nonce-purge job** (15-min cadence, 1-hour TTL >> the 120s
+freshness window); that REST-installed job's `run_period` is a plain string, so it is **not**
+affected by the now-sdk 4.7.1 `'[object Object]'` ScheduledScript serializer bug.
+
+The scoped Fluent `x_1793136_mcp_nonce` table + its unique index + its `MCP Nonce Purge`
+ScheduledScript (in `x_mcp.now.ts`) are **reserved/unused by the live core** — kept for a
+possible future scoped-hosted verifier. The now-sdk 4.7.1 serializer bug (P8 manual `run_period`
+fixup) applies only to that scoped, **functionally-unused** ScheduledScript — it is NOT a
+functional blocker for the live purge.
+
+**P8-LIVE GATE (cannot run here):** the race-close is correct **only if** the `x_mcp_nonce` value
+unique index is DB-enforced. The `_consumeNonce` INSERT-as-arbiter logic is inert without that
+constraint, so the live gate is: **confirm a concurrent duplicate `value` INSERT is actually
+REJECTED** (not merely that the `sys_index` row exists) on a live PDI. The global nonce-purge
+`sysauto_script` is likewise new Table-API DDL to verify live.
+
+## Fluent toolchain audit residual (P7 — `sn-executor-app/fluent`)
+
+`npm audit` reports **15 vulnerabilities (3 low, 11 moderate, 1 high)** — UNCHANGED after a
+non-breaking `npm audit fix` (no `--force`). Every advisory is in the **dev/build toolchain**
+of `@servicenow/sdk@4.7.1`, not in any deployed Worker or ServiceNow runtime artifact:
+
+| Chain | Severity | Why it can't be fixed non-breaking |
+|---|---|---|
+| `tmp <=0.2.5` → `external-editor` → `@inquirer/editor` → `@inquirer/prompts` → `@servicenow/sdk-cli` | high | the CLI pins `@inquirer/prompts <=6.0.1`; bumping needs a new SDK |
+| `@fastify/static 8.0.0–9.1.0` → `@servicenow/isomorphic-rollup` → `@servicenow/sdk-api` | moderate | transitively pinned by `@servicenow/sdk@4.7.1` |
+| `js-yaml <3.14.2` → `xmlbuilder2` → `@cyclonedx/cyclonedx-library` / `@servicenow/sdk-build-core` | moderate | bundled with the SDK build core |
+
+`npm audit fix --force` would install `@servicenow/sdk@4.6.1` — a **breaking downgrade** that
+regresses the Fluent build the executor depends on. Per the P7 plan ("do not break the now-sdk
+build chasing upgrades") **no upgrade is applied**. Residual risk is dev-only (the SDK runs at
+build/deploy time on a trusted developer machine; none of these packages ship to Cloudflare or
+ServiceNow). Re-audit when ServiceNow releases an SDK that bumps these transitive pins; track as
+a GA release-checklist item, not a runtime blocker.

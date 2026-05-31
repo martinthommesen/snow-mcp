@@ -27,22 +27,39 @@ const SCRIPT = "return gs.getUserName();";
 const T0 = 1_700_000_000_000;
 
 // ─── §2.0 — actor signing (host side; authoritative verify is on ServiceNow) ──
+const REASON = "rotate key";
 describe("§2.0 actor signing", () => {
   it("canonicalization is deterministic and key-ordered", async () => {
-    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", hmacKey: HKEY });
+    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", reason: REASON, hmacKey: HKEY });
     expect(canonicalize(a.actor).startsWith('{"mcp_actor_user_id":"u1"')).toBe(true);
     expect(typeof a.actor_sig).toBe("string");
   });
 
+  it("signs `reason` as the LAST canonical key (P7: integrity-bound justification)", async () => {
+    // Failing-first against the pre-P7 signer (which had no `reason` claim). The executor
+    // _canonical in all THREE JS cores must list `reason` last too, or the HMAC breaks (B1).
+    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", reason: REASON, hmacKey: HKEY });
+    expect(a.actor.reason).toBe(REASON);
+    const canon = canonicalize(a.actor);
+    expect(canon).toContain(`,"nonce":"n1","reason":"rotate key"}`);
+    expect(canon.endsWith(`,"reason":"rotate key"}`)).toBe(true);
+  });
+
   it("a valid signature verifies (local mirror of the in-scope check)", async () => {
-    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", hmacKey: HKEY });
+    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", reason: REASON, hmacKey: HKEY });
     expect(await verifyActorSignatureLocal(a, SCRIPT, HKEY, { now: T0 + 1000 })).toBe(true);
+  });
+
+  it("a tampered `reason` (re-signed payload field) fails the signature", async () => {
+    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", reason: REASON, hmacKey: HKEY });
+    const forged = { ...a, actor: { ...a.actor, reason: "forged justification" } };
+    expect(await verifyActorSignatureLocal(forged, SCRIPT, HKEY, { now: T0 })).toBe(false);
   });
 
   it("canonical form is ASCII-only and deterministic even with non-ASCII actor fields", async () => {
     // Cross-engine linchpin: V8 and ServiceNow's engine must produce identical bytes.
     const unicodeClaims: ActorClaims = { ...claims, mcp_actor_email: " André@例子.com" };
-    const a = await signActor({ claims: unicodeClaims, script: SCRIPT, issuedAt: T0, nonce: "n1", hmacKey: HKEY });
+    const a = await signActor({ claims: unicodeClaims, script: SCRIPT, issuedAt: T0, nonce: "n1", reason: REASON, hmacKey: HKEY });
     const canon = canonicalize(a.actor);
     // Pure ASCII (no code point >= 0x80) — non-ASCII escaped as \uXXXX.
     expect([...canon].every((ch) => ch.charCodeAt(0) < 0x80)).toBe(true);
@@ -53,7 +70,7 @@ describe("§2.0 actor signing", () => {
   });
 
   it("B1-shape: forged email, wrong key, stale time, or altered script all fail", async () => {
-    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", hmacKey: HKEY });
+    const a = await signActor({ claims, script: SCRIPT, issuedAt: T0, nonce: "n1", reason: REASON, hmacKey: HKEY });
 
     const forged = { ...a, actor: { ...a.actor, mcp_actor_email: "evil@x.com" } };
     expect(await verifyActorSignatureLocal(forged, SCRIPT, HKEY, { now: T0 })).toBe(false);
