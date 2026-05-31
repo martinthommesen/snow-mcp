@@ -66,9 +66,10 @@ host+executor redeploy + live re-proof is the P8 gate. Landed source hardenings:
   insert = replay → reject), plus a scheduled nonce-purge job. The scoped `x_1793136_mcp_nonce` +
   its index are reserved/unused by the global core (DELTAS).
 - **Admin ACLs** — the audit table + properties are restricted to `x_1793136_mcp.admin`.
-- **Deprecated global-REST endpoint gated off** — the un-ACL'd HMAC-only global-REST endpoint is
-  gated behind `X_MCP_INSTALL_GLOBAL_REST=1` (default OFF); the canonical surface is the scoped,
-  role-ACL-gated Fluent REST.
+- **Deprecated global-REST endpoint REMOVED (M-4, 2026-05-31)** — the un-ACL'd HMAC-only
+  global-REST install path (formerly gated behind `X_MCP_INSTALL_GLOBAL_REST=1`) has been deleted
+  from `scripts/executor-install.mjs`; the installer now ships only the global `x_mcp_verify` core
+  + properties. The canonical surface is the scoped, role-ACL-gated Fluent REST.
 
 **Breaking payload change:** P7 added the signed `reason` key + the instance claim, so the host
 and executor **must be redeployed together** (P8); the earlier live executor proofs (B1 HMAC

@@ -148,9 +148,10 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
   the CONCURRENT one-200/one-401 case). now-sdk 4.7.1 creates the physical index but omits the
   `sys_index` catalog row — index enforces while `sys_index` reads empty; verify functionally.
 - **`executor-install.mjs` = global verify()/execute()/run() CORE + properties ONLY (no tables,
-  no REST endpoint).** The global-REST endpoint is deprecated (gated behind
-  `X_MCP_INSTALL_GLOBAL_REST=1`, default OFF). The canonical surface is the scoped, role-ACL-gated
-  Fluent REST at the two-segment path **`/api/x_1793136_mcp/x_mcp/executor/run`**.
+  no REST endpoint).** The opt-in global-REST install path (formerly `X_MCP_INSTALL_GLOBAL_REST=1`)
+  was **REMOVED** in the M-4 remediation (2026-05-31) — it reproduced the incident's un-ACL'd
+  global-executor shape. The canonical surface is the scoped, role-ACL-gated Fluent REST at the
+  two-segment path **`/api/x_1793136_mcp/x_mcp/executor/run`**.
   **P8 finding (2026-05-31):** a global numeric endpoint `/api/1793136/x_mcp/executor/run` from an
   *earlier* install had survived and was LIVE — and its verify reject branch was dead code
   (`if (!new x_mcp_verify().verify(...))` is always false because `verify()` returns an object), so

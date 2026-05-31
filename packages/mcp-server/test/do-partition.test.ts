@@ -166,6 +166,21 @@ describe("Phase P5 — BudgetDO daily rows/bytes admission check (tier 1)", () =
     expect(r.ok).toBe(true);
     expect(await obj.get("uniqueWorkers")).toBe(1);
   });
+
+  it("denies the next run when the day's accrued sandboxRpcCalls are already at/over cap (M-1)", async () => {
+    // M-1: sandboxRpcCalls is accrued post-run (handlers maps snapshot.rpcCalls -> sandboxRpcCalls)
+    // and was previously compared NOWHERE — the configured daily cap was dead. The admission check
+    // must now DENY the next run once the day is at/over the sandboxRpcCalls cap (T-1: every
+    // configured ceiling has a test proving it can deny).
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-07"));
+    const cap = { sandboxRpcCalls: 50 };
+    await obj.increment({ sandboxRpcCalls: 50 }); // prior runs accrued to the cap
+    const r = await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 1 }, cap, "userF");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.dimension).toBe("sandboxRpcCalls");
+    expect(await obj.get("uniqueWorkers")).toBe(0); // nothing committed by the denied reserve
+  });
 });
 
 describe("Phase 7.3 / S17 — MutationLedgerDO leveled idempotency", () => {
