@@ -47,9 +47,37 @@ interactive dry-run→approve branch remains **documented-unsupported** (the sta
 
 ## Status
 
-The executor scoped app (`sn-executor-app/`) is **source-only / unverified** — it must be
-installed on the instance and proven (S8/S9/S16, B1, B6) before any of the above are live.
-Until then `runServerScript` is unreachable (no executor endpoint exists on `dev374488`).
-Host-side: the mutating/executor path is now wired through the idempotency ledger, host
-audit (AUDIT_KV, 30-day TTL), recovery snapshots (SNAPSHOT_KV, 30-day TTL, fail-closed), and
-the second-approval gate (P4); `runServerScript` requires a tool-level `idempotencyKey`.
+**Executor (`sn-executor-app/`) — HARDENED IN SOURCE (P7); live-verified in P8.** The scoped
+Fluent app `x_1793136_mcp` + its global `x_mcp_verify` core are no longer "source-only/
+unverified" and not yet "done live" either — P7 hardened them in source and a coordinated
+host+executor redeploy + live re-proof is the P8 gate. Landed source hardenings:
+
+- **Instance-claim enforcement** — `verify()` rejects a payload whose signed `actor.instance`
+  does not name this instance (cross-instance replay → clean 401).
+- **Null-safe MAC** — `_constantTimeEquals` treats a null/undefined MAC (from `_hmacBase64`/
+  `generateMac`) as a clean `false`; the audit row closes to `rejected` (never stuck `running`).
+- **Signed + audited `reason`** — `reason` is the LAST key of the executor `_canonical` (mirrors
+  the host `auth/actor.ts` `CANONICAL_KEYS`), so the audited justification can't be forged
+  independent of the HMAC; the wrapper persists the signed `reason` to a new audit column.
+- **Byte-safe `result_sample`** — a GlideScript UTF-8 back-off slice (mirrors host `truncateUtf8`),
+  replacing the code-unit slice against a byte cap.
+- **Nonce replay race-close** — the live verifier (the GLOBAL core) consumes nonces via a bare
+  INSERT into the **DB-unique-indexed global `x_mcp_nonce` table** (INSERT-as-arbiter: a duplicate
+  insert = replay → reject), plus a scheduled nonce-purge job. The scoped `x_1793136_mcp_nonce` +
+  its index are reserved/unused by the global core (DELTAS).
+- **Admin ACLs** — the audit table + properties are restricted to `x_1793136_mcp.admin`.
+- **Deprecated global-REST endpoint gated off** — the un-ACL'd HMAC-only global-REST endpoint is
+  gated behind `X_MCP_INSTALL_GLOBAL_REST=1` (default OFF); the canonical surface is the scoped,
+  role-ACL-gated Fluent REST.
+
+**Breaking payload change:** P7 added the signed `reason` key + the instance claim, so the host
+and executor **must be redeployed together** (P8); the earlier live executor proofs (B1 HMAC
+match, S8/S9/T8/S16) predate this and are re-run in P8. P8-live gates: the `instance_name`
+property shape (fail-closed; an FQDN/empty value is a total 401 brick), the `GlideDigest`
+SHA-256 UTF-8 encoding (0.13a), and the `x_mcp_nonce` unique-index DB enforcement.
+
+**Host-side: wired + locally tested (P4).** The mutating/executor path runs through the
+idempotency ledger, host audit (AUDIT_KV, 30-day TTL, audit-before-effect fail-closed), recovery
+snapshots (SNAPSHOT_KV, 30-day TTL, fail-closed), and the (opt-in) second-approval gate — all on
+every host `runServerScript` (`sn/rpc.ts` → `sn/mutation-guard.ts`); `runServerScript` requires a
+tool-level `idempotencyKey`.

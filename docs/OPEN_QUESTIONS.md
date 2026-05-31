@@ -5,47 +5,82 @@ Definition-of-Done depends on **live external services that are not available in
 environment**. This file records exactly what is proven locally vs what is blocked, so no
 unverified claim is mistaken for a verified one (plan §0 rule 9; §7 GA gate).
 
-## ✅ DEPLOYED — most of the wall is now cleared
+## Status note (P0–P7 hardening branch) — what "done" means here
 
-With the user's instance + Cloudflare access, the major external items are DONE:
+This file predates the `harden/code-review-closeout` branch (P0–P7). Two things changed how to
+read it:
+
+1. **The earlier live proofs predate the hardening.** P7 made a **breaking, coordinated change
+   to the signed actor payload** (added a signed `reason` key + enforced the `actor.instance`
+   claim). So the on-edge `deploy:e2e` chain and the live executor proofs below were verified
+   against the **pre-hardening** build and the **old** canonical — they are **re-verified in P8**
+   (operator-gated, not yet run), not currently valid for this branch. They are relabelled
+   **"proven live pre-hardening; re-verified in P8"** below.
+2. **Credential mode is decided (posture, below):** `per_user_oauth` is now wired end-to-end **in
+   source** (P6b) and `integration_user` remains the **default**; the restrictive ActorPolicy is
+   **opt-in**.
+
+## ✅ DEPLOYED to Cloudflare; ☐ P8 re-verification pending
+
+With the user's instance + Cloudflare access, the major external items are DEPLOYED, but the
+hardened build's live behavior is a P8 gate:
 - [x] **Deployed** to Cloudflare via Alchemy (`alchemy.run.ts`) — Worker + Worker Loader +
-      KV + 4 sqlite DOs + secrets. URL: `https://servicenow-mcp.lammesen.workers.dev`.
-- [x] **Full sandbox→live e2e** on the deployed Worker (`npm run deploy:e2e`, 5/5): run_code
-      transpiles + sandboxes LLM TS, calls `servicenow.*` over RPC, reaches LIVE ServiceNow
-      (`INC0000060`); fetch blocked in-sandbox (S1); Origin 403 (S12) — all on real edge.
-- [x] **OAuth token flow** live-verified (B9).
-- [x] ServiceNowRPC reads / ActorPolicy / masking / capability gate live-verified.
+      KV (4 namespaces) + 4 sqlite DOs + secrets. URL: `https://servicenow-mcp.lammesen.workers.dev`.
+- [~] **Full sandbox→live e2e** (`deploy:e2e`) — proven live **pre-hardening** (5/5: run_code →
+      sandbox → `servicenow.*` RPC → LIVE ServiceNow `INC0000060`; S1 fetch-blocked; S12 Origin
+      403). **Re-verified in P8** against the hardened build (forged-error stripped, byte-cap
+      truncation, restrictive-policy denial, idempotent-retry dedup, audit emitted, reauth flow).
+- [x] **OAuth token flow** (ROPC grant/refresh) live-verified pre-hardening (B9).
+- [~] ServiceNowRPC reads / ActorPolicy / masking / capability gate — proven live pre-hardening;
+      P1 then tightened the read path (validate-first), so re-verified in P8 (`live:verify`).
 
-## ✅ MCP-client OAuth — DONE + deployed (Phase 1.1, §2.4, §7.8)
+## MCP-client OAuth — gating WIRED + tested; live deploy:e2e re-verified in P8
 
-The deployed `/mcp` is now **OAuth-gated** (was open). `npm run deploy:e2e` (7/7):
-- [x] unauthenticated `/mcp` → **401**; RFC-8414 metadata exposed
-- [x] full OAuth dance (DCR + **PKCE S256** + single-operator consent secret) issues a token
-- [x] authenticated `run_code` → sandbox → **live ServiceNow** (`INC0000060`)
+The deployed `/mcp` is **OAuth-gated** (was open). The gating + dance are **wired and locally
+tested**; the on-edge `deploy:e2e (7/7)` run below proved them **pre-hardening** and is re-run
+in P8 against the hardened build:
+- [x] unauthenticated `/mcp` → **401** — wired (`index.ts` `OAuthProvider apiRoute:/mcp`) +
+      tested (`health.test.ts` asserts the 401); RFC-8414 metadata exposed
+- [x] full OAuth dance (DCR + **PKCE S256** + single-operator consent secret) — signed/single-use
+      consent tested (`auth-surface.test.ts`)
+- [~] authenticated `run_code` → sandbox → **live ServiceNow** (`INC0000060`) — proven live
+      pre-hardening; re-verified in P8
 - [x] **B4 at the wire**: a `read_only`-scoped client requesting `write` → `mode_not_permitted`
-- [x] S1 sandbox isolation on the deployed Worker
+      — wired + tested (`effective-mode.test.ts`); live wire re-verified in P8
+- [~] S1 sandbox isolation on the deployed Worker — proven live pre-hardening; re-verified in P8
 
-## Also done since: Phase 2 + Phase 7 host-side
+## Also done since: Phase 2 + Phase 7 host-side (wired + locally tested)
 
-- [x] §2.6 user-aware schema cache (S6) — wired into describe/list
-- [x] §2.13 ACL-safe keyset pagination (B7) — no stall, no skip, honest `partial`
-- [x] §7.2 host-side audit (hashes + redaction, both identities)
-- [x] §7.7 encrypted recovery snapshots (AES-GCM, SNAPSHOT_KEK, AAD fail-closed, retention)
-- [x] S13 (subset, LIVE): wrong operator secret → no code; wrong PKCE verifier → rejected
+- [x] §2.6 user-aware schema cache (S6) — wired into describe/list; content-addressed roleHash
+      cache key (P6b-2), `"*"`-collision fixed (`schema-cache.test.ts`)
+- [x] §2.13 ACL-safe keyset pagination (B7) — honest `partial` flag; available-but-unwired keyset
+      paginate (wire on a live ACL stall — DELTAS D13)
+- [x] §7.2 host-side audit — **wired** on every mutation (`sn/mutation-guard.ts` → AUDIT_KV,
+      audit-before-effect, fail-closed; `mutation-wiring.test.ts`)
+- [x] §7.7 encrypted recovery snapshots — **wired** before reversible mutates (SNAPSHOT_KV,
+      versioned SNAPSHOT_KEK, fail-closed; `audit-recovery.test.ts`)
+- [~] S13 (subset): wrong operator secret → no code; wrong PKCE verifier → rejected — proven live
+      pre-hardening; re-verified in P8
 
-## ✅ `x_mcp` executor — INSTALLED + PROVEN LIVE (Phase 5; user-authorized)
+## `x_mcp` executor — proven live PRE-HARDENING; HARDENED IN SOURCE (P7); ☐ re-verified in P8
 
-`node scripts/executor-install.mjs` installed the executor and proved **6/6** on the live
-instance, and `npm run deploy:e2e` proves the **full chain** through the deployed Worker:
-- [x] **B1 / 0.13a**: host WebCrypto signer ≡ ServiceNow `GlideCertificateEncryption` over the
-      ASCII-canonical payload — valid sig executes (`gs.getUserName()`→`admin`); **forged email
-      → 401**, **bad sig → 401**. Cross-engine HMAC contract holds.
-- [x] **S16**: cross-scope reach (GlideAggregate count on global `incident` = 67)
-- [x] **T8**: nonce replay rejected (first 200, second 401)
-- [x] **S9**: kill switch disabled→503, re-enabled→200 (audit-first)
-- [x] **B6**: over-cap output → `{result:null, result_sample, truncated:true}` (live)
-- [x] **FULL CHAIN**: deployed `admin_script` run_code → sandbox → `runServerScript` → signed
-      actor → executor verify+execute → result. End-to-end on real infra.
+`node scripts/executor-install.mjs` installed the executor and proved **6/6** live, and an
+earlier `deploy:e2e` proved the **full chain** — **all against the PRE-HARDENING build/canonical**.
+P7 then changed the signed payload (added `reason`; enforced `actor.instance`), so these are
+re-run in P8 after a coordinated host+executor redeploy (the old proofs do NOT cover the hardened
+build):
+- [~] **B1 / 0.13a**: host WebCrypto signer ≡ ServiceNow `GlideCertificateEncryption` over the
+      ASCII-canonical payload (now **6-key incl. signed `reason`**). Byte-identical canonical
+      confirmed across host + all 3 executor cores via a Node harness; the **live** HMAC match +
+      `GlideDigest` SHA-256 UTF-8 encoding are P8 gates.
+- [~] **S16** cross-scope reach · **T8** nonce replay (now DB-unique-index INSERT-as-arbiter on
+      `x_mcp_nonce`, not the old TOCTOU check-then-insert — the race-close is provable only with
+      the live unique index) · **S9** kill switch (audit-first) · **B6** over-cap output — all
+      re-verified in P8.
+- [~] **NEW P8 cases:** instance-claim mismatch → 401; signed+audited `reason`; null-MAC → clean
+      401; size/kill before nonce-consume; cooperative-timeout/quota.
+- [~] **FULL CHAIN** re-proven in P8 (`deploy:e2e` + `executor-scoped-verify.mjs` against the
+      scoped `/api/x_1793136_mcp/...` endpoint; set `SNOW_EXECUTOR_PATH` accordingly).
 
 ## Also done: Phase 1.3 token store + S18
 
@@ -60,12 +95,23 @@ ships the real `x_mcp_audit_log`/`x_mcp_nonce` tables + role ACL via a Studio up
 
 ## Remaining (refinements / GA)
 
-- [ ] Production scoped-app packaging: real tables + `x_mcp.executor` role + REST_Endpoint ACL
-      (S8 role-gating) via Studio update set (the REST install proves the mechanism in global scope).
-- [ ] Per-user ServiceNow tokens via TokenStoreDO (operator OAuth gates clients; ServiceNow
-      credential is the shared Basic-Auth integration identity today).
-- [ ] Remaining Phase 9 tests: S2-auth, S7 (full), S18, B6 (live), full S13.
+- [x] Production scoped-app packaging: real tables + `x_1793136_mcp.executor` role + REST_Endpoint
+      ACL via the **Fluent SDK project** (P7 / DELTAS D11), superseding the XML update set + the
+      global-REST install (both now DEPRECATED references). ☐ live re-verified in P8.
+- [x] **Per-user ServiceNow tokens — wired end-to-end IN SOURCE** (P6b, commits `b2dc973`/`9a02e49`):
+      `SERVICENOW_CREDENTIAL_MODE=per_user_oauth` drives ticket → `/servicenow/authorize` → PKCE
+      S256 → `/servicenow/callback` → per-user token in `TokenStoreDO`; SN principal resolves the
+      sys_id → signed `snow_effective_user_sys_id` + roleHash cache key. ☐ live authorize/callback
+      dance + SN-principal endpoint shape re-verified in P8.
 - [ ] GA gate (§7): sub-production instance (not a PDI), pre-1.0 dependency exit.
+
+### Open-pending-live (P8 gates — cannot run here)
+
+- [ ] Coordinated host+executor redeploy (the P7 breaking payload change), then re-run
+      `deploy:e2e` + `executor-scoped-verify.mjs` + `oauth-verify.mjs` + the KEK rotation drill.
+- [ ] `instance_name` property shape (fail-closed); `GlideDigest` SHA-256 UTF-8 encoding (0.13a);
+      `x_mcp_nonce` unique-index DB enforcement (the replay-race arbiter).
+- [ ] `SNOW_EXECUTOR_PATH` points at the scoped `/api/x_1793136_mcp/...` endpoint.
 
 ## The wall (historical) — what needed credentials / accounts
 
@@ -110,15 +156,17 @@ LOGIC is verified; live ServiceNow behavior and end-to-end integration are NOT.
 - [x] §3.2 MCP tool surface: run_code/describe_table/list_tables registered with schemas + annotations
 - [x] §10 executor reference script + `x_mcp_verify` written as **source** in `sn-executor-app/` (unverified)
 
-### LIVE-verified against `dev374488.service-now.com` (Basic-Auth dev path)
+### Read surface — proven live PRE-HARDENING (`dev374488`, Basic-Auth); re-verified in P8
 
-`npm run live:verify` — 7/7 against real ServiceNow:
-- [x] ServiceNowRPC `tableQuery` real rows + `sys_id` injection (§1.7)
-- [x] `aggregate` real count
-- [x] **ActorPolicy denies non-allowlisted table (B5)** — live
-- [x] field masking strips forbidden field from live response — live
-- [x] capability gate: `read_only` cannot `tableUpdate` (no live mutation)
-- [x] cost gate: BudgetDO atomic reserve-before-load + **S14** concurrency (granted == cap)
+An earlier `npm run live:verify` passed 7/7 against real ServiceNow. P1 then tightened the read
+path (validate-first table/`sys_id`/`limit`/fields, encoded path segments), so these are wired +
+locally tested here and re-verified live in P8:
+- [~] ServiceNowRPC `tableQuery` real rows + `sys_id` injection (§1.7)
+- [~] `aggregate` real count
+- [~] **ActorPolicy denies non-allowlisted table (B5)** — re-verified live in P8
+- [~] field masking strips forbidden field from live response — re-verified live in P8
+- [~] capability gate: `read_only` cannot `tableUpdate` (no live mutation)
+- [~] cost gate: BudgetDO atomic reserve-before-load + **S14** concurrency (granted == cap)
 
 ### Environment limitation (not a code defect)
 
@@ -141,15 +189,16 @@ and proved the real flow:
 The `ServiceNowRPC`/`SnFetchClient` auth is scheme-agnostic (`getAuthorization` returns the
 full header), so the live-verified RPC path works identically with an OAuth `Bearer` token.
 
-### Still blocked on external services
+### Still blocked on external services (P8 live gates)
 
-- [ ] Wire the OAuth provider (consent/PKCE) + TokenStoreDO into the server's request path
-      (the token *grant/refresh* against the instance is now proven; the provider plumbing
-      and per-user token storage are not yet wired e2e).
+- [x] OAuth provider (consent/PKCE) + per-user TokenStoreDO wired into the request path **in
+      source** (P6a signed consent; P6b per-user authorize/callback) — ☐ the live authorize/callback
+      dance is a P8 gate.
 - [ ] ServiceNow client retry/429/5xx + hibernation-splash detection (live network behavior)
-- [ ] describe_table/list_tables real implementations (need schema cache against the instance)
-- [ ] `x_mcp` scoped-app executor install + proof (S8/S9/S16, B1, B6) — needs app install on the PDI
-- [ ] Deployment (Cloudflare Workers-Paid account)
+- [ ] `x_mcp` scoped-app executor re-install + proof against the **hardened** build (the breaking
+      payload change requires a coordinated redeploy) — needs the PDI (P8)
+- [ ] KEK rotation drill: deploy with `TOKEN_KEK_CURRENT`=current passphrase → existing tokens
+      still decrypt; simulate rotation → no outage (P8)
 
 ## Known gaps & hardening notes (honest caveats)
 
@@ -159,24 +208,35 @@ full header), so the live-verified RPC path works identically with an OAuth `Bea
   Dynamic Worker. **S14** proves parallel reserves through the single global object can't
   exceed the cap (granted == cap, never over-committed). `buildHandlers` wires it to the
   date-keyed BUDGET_DO. (Per-run meter still bounds one cheap Worker mid-snippet.)
-- **B1 cross-engine canonicalization — hardened, host-verified, SN side still unproven.**
-  Host signer and `x_mcp_verify.js` now use an identical ASCII-only canonical encoder
-  (no `JSON.stringify`), so non-ASCII actor fields can't silently break signatures. The
-  host side is unit-tested with Unicode fields; the ServiceNow side remains source-only
-  until a PDI run confirms `GlideCertificateEncryption.generateMac` key encoding and that
+- **B1 cross-engine canonicalization — hardened, host-verified, SN side P8-live.**
+  Host signer and the executor `_canonical` now use an identical ASCII-only canonical encoder
+  (no `JSON.stringify`) over a **6-key payload incl. the signed `reason`** (P7), so non-ASCII
+  actor fields can't silently break signatures and the audited justification can't be forged
+  independent of the HMAC. Byte-identical canonical output is confirmed across the host + all 3
+  executor cores via a Node harness; the ServiceNow side is **source-complete; live-verified in
+  P8** — a PDI run confirms `GlideCertificateEncryption.generateMac` key encoding and that
   `GlideDigest.getSHA256Base64` hashes the **UTF-8** bytes of the script (the `script_sha256`
-  digest-input-encoding seam). 0.13a still owes this proof.
-- **Typed error code across the sandbox** is now preserved via a `[[code]]` message
-  envelope (RPC encodes, run_code decodes into `structuredContent.code`). The host-side
-  audit/ledger that records denials (§7.2/7.3) is not yet built.
+  digest-input-encoding seam, 0.13a).
+- **Typed error code across the sandbox** is host-attested (P2): `structuredContent.code` derives
+  ONLY from monotonic host signals (`budget_exceeded`/`reauth_required`), never the
+  snippet-controlled post-sandbox message (a forged `[[code]]` collapses to `run_error`). The
+  host-side audit/ledger that records denials (§7.2/7.3) is now **built + wired + tested** (P4,
+  `sn/mutation-guard.ts` → AUDIT_KV/LEDGER_DO; `mutation-wiring.test.ts`).
 
-## Posture decisions still owed by the operator (plan §0.9)
+## Posture decisions (plan §0.9) — RESOLVED
 
-1. **`run_code` default mode** — plan recommends `read_only` (Decision 1). Adopted as the
-   default in `config.ts` when written; flip via `DEFAULT_MODE` for private demos.
-2. **ServiceNow credential mode** — `integration_user` (single operator) vs `per_user_oauth`
-   (multi-user default), or `integration_user` + enforced `ActorPolicy`. Must be chosen per
-   deployment before Phase 1 (§0.9 Decision 2). Not decidable without knowing the audience.
+1. **`run_code` default mode** — `read_only` (Decision 1), the default in `config.ts`; flip via
+   `DEFAULT_MODE` for private demos. ✅
+2. **ServiceNow credential mode** — RESOLVED (operator-locked, plan Context): build **per-user
+   ServiceNow OAuth** (`per_user_oauth`) on top of restrictive-ActorPolicy hardening. Landed
+   state on this branch:
+   - `per_user_oauth` is **wired end-to-end in source** (P6b) — selectable via
+     `SERVICENOW_CREDENTIAL_MODE=per_user_oauth`.
+   - `integration_user` (ROPC / shared Basic-Auth) remains the **default** (unset mode) so the
+     live single-operator deployment is unchanged.
+   - The **restrictive ActorPolicy is OPT-IN** (`ACTOR_POLICY_*` vars); with none set the
+     permissive single-operator policy is used. A sane conservative restrictive config ships as a
+     documented example in `.dev.vars.example`, not as the hardcoded runtime default.
 
 ## Notes
 

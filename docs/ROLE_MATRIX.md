@@ -17,8 +17,9 @@ applies depends on the credential mode (§2.0, Decision 2).
 - **`integration_user` (single-operator default):** the broad role set applies to
   `mcp_integration_user`; host-side actor attribution is **mandatory + signed-and-verified**
   (§2.0). In **multi-user** deployments this mode additionally requires the **`ActorPolicy`**
-  layer (§2.12, enforced before every RPC — implemented + live-verified, B5) because the
-  broad identity otherwise lets any MCP user read anything.
+  layer (§2.12, enforced before every RPC — implemented + unit-tested; configurable restrictive
+  policy added in P6b-2, host-side enforcement live-verified **pre-hardening** as B5 and
+  re-verified in P8) because the broad identity otherwise lets any MCP user read anything.
 - **`per_user_oauth` (multi-user default):** the matrix applies to the human users/groups;
   ServiceNow ACLs bound access natively and attribution is native.
 - **Reversible elevation:** to write system tables in global scope, grant `admin` to
@@ -26,8 +27,13 @@ applies depends on the credential mode (§2.0, Decision 2).
 
 ## Current build status
 
-- The MCP-client OAuth layer and `mcp_integration_user`/scoped-app roles are **not yet
-  provisioned** on the test instance (`dev374488`); the dev path uses Basic Auth (admin).
-- `ActorPolicy` enforcement (instance/table/field/mode) is implemented and **live-verified**
-  (B5, field masking) — so the host-side half of the integration_user bounding is real today.
-- The `admin_script` approval gate (allowlist + second approval, §7.9) is implemented + tested.
+- Per-user ServiceNow OAuth (`per_user_oauth`) is now **wired end-to-end in source** (P6b:
+  signed-ticket → PKCE authorize → consume-once callback → per-user TokenStoreDO); the live
+  authorize/callback dance on `dev374488` is **verified in P8**. `integration_user` (Basic-Auth
+  / ROPC dev path) remains the single-operator default.
+- `ActorPolicy` enforcement (instance/table/field/mode) is implemented + **unit-tested**
+  (dot-aware field masking, P1; configurable restrictive policy is opt-in, P6b-2). The host-side
+  enforcement was live-verified **pre-hardening** (B5) and is re-verified in P8.
+- The `admin_script` second-approval gate (allowlist + token/access-group, §7.9) is now **wired**
+  on the live mutating path (P4) and unit-tested; it is **opt-in** (no policy configured ⇒ the
+  single-operator default still permits `admin_script` with reason + HMAC).

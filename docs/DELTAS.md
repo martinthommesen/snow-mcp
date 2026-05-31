@@ -67,7 +67,13 @@ RPC (confirmed in the 0.3.8 executor source). Extending `RpcTarget` here is unne
 and would couple the class to `cloudflare:workers` for no benefit. Recorded; revisit only
 if a direct-RPC path (bypassing codemode) is added.
 
-## D10 — ServiceNow executor install via REST (Phase 5, observed on dev374488)
+## D10 — ServiceNow executor install via REST (Phase 5, observed on dev374488) — DEPRECATED
+
+> **DEPRECATED reference (P7).** The canonical executor is the scoped, role-ACL-gated Fluent app
+> (**D11** + D12), and `executor-install.mjs` now installs **only the global `x_mcp_verify`
+> helper** by default. The un-ACL'd global-REST endpoint below is gated OFF behind
+> `X_MCP_INSTALL_GLOBAL_REST=1` and kept only as a non-SDK reference. Findings observed here
+> (numeric namespace, no custom tables via Table API, cross-engine HMAC) remain accurate.
 
 - **Global-scope Scripted REST APIs get an auto-generated NUMERIC namespace.** The endpoint
   is `/api/1793136/x_mcp/executor/run`, not `/api/x_mcp/...`. The host executor path is now
@@ -88,9 +94,11 @@ if a direct-RPC path (bypassing codemode) is added.
 
 Built the production scoped app `x_1793136_mcp` as a **ServiceNow SDK (now-sdk 4.7.1) Fluent
 project** (`sn-executor-app/fluent/`, TypeScript metadata: Table/Role/Acl/RestApi/Property)
-and deployed via `now-sdk install` — **no XML update set import**. Verified 4/4 live
-(`scripts/executor-scoped-verify.mjs`): S8 role-ACL enforced, B1 valid executes, forged→401,
-audit-first row written. Findings:
+and deployed via `now-sdk install` — **no XML update set import**. Proven 4/4 live
+**pre-hardening** (`scripts/executor-scoped-verify.mjs`): S8 role-ACL enforced, B1 valid
+executes, forged→401, audit-first row written. (P7 later changed the signed payload — added
+`reason`, enforced `actor.instance` — so this is **re-verified in P8** after a coordinated
+host+executor redeploy; see D12.) Findings:
 
 - **`new Function` (eval) and `GlideCertificateEncryption` are GLOBAL-only** — neither is
   allowed in a scoped application. So the executor's CORE (verify + eval) must live in global
@@ -111,6 +119,65 @@ audit-first row written. Findings:
 
 The `update-set/x_mcp.xml` scaffold is superseded by the Fluent project (kept as a reference
 for non-SDK environments).
+
+## D12 — Hardening deltas (P0–P7, `harden/code-review-closeout`)
+
+The P0–P7 security-hardening branch landed the following deltas vs the pre-hardening reality.
+**Breaking, coordinated:** the signed actor payload changed, so the host + executor must be
+**redeployed together** (P8). Live re-verification of every executor-side item is a P8 gate.
+
+- **Signed `reason` (the last canonical key) — host + executor.** `reason` is appended LAST to
+  the host `auth/actor.ts` `CANONICAL_KEYS` and to every executor core's `_canonical` (6 keys:
+  `email, sys_id, instance, request_id, script_sha256, issued_at, nonce, reason`). `signActor`
+  accepts it; `rpc.ts` `runServerScript` signs the **host** tool-level `reason` (validated, not
+  the snippet-supplied body) and the unsigned top-level `body.reason` is dropped — so the audited
+  justification can't be forged independent of the HMAC. Byte-identical canonical output verified
+  across the host signer + all 3 executor cores via a Node harness.
+- **Instance claim enforced (executor).** The verifier rejects a payload whose signed
+  `actor.instance` does not name this instance (cross-instance replay → clean 401). The host
+  already signed `instance`; the executor now compares it.
+- **Live nonce store = the DB-unique-indexed GLOBAL `x_mcp_nonce` table, INSERT-as-arbiter.**
+  The production verifier is the GLOBAL core (`new Function` + `GlideCertificateEncryption` are
+  global-only, D11). Its `_consumeNonce` does a bare INSERT into `x_mcp_nonce` and treats a
+  duplicate (insert returns falsy OR the unique-constraint violation) as a replay → reject,
+  closing the prior TOCTOU check-then-insert race. The concurrency arbiter is a **DB-enforced
+  unique index** on the value column (a `sys_index` record) + a global nonce-purge job. The
+  scoped `x_1793136_mcp_nonce` + its index/purge are **reserved/unused by the global core**
+  (kept for a possible future scoped-hosted verifier).
+- **`executor-install.mjs` = global-helper-only by default; global-REST endpoint DEPRECATED +
+  gated off.** The installer installs ONLY the global `x_mcp_verify` helper + its
+  tables/unique-index/purge/properties by default. The deprecated HMAC-only global-REST endpoint
+  (no role ACL — a second un-ACL'd executor surface) is gated behind `X_MCP_INSTALL_GLOBAL_REST=1`
+  (default OFF). The canonical surface is the scoped, role-ACL-gated Fluent REST
+  (`/api/x_1793136_mcp/x_mcp/executor/run`).
+- **now-sdk 4.7.1 `run_period` `'[object Object]'` ScheduledScript serializer bug.** The SDK's
+  ScheduledScript serializer emits `'[object Object]'` for a structured `run_period`; it affects
+  ONLY the scoped, functionally-unused `MCP Nonce Purge` job (manual P8 `run_period` fixup) — NOT
+  the REST-installed global purge job (whose `run_period` is a plain string).
+- **Content-addressed versioned KEK ring (P3).** `buildKekRing(currentSecret, prevSecret?)` with
+  version labels `kek-${sha256(keyBytes)[:8]}`, so a same-label rotation can no longer mask the
+  previous key. Threaded for both the token ring (`handlers.ts`) and the snapshot ring (P4).
+  `TOKEN_KEK`/`SNAPSHOT_KEK` kept as one-release aliases. Migration runbook in RECOVERY.md.
+- **Host-attested error codes (P2).** `structuredContent.code` derives only from monotonic host
+  signals (`budget_exceeded`/`reauth_required`); a forged `[[code]]` in a sandbox throw collapses
+  to `run_error`. `truncateUtf8` replaces the UTF-16 `json.slice` (byte-safe output).
+- **Opt-in posture (P4/P5/P6b).** The restrictive ActorPolicy (`ACTOR_POLICY_*`), the
+  second-approval gate (`ADMIN_SCRIPT_*`), and recovery snapshots (`SNAPSHOT_ENABLED_TABLES`) are
+  ALL **opt-in** — with the relevant vars unset, the single-operator behavior is preserved.
+  Mutations, however, now **hard-require** a tool-level `idempotencyKey` (fail-closed, not opt-in).
+
+## D13 — Deferred-but-available (documented, no speculative code)
+
+Per the plan's "Deferred" section — kept as tested helpers, wired only when the trigger exists:
+
+- **B2 `scriptedRest` denylist (`sn/scripted-rest-denylist.ts`).** No generic `scriptedRest`
+  RPC method exists today, so wiring the guard would protect nothing. The tested helper is kept
+  (`url-and-path-guards.test.ts`); wire it when such a method is added. **Available-but-unwired by
+  design** (finding: B2).
+- **B7 keyset `paginate` (`sn/pagination.ts`).** `tableQuery` already returns an honest `partial`
+  flag, so a stall/skip is visible without keyset pagination. Wire only if live P8 testing under
+  the restrictive policy surfaces ACL blank-page stalls; otherwise **available-but-unwired**
+  (finding: B7).
 
 ## Open / deferred
 

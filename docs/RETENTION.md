@@ -5,10 +5,10 @@ become "we built a second unmanaged sensitive database."
 
 | Control | Policy |
 |---|---|
-| **Retention period** | Default 30 days, then scheduled purge. |
+| **Retention period** | Default 30 days, then auto-expiry (Cloudflare KV `expirationTtl`). |
 | **Encryption** | AES-256-GCM (`auth/crypto.ts`) under a dedicated `SNAPSHOT_KEK`, versioned + rotated (current+previous window). |
 | **Who can decrypt** | `x_mcp.admin` role + the key holder; never the integration user. |
-| **Deletion workflow** | Scheduled purge job removes snapshots past retention. |
+| **Deletion workflow** | Cloudflare KV auto-expires each key at its 30-day `expirationTtl` — no separate scheduled purge job is needed on the host side (the executor nonce-table purge is a separate executor-side concern, P7). |
 | **PII classification** | Snapshots may contain PII — classified accordingly; access audited. |
 | **Tenant opt-out** | A tenant may disable snapshots; the recovery claim is then **narrowed** for that tenant (RECOVERY.md). |
 

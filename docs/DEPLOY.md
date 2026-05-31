@@ -42,9 +42,16 @@ npx alchemy deploy      # reads .dev.vars; provisions Worker + bindings; prints 
    mirror `X_MCP_EXECUTOR_HMAC_KEY` to the `x_mcp.executor.hmac_secret` property (still
    pending — Studio install).
 
-## Remaining external work (post-deploy)
+## Remaining external work (P8 — live verification + redeploy, operator-gated)
 
-- Install + prove the `x_mcp` scoped-app executor (S8/S9/S16, B1, B6) — ServiceNow Studio.
-- Wire the OAuthProvider consent/PKCE flow into the request path (token grant already
-  live-verified, B9) and per-user TokenStoreDO storage.
-- Move off the Basic-Auth dev path to per-user OAuth for multi-user deployments.
+- Build + install the **canonical Fluent scoped-app executor** `x_1793136_mcp` (D11) — hardened
+  in source in P7 (instance-claim, null-safe MAC, signed/audited `reason`, byte-safe sample,
+  DB-unique-indexed `x_mcp_nonce` replay-close, admin ACLs); install via `now-sdk install` + the
+  global `x_mcp_verify` helper, then prove S8/S9/S16, B1, B6 on `dev374488` in P8.
+- The OAuthProvider consent/PKCE flow + per-user TokenStoreDO storage are now **wired in source**
+  (P6a signed consent-state; P6b per-user OAuth authorize/callback + TokenStoreDO). The SN token
+  grant was live-verified **pre-hardening** (B9); the per-user dance is re-verified in P8.
+- Coordinated redeploy: P7's signed-`reason` canonical is a breaking payload change — deploy the
+  Worker and reinstall the executor **together** (both or neither), and point `SNOW_EXECUTOR_PATH`
+  at the scoped `/api/x_1793136_mcp/...` endpoint.
+- Move off the Basic-Auth dev path to `per_user_oauth` for multi-user deployments.

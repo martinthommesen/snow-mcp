@@ -14,11 +14,12 @@
   "worker_loaders": [{ "binding": "LOADER" }],
 
   // Plan §2.10 / §2.6 / §2.4 — KV namespaces, kept separate from TokenStoreDO.
-  // Placeholder IDs for local/test; real IDs come from `wrangler kv namespace create`
-  // or alchemy. vitest-pool-workers ignores IDs and uses in-memory KV.
+  // ALL FOUR IDs below (SCHEMA_KV/OAUTH_KV/AUDIT_KV/SNAPSHOT_KV) are PLACEHOLDERS for
+  // local/test only — vitest-pool-workers ignores IDs and uses in-memory KV. The real
+  // namespaces are adopted-by-title in alchemy.run.ts at deploy time (adopt: true), so
+  // these literal IDs are never the production bindings.
   // AUDIT_KV (host audit trail, §7.2) + SNAPSHOT_KV (recovery snapshots, §7.7) are
-  // declared here but consumed only once their flows are wired (P4); real namespaces
-  // are provisioned at deploy time (adopt-by-title in alchemy.run.ts).
+  // consumed once their flows are wired (P4); both are now live (P4 mutating path).
   "kv_namespaces": [
     { "binding": "SCHEMA_KV", "id": "40c98ca0d717428e89e097ef30887b8a" },
     { "binding": "OAUTH_KV", "id": "8de4edaad4d8481988a80be5edc77b46" },

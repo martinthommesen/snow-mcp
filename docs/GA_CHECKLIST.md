@@ -1,34 +1,65 @@
 # GA gate (plan §7) — status
 
-Maps each "production ready" criterion to current evidence. ✅ done · 🟡 partial · ⬜ open.
+Maps each "production ready" criterion to current evidence. ✅ done · 🟢-P8 source-complete,
+live-verified in P8 · 🟡 partial · ⬜ open.
+
+**Branch:** `harden/code-review-closeout` (P0–P7 landed + locally test-gated; P8 live is
+operator-gated, not yet run). The earlier on-edge proofs predate P7's **breaking signed-payload
+change** (added `reason`; enforced `actor.instance`) — they are re-verified in P8, not inherited.
 
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| 1 | Phases 0–9 complete; always-blocking suite green; sub-prod integration green | 🟡 | 105 local tests + 10 deployed e2e + executor 6/6 green; **sub-prod** not yet (PDI only) |
-| 2 | Security invariants proven (S1, S2, S2-auth, S8, S9, S12, S13, S14, S15, B1–B8) | ✅ | S1✅ S2/S2-auth✅ **S8✅** (scoped role-ACL via Fluent) S9✅(live) S12✅ S13✅(subset live) S14✅ S15✅ B1✅(live) B2✅ B3/B4✅(live) B5✅(live) B6✅(live) B7✅ B8✅ |
-| 3 | Cost bounded: multi-dim atomic budget breaker, metrics logged | ✅ | BudgetDO reserve-before-load; per-run meter; S14 |
-| 4 | Identity model decided; integration mode signed+verified; ActorPolicy enforced | ✅ | actor signing+verify proven live (B1); ActorPolicy live (B5) |
-| 5 | Recoverability honest (S18) | ✅ | recovery snapshots + recoverability classifier; claim narrowed where unsnapshotted |
-| 6 | run_code default read_only (or documented override) | ✅ | DEFAULT_MODE=read_only; B3/B4 enforced live |
-| 7 | No secrets in repo/logs; versioned envelope; refresh/revoke/rotation (S7) | ✅ | AES-GCM envelope; token-store rotate/revoke/KEK; redactor; .dev.vars gitignored |
+| 1 | Phases 0–9 complete; always-blocking suite green; sub-prod integration green | 🟡 | **286 local tests / 27 files green** (P0–P7); P8 live + sub-prod not yet (PDI only) |
+| 2 | Security invariants proven (S1, S2, S2-auth, S8, S9, S12, S13, S14, S15, B1–B8) | 🟡 | **Host (wired+tested):** S1✅ S12✅ S14✅ S15✅ B2✅ B3/B4✅ B5✅(policy) B7✅ B8✅. **Pre-hardening live, re-verified in P8:** S8 S9 S13 B1 B6. **🟢-P8:** executor verify (instance-claim, nonce unique-index, SHA-256 UTF-8) |
+| 3 | Cost bounded: multi-dim atomic budget breaker, metrics logged | ✅ | BudgetDO mutexed reserve-before-load + per-user map; ENFORCED per-run row/byte caps (P5); S14 |
+| 4 | Identity model decided; integration mode signed+verified; ActorPolicy enforced | ✅ host / 🟢-P8 live | actor signing incl. signed `reason` (`auth/actor.ts`, tested); ActorPolicy enforced (`actor-policy.ts`, tested); 🟢-P8 the in-scope HMAC verify match (B1) |
+| 5 | Recoverability honest (S18) | ✅ | recovery snapshots **wired** to SNAPSHOT_KV (fail-closed before mutate) + recoverability classifier; claim narrowed where unsnapshotted (P4) |
+| 6 | run_code default read_only (or documented override) | ✅ | DEFAULT_MODE=read_only; B3/B4 enforced + unknown-mode fail-closed |
+| 7 | No secrets in repo/logs; versioned envelope; refresh/revoke/rotation (S7) | ✅ | AES-GCM envelope; versioned-KEK ring (P3); token-store rotate/revoke; redactor; .dev.vars gitignored |
 | 8 | Exact pins; lockfile; `npm ci` reproducible | ✅ | runtime deps EXACT; package-lock committed |
 | 9 | Pre-1.0 exit (codemode ≥1.0; worker-bundler GA) or signed exemption | ⬜ | codemode 0.3.8 (pre-1.0); worker-bundler unused → exemption candidate |
 | 10 | Tested against a non-PDI instance | ⬜ | dev374488 is a PDI |
-| 11 | ServiceNow OAuth proven (B9); OAUTH_KV isolated from TokenStoreDO (B8) | ✅ | B9 live (grant/refresh); B8 |
-| 12 | Authorization real: effectiveMode=min(...); admin_script gated | ✅ | live B3/B4; approval gate (§7.9) |
-| 13 | SN-side egress controlled; recovery retention/encryption/opt-out | 🟡 | egress toggle + approval live; snapshot store policy doc'd, store not built |
+| 11 | ServiceNow OAuth proven (B9); OAUTH_KV isolated from TokenStoreDO (B8) | ✅ host / 🟢-P8 dance | B9 grant/refresh proven live pre-hardening; per-user OAuth wired in source (P6b), tested; B8; 🟢-P8 the live authorize/callback dance |
+| 12 | Authorization real: effectiveMode=min(...); admin_script gated | ✅ | effectiveMode min + unknown-mode fail-closed; (opt-in) approval gate wired (§7.9, P4) |
+| 13 | SN-side egress controlled; recovery retention/encryption/opt-out | ✅ host / 🟢-P8 executor | host audit/ledger/snapshot/approval wired on `runServerScript` (P4); snapshot store **built**; 🟢-P8 executor kill-switch/egress live |
 
 ## What remains for GA
 
-- ~~S8 role-ACL~~ **DONE** — production scoped app `x_1793136_mcp` shipped via the ServiceNow
-  SDK + Fluent (`sn-executor-app/fluent/`), with the real `x_1793136_mcp_audit_log`/`_nonce`
-  tables, `x_1793136_mcp.executor` role, and the enforced REST_Endpoint ACL. Verified 4/4 live.
-  (Eval + crypto are global-only, so the scoped wrapper delegates to the global core — DELTAS D11.)
+- ~~S8 role-ACL~~ **DONE in source** — production scoped app `x_1793136_mcp` shipped via the
+  ServiceNow SDK + Fluent (`sn-executor-app/fluent/`), with the real
+  `x_1793136_mcp_audit_log`/`_nonce` tables, `x_1793136_mcp.executor` role, and the enforced
+  REST_Endpoint ACL. (Eval + crypto are global-only, so the scoped wrapper delegates to the
+  global core — DELTAS D11.) **Live re-verified in P8** (the earlier 4/4 predates the P7 payload
+  change).
+- ~~Per-user ServiceNow tokens~~ **WIRED end-to-end in source** (P6b) — ticket → authorize →
+  PKCE → callback → per-user `TokenStoreDO`; SN principal → signed `snow_effective_user_sys_id`
+  + roleHash cache key. 🟢-P8 the live authorize/callback dance + SN-principal endpoint shape.
+- ~~Recovery snapshot store~~ **BUILT + WIRED** — `SNAPSHOT_KV` (30-day KV `expirationTtl`, no
+  separate purge job needed — KV auto-expires), sealed under the versioned `SNAPSHOT_KEK` ring,
+  fail-closed before mutate (P4; policy in RETENTION.md).
 - **Sub-production instance** for the GA evidence base (PDIs are dev/demo only, §13).
 - **Pre-1.0 dependency exit** or a signed exemption in DELTAS for `@cloudflare/codemode`.
-- **Per-user ServiceNow tokens** wired end-to-end (the TokenStore adapter + crypto are done
-  and unit-verified; wiring into the OAuth callback is the remaining integration).
-- Recovery **snapshot store + scheduled purge** (policy in RETENTION.md; crypto verified).
+
+## P8-LIVE GATE — must be proven on the PDI before GA (cannot run here)
+
+P7's breaking signed-payload change means the host + executor are **redeployed together** and
+the full chain is re-proven live. The specific gates:
+
+1. **`instance_name` property shape** — fail-closed: an FQDN or empty value makes
+   `_instanceMatches` reject everything (total 401 brick). Confirm the property returns the bare
+   subdomain (e.g. `dev374488`) on the PDI.
+2. **`GlideDigest` SHA-256 UTF-8 encoding** — confirm `getSHA256Base64` hashes the **UTF-8** bytes
+   of the script (the `script_sha256` seam, 0.13a); a UTF-16/Latin-1 hash breaks non-ASCII scripts.
+3. **`x_mcp_nonce` unique-index DB enforcement** — the INSERT-as-arbiter race-close is **inert
+   without the DB-enforced unique index**. Confirm a concurrent duplicate `value` INSERT is
+   actually REJECTED (not merely that the `sys_index` row exists).
+4. **Coordinated host + executor redeploy** — the signed canonical changed (6 keys incl. `reason`);
+   a half-redeploy = total signature mismatch.
+5. **`SNOW_EXECUTOR_PATH`** must point at the scoped `/api/x_1793136_mcp/...` endpoint.
+6. **Per-user OAuth authorize/callback live dance** (`oauth-verify.mjs`) — authorize → callback →
+   token stored/reused/refreshed; `reauth_required` when absent.
+7. **KEK rotation drill** — deploy with `TOKEN_KEK_CURRENT`=current passphrase → existing tokens
+   still decrypt; simulate rotation (current→prev, new current) → no outage.
 
 ## Nonce replay store — live target (P7 finding 24)
 
