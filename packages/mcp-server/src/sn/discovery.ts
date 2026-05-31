@@ -9,6 +9,7 @@ import { mapServiceNowError } from "./errors.js";
 import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
 import { assertActorPolicy, type ActorPolicy } from "../authz/actor-policy.js";
 import { validateTableName } from "./validate.js";
+import { utf8Len } from "../sandbox/serialize.js";
 import type { RunBudget } from "./run-budget.js";
 import type { Mode } from "@servicenow-codemode/shared";
 
@@ -113,7 +114,11 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
     if (Number.isFinite(ml) && ml > 0) out.maxLength = ml;
     byName.set(name, out);
   }
-  return [...byName.values()];
+  const fields = [...byName.values()];
+  // L-5: meter the returned bytes against the per-run/daily byte ceiling, matching rpc.ts reads
+  // (discovery previously counted rows but not bytes, leaving a byte-budget accounting gap).
+  deps.runBudget.countBytes(utf8Len(JSON.stringify(fields)));
+  return fields;
 }
 
 /** List tables (sys_db_object), optionally filtered. Drops tables denied by ActorPolicy. */
@@ -140,9 +145,12 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
 
   const rows = ((res.json as { result?: Record<string, unknown>[] }).result ?? []);
   deps.runBudget.countRows(rows.length);
-  return rows
+  const tables = rows
     .map((r) => ({ name: String(r.name ?? ""), label: String(r.label ?? "") }))
     .filter((t) => t.name && isTableVisible(deps.actorPolicy, t.name));
+  // L-5: meter returned bytes (see describeTable note).
+  deps.runBudget.countBytes(utf8Len(JSON.stringify(tables)));
+  return tables;
 }
 
 function isTableVisible(policy: ActorPolicy, table: string): boolean {

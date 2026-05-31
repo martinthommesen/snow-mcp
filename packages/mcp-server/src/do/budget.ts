@@ -79,10 +79,12 @@ export class BudgetDO extends DurableObject {
     const current: Record<BudgetDimension, number> = {} as Record<BudgetDimension, number>;
     for (const d of DIMENSIONS) current[d] = (await this.ctx.storage.get<number>(`dim:${d}`)) ?? 0;
 
-    // Daily rows/bytes ADMISSION check (§P5): these dimensions are accrued POST-run, so the
-    // reserve loop below (which skips 0-increment dimensions) never sees them. Deny the next
-    // run if the day is already at/over cap. Unconditional — independent of `req`.
-    for (const d of ["rowsReturned", "bytesReturned"] as const) {
+    // Daily ADMISSION check (§P5): these dimensions are accrued POST-run (the reserve loop below
+    // skips 0-increment dimensions, so it never sees them). Deny the next run if the day is already
+    // at/over cap. Unconditional — independent of `req`. M-1: sandboxRpcCalls is accrued post-run
+    // too (handlers maps snapshot.rpcCalls -> sandboxRpcCalls) and was previously enforced NOWHERE
+    // — the configured cap was dead. It is now an admission dimension alongside rows/bytes.
+    for (const d of ["rowsReturned", "bytesReturned", "sandboxRpcCalls"] as const) {
       if (current[d] >= caps[d]) return { ok: false, dimension: d, cap: caps[d], would: current[d] };
     }
 

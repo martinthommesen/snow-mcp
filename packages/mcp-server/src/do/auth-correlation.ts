@@ -17,8 +17,9 @@ export interface AuthCorrelationRecord {
   instanceHost: string;
   /** PKCE code_verifier; exchanged with the code at oauth_token.do (S256). */
   pkceVerifier: string;
-  /** Anti-CSRF nonce carried from the ticket (defense in depth alongside the opaque state). */
-  nonce: string;
+  // I-2: the former `nonce` field was write-only — never read at the callback, so it provided no
+  // CSRF protection. CSRF/replay defense is the opaque, single-use `state` (atomic
+  // read-then-delete in this DO). Removed to avoid implying a second correlation check exists.
   /** Optional post-auth return target (unused by the worker today; reserved for the UI). */
   returnTarget?: string;
   /** epoch ms after which the record is expired (TTL check at the callback). */

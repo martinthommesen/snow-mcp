@@ -54,6 +54,11 @@ export function requireCapability(mode: Mode, cap: Capability): void {
 export const SIZE_LIMITS = {
   maxCodeBytes: 64 * 1024, // reject oversize snippets pre-transpile
   maxOutputBytes: 256 * 1024, // truncate run_code result beyond this
+  // M-3: cap snippet console.log output too — the result value is capped at maxOutputBytes, but
+  // exec.logs was spliced into the tool result verbatim (a `for(;;)console.log("x".repeat(1e6))`
+  // loop inflated the payload to ~sandbox-memory size, uncapped/unmetered). Truncate to these.
+  maxLogBytes: 64 * 1024, // total UTF-8 bytes across all captured log entries
+  maxLogEntries: 1000, // max number of log entries retained
 } as const;
 
 /** Multi-dimensional budgets (plan §2.5). Per-run trips mid-snippet; daily is the hard breaker. */

@@ -45,3 +45,39 @@ export function serializeResult(value: unknown, maxBytes: number): SerializedRes
   }
   return { text: json, truncated: false, totalBytes };
 }
+
+export interface CappedLogs {
+  logs: string[];
+  truncated: boolean;
+}
+
+/**
+ * Cap snippet-captured console logs (M-3). The sandbox's `console.log` capture is unbounded, and
+ * the logs were spliced into the tool result verbatim — past the documented output cap. Bound BOTH
+ * entry count and cumulative UTF-8 bytes, truncating the final retained entry byte-safely
+ * (reuses truncateUtf8 — never split a multi-byte sequence). Returns a `truncated` flag so the
+ * caller can surface `logsTruncated`.
+ */
+export function capLogs(logs: readonly unknown[], maxEntries: number, maxBytes: number): CappedLogs {
+  let truncated = false;
+  let entries = logs;
+  if (entries.length > maxEntries) {
+    entries = entries.slice(0, maxEntries);
+    truncated = true;
+  }
+  const out: string[] = [];
+  let total = 0;
+  for (const e of entries) {
+    const s = typeof e === "string" ? e : String(e);
+    const len = utf8Len(s);
+    if (total + len > maxBytes) {
+      const remaining = maxBytes - total;
+      if (remaining > 0) out.push(truncateUtf8(s, remaining));
+      truncated = true;
+      break;
+    }
+    out.push(s);
+    total += len;
+  }
+  return { logs: out, truncated };
+}

@@ -8,7 +8,7 @@ import type { Mode } from "@servicenow-codemode/shared";
 import { resolveEffectiveMode } from "../authz/effective-mode.js";
 import { transpileTs, TranspileFailure } from "../sandbox/transpile.js";
 import { createExecutor, executeSnippet } from "../sandbox/executor.js";
-import { serializeResult, utf8Len } from "../sandbox/serialize.js";
+import { serializeResult, utf8Len, capLogs } from "../sandbox/serialize.js";
 import { SIZE_LIMITS } from "../config.js";
 import { McpToolError, toToolResult, parseSandboxError } from "../sn/errors.js";
 import type { ServiceNowRPC } from "../sn/rpc.js";
@@ -143,6 +143,9 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
 
     // 5) serialize / finalize
     const budget = runBudget.snapshot();
+    // M-3: cap snippet logs (entry count + cumulative bytes) ONCE for every return path below —
+    // exec.logs was previously spliced in verbatim, bypassing the output byte cap.
+    const cappedLogs = capLogs(exec.logs ?? [], SIZE_LIMITS.maxLogEntries, SIZE_LIMITS.maxLogBytes);
 
     // Host-attested error code (§P2). The attested `code` is derived ONLY from monotonic
     // host signals, never from the snippet-controlled error text — a forged
@@ -156,7 +159,7 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       return {
         content: [{ type: "text", text: `[budget_exceeded] Per-run ${dimension ?? "budget"} cap exceeded.` }],
         isError: true,
-        structuredContent: { code: "budget_exceeded", logs: exec.logs ?? [], budget, ...(dimension ? { detail: { dimension } } : {}) },
+        structuredContent: { code: "budget_exceeded", logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}), budget, ...(dimension ? { detail: { dimension } } : {}) },
       };
     }
     if (signals.reauthRequired) {
@@ -164,7 +167,7 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       return {
         content: [{ type: "text", text: "[reauth_required] ServiceNow re-authentication required." }],
         isError: true,
-        structuredContent: { code: "reauth_required", logs: exec.logs ?? [], budget, ...(authorizeUrl ? { detail: { authorizeUrl } } : {}) },
+        structuredContent: { code: "reauth_required", logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}), budget, ...(authorizeUrl ? { detail: { authorizeUrl } } : {}) },
       };
     }
     if (exec.error) {
@@ -175,7 +178,7 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       return {
         content: [{ type: "text", text: `[run_error] ${parsed.message}` }],
         isError: true,
-        structuredContent: { code: "run_error", error: parsed.message, logs: exec.logs ?? [], budget },
+        structuredContent: { code: "run_error", error: parsed.message, logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}), budget },
       };
     }
     const ser = serializeResult(exec.result, SIZE_LIMITS.maxOutputBytes);
@@ -186,7 +189,7 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
         mode: effectiveMode,
         truncated: ser.truncated,
         totalBytes: ser.totalBytes,
-        logs: exec.logs ?? [],
+        logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}),
         budget,
       },
     };
@@ -203,11 +206,23 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       } catch (e) {
         // Swallow so accrual failure never masks the real run result/error — BUT this is NOT
         // merely a metering gap: budget.ts's admission check reads dim:rowsReturned/
-        // dim:bytesReturned, which are written ONLY by this (now-failed) accrual. So a
-        // PERSISTENT BUDGET_DO failure silently DISABLES the daily rows/bytes ceiling — it
-        // degrades to per-run enforcement, backstopped only by the hard uniqueWorkers daily
-        // cap (reserved pre-run). Emit an observable signal so that silent disable is detectable.
-        console.error("accrueDailyBudget failed:", e instanceof Error ? e.message : String(e));
+        // dim:bytesReturned/dim:sandboxRpcCalls, written ONLY by this (now-failed) accrual. So a
+        // PERSISTENT BUDGET_DO failure silently DISABLES those daily ceilings — they degrade to
+        // per-run enforcement, backstopped only by the hard uniqueWorkers daily cap (reserved
+        // pre-run; that path fails CLOSED, so worst-case daily cost stays bounded by it).
+        // M-2: emit a STRUCTURED, alertable signal (not a prose log line) so an SRE log-metric can
+        // page on a sustained streak — the correct place to escalate a silently-degraded ceiling.
+        // We deliberately do NOT fail the next run closed here: that would require cross-DO streak
+        // state and could turn a transient blip into a self-inflicted outage (availability > a
+        // bounded, backstopped overrun). The uniqueWorkers cap is the safety bound meanwhile.
+        console.error(
+          JSON.stringify({
+            event: "budget_accrual_failed",
+            severity: "alert",
+            note: "daily rows/bytes/sandboxRpcCalls ceiling degraded until BUDGET_DO recovers; uniqueWorkers cap still bounds worst case",
+            error: e instanceof Error ? e.message : String(e),
+          }),
+        );
       }
     }
   }

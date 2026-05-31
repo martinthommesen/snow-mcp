@@ -111,13 +111,44 @@ export function tokenAad(userId: string, instanceHost: string, tokenType: string
 }
 
 /**
- * Derive a 32-byte AES-256 key from an arbitrary KEK passphrase via SHA-256. Lets a KEK
- * secret be any string (not necessarily base64-32). Deterministic, so the same passphrase
- * always yields the same key.
+ * Derive a 32-byte AES-256 key from a KEK secret via a single SHA-256. Deterministic (same secret
+ * → same key), which the rotation/migration path depends on — DO NOT change this derivation, or
+ * every existing envelope (stamped by content-addressed label over these exact bytes) becomes
+ * undecryptable.
+ *
+ * M-8: this is UNSALTED, SINGLE-ITERATION. That is cryptographically fine IFF `secret` is a
+ * high-entropy CSPRNG value (e.g. `openssl rand -base64 32`). A low-entropy passphrase is
+ * offline-guessable (~1 SHA-256 + 1 AES-GCM/candidate, no salt → amortizes across deployments) if
+ * envelopes ever leak. We do not stretch (changing it breaks existing envelopes) — instead callers
+ * WARN on weak-looking secrets at startup (warnIfWeakSecret) and the docs mandate CSPRNG secrets.
  */
 export async function deriveKeyBytes(secret: string): Promise<Uint8Array> {
   const digest = await crypto.subtle.digest("SHA-256", enc.encode(secret) as BufferSource);
   return new Uint8Array(digest);
+}
+
+/** Heuristic (M-8): does `secret` look like a CSPRNG-generated key of >=32 bytes — base64/base64url
+ *  (>=43 chars) or hex (>=64 chars)? Used only to WARN; never to gate (a hard reject would brick an
+ *  existing deployment that uses a passphrase). */
+export function looksLikeStrongSecret(secret: string): boolean {
+  const s = secret.trim();
+  const base64ish = /^[A-Za-z0-9+/_-]+={0,2}$/.test(s) && s.replace(/=+$/, "").length >= 43;
+  const hexish = /^[0-9a-fA-F]+$/.test(s) && s.length >= 64;
+  return base64ish || hexish;
+}
+
+/** WARN (structured, alertable; never throw) when a KEK/HMAC secret does not look CSPRNG-strong
+ *  (M-8). Call once at startup per secret — never per-request (log spam). */
+export function warnIfWeakSecret(name: string, secret: string): void {
+  if (secret && !looksLikeStrongSecret(secret)) {
+    console.warn(
+      JSON.stringify({
+        event: "weak_secret_warning",
+        secret: name,
+        note: "value does not look like a CSPRNG 32-byte key; derivation is unsalted SHA-256, so a low-entropy secret is offline-guessable if envelopes leak (M-8). Generate with `openssl rand -base64 32`.",
+      }),
+    );
+  }
 }
 
 function hex(bytes: Uint8Array): string {
@@ -150,9 +181,11 @@ async function kekLabel(keyBytes: Uint8Array): Promise<string> {
  */
 export async function buildKekRing(currentSecret: string, prevSecret?: string): Promise<KekRing> {
   if (!currentSecret) throw new Error("KEK ring requires a current secret (fail closed).");
+  warnIfWeakSecret("KEK (current)", currentSecret); // M-8: startup-only weak-secret warning
   const currentBytes = await deriveKeyBytes(currentSecret);
   const ring: KekRing = { current: { version: await kekLabel(currentBytes), keyBytes: currentBytes } };
   if (prevSecret) {
+    warnIfWeakSecret("KEK (previous)", prevSecret);
     const prevBytes = await deriveKeyBytes(prevSecret);
     ring.previous = { version: await kekLabel(prevBytes), keyBytes: prevBytes };
   }

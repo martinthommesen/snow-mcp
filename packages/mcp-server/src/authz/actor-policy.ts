@@ -228,3 +228,44 @@ export function assertRequestedFieldsAllowed(policy: ActorPolicy, table: string,
     throw new McpToolError("actor_policy_denied", `Fields not permitted for this actor on "${table}": ${violating.join(", ")}.`);
   }
 }
+
+// Leading clause-operator keywords in a ServiceNow encoded query (longest-first so ORDERBYDESC
+// is stripped before ORDERBY, and ORDERBY before OR). Used to reach the field token in a clause
+// like `^ORsalary>5` / `^ORDERBYsalary` / `^GROUPBYdept`.
+const QUERY_OP_PREFIX = /^(ORDERBYDESC|ORDERBY|GROUPBY|NQ|OR|EQ)/i;
+
+/** The leading ServiceNow field token of a clause: the initial run of lowercase field chars.
+ *  SN field names are lowercase `[a-z0-9_.]` (see validate.ts FIELD_NAME), so an UPPERCASE
+ *  operator (LIKE/IN/STARTSWITH/ISEMPTY/BETWEEN/…) or a symbol (`=`,`>`,`<`) terminates the run
+ *  cleanly — `salaryLIKE5` and `salary>5` both yield `salary`. */
+function leadingFieldToken(clause: string): string {
+  const m = clause.match(/^[a-z0-9_.]+/);
+  return m ? m[0] : "";
+}
+
+/**
+ * M-6: reject a caller-supplied encoded query whose PREDICATE / ordering / grouping references a
+ * masked field. `fieldMasks` already strips masked fields from requested `fields` and from
+ * returned rows, but a caller could still filter ON a masked column without REQUESTING it
+ * (`tableQuery({table:'sys_user', query:'salary>500000', fields:['name']})` is a row-selection
+ * oracle; `aggregate({query:'ssn=…'})` is an equality oracle) and reconstruct the masked value.
+ *
+ * Fail-safe: split on `^` clause boundaries; for each clause extract the field token both raw and
+ * after stripping one leading operator keyword (so `^ORsalary>5` and `^ORDERBYsalary` are caught),
+ * and deny (`actor_policy_denied`) if either is masked (dot-aware via isMaskedBy). This errs toward
+ * over-rejection, the correct direction for a confidentiality control. Residual edge: a rare
+ * lowercase-operator form (`salarylike5`) is not detected — SN-canonical queries use UPPERCASE
+ * operators; this mirrors validate.ts's documented P8 case-sensitivity caveat.
+ */
+export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, userQuery: string): void {
+  const masked = policy.fieldMasks[table];
+  if (!masked || masked.length === 0 || !userQuery) return;
+  for (const clause of userQuery.split("^")) {
+    const candidates = [leadingFieldToken(clause), leadingFieldToken(clause.replace(QUERY_OP_PREFIX, ""))];
+    for (const f of candidates) {
+      if (f && masked.some((m) => isMaskedBy(f, m))) {
+        throw new McpToolError("actor_policy_denied", `Query references a field not permitted for this actor on "${table}": ${f}.`);
+      }
+    }
+  }
+}

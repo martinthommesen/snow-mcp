@@ -4,7 +4,11 @@
 // OAuth bearer is injected host-side in SnHttpClient and never appears in any
 // signature or return. Every method — reads included — enforces, IN ORDER:
 //   ActorPolicy (§2.12) -> effective-mode capability (§3.5) -> per-run budget (§2.5)
-// before calling ServiceNow. The enforcement is unit-verified locally against a mock
+// before calling ServiceNow. The ActorPolicy step is table-scoped for reads/writes
+// (assertActorPolicy: instance + table allowlist + mode ceiling) and additionally screens the
+// caller query for masked fields (assertQueryFieldsAllowed). runServerScript is TABLE-LESS, so it
+// applies the ActorPolicy MODE CEILING explicitly (H-1) — there is no table allowlist to run.
+// The enforcement is unit-verified locally against a mock
 // SnHttpClient; live ServiceNow behavior is not (see OPEN_QUESTIONS.md).
 //
 // NOTE: the plan writes `class ServiceNowRPC extends RpcTarget`. We expose plain
@@ -12,6 +16,7 @@
 // over Workers RPC — so extending RpcTarget here is unnecessary (recorded in DELTAS).
 
 import type { Mode } from "@servicenow-codemode/shared";
+import { modeRisk } from "@servicenow-codemode/shared";
 import type { SnHttpClient } from "./http.js";
 import { mapServiceNowError, encodeSandboxError, McpToolError } from "./errors.js";
 import { requireCapability } from "../config.js";
@@ -22,6 +27,7 @@ import {
   assertActorPolicy,
   applyRowFilter,
   assertRequestedFieldsAllowed,
+  assertQueryFieldsAllowed,
   maskRow,
   type ActorPolicy,
 } from "../authz/actor-policy.js";
@@ -182,6 +188,9 @@ export class ServiceNowRPC {
     const userQuery = validateUserQuery(args.query, this.hasMandatoryFilter(table));
     const reqLimit = validateLimit(args.limit);
     this.gateRead(table, reqFields);
+    // M-6: masked fields must not be referenced in the query predicate/ordering either (closes the
+    // row-selection inference oracle — filtering ON a masked column without REQUESTING it).
+    assertQueryFieldsAllowed(this.deps.actorPolicy, table, userQuery);
     const query = applyRowFilter(this.deps.actorPolicy, table, userQuery);
     const limit = reqLimit ?? TABLE_PAGE_CAP;
 
@@ -237,6 +246,9 @@ export class ServiceNowRPC {
     const countFields = args.countField !== undefined ? validateFields([args.countField]) : undefined;
     const fieldRefs = [...(groupBy ?? []), ...(countFields ?? [])];
     this.gateRead(table, fieldRefs.length > 0 ? fieldRefs : undefined);
+    // M-6: the aggregate `query` is an equality/inference oracle if it can filter on a masked field
+    // (groupBy/countField are already mask-checked via gateRead; the predicate was not).
+    assertQueryFieldsAllowed(this.deps.actorPolicy, table, userQuery);
     const query = applyRowFilter(this.deps.actorPolicy, table, userQuery);
     const q: Record<string, string> = { sysparm_count: "true" };
     if (query) q.sysparm_query = query;
@@ -383,12 +395,32 @@ export class ServiceNowRPC {
     // runContext.reason below, mirroring tableUpdate).
     validateReason(args.reason);
     validateIdempotencyKey(args.idempotencyKey);
+    // H-1: ActorPolicy mode ceiling on the executor path. assertActorPolicy is table-scoped and
+    // never runs here (runServerScript is table-less), so the per-actor `maxMode` cap previously
+    // failed OPEN on the single most dangerous capability — an actor pinned to `write` could still
+    // run arbitrary admin script. In integration_user mode (SN ACLs don't bound the shared
+    // identity) this host-side cap is the bound, so enforce it explicitly BEFORE the capability
+    // gate, matching the documented ActorPolicy→capability order. modeRisk scores any non-Mode as
+    // +Infinity, so it fails closed.
+    if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode)) {
+      throw new McpToolError(
+        "actor_policy_denied",
+        `Mode "${this.deps.effectiveMode}" exceeds this actor's maxMode "${this.deps.actorPolicy.maxMode}".`,
+      );
+    }
     requireCapability(this.deps.effectiveMode, "runServerScript");
     if (!this.deps.signing) {
       // The executor call is ALWAYS host-signed when the executor is configured (orthogonal to
       // credential mode — see the method header). No signing config => the executor is unwired.
       throw new Error("runServerScript requires signed-actor configuration (executor not configured).");
     }
+    // I-6: a security-critical egress target must fail CLOSED, never silently fall back to a
+    // hardcoded guess. Require the configured executor path here (handlers gates executorReady on
+    // SNOW_EXECUTOR_PATH, so this is set in every wired deployment).
+    if (!this.deps.executorPath) {
+      throw new Error("runServerScript requires executorPath (executor not configured).");
+    }
+    const executorPath = this.deps.executorPath;
     const signing = this.deps.signing;
     this.deps.runBudget.countRpcCall();
 
@@ -413,7 +445,7 @@ export class ServiceNowRPC {
       });
       const res = await this.deps.http.request({
         method: "POST",
-        path: this.deps.executorPath ?? "/api/x_mcp/executor/run",
+        path: executorPath,
         body: { script: args.script, actor: signed.actor, actor_sig: signed.actor_sig },
       });
       // Executor surfaces 503 (disabled) / 401 (bad signature) as typed conditions.

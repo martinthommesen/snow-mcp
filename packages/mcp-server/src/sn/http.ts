@@ -49,10 +49,11 @@ export class SnFetchClient implements SnHttpClient {
   }
 
   async request(req: SnRequest): Promise<SnResponse> {
-    // Transport-level path safety only (no scheme/userinfo, must be /api/...). The B2
-    // executor-bypass DENYLIST is enforced by the generic `scriptedRest` RPC method
-    // (§3.2), NOT here — the sanctioned runServerScript() path legitimately targets the
-    // executor endpoint and must pass through this transport.
+    // Transport-level path safety only (no scheme/userinfo, must be /api/...). NOTE (L-1): the B2
+    // executor-bypass DENYLIST (scripted-rest-denylist.ts) is DEFINED BUT NOT YET WIRED — there is
+    // no generic `scriptedRest` RPC method today, so nothing routes through it. If a generic
+    // scripted-REST tool is ever added it MUST call checkScriptedRestPath(); the sanctioned
+    // runServerScript() path legitimately targets the executor endpoint and passes through here.
     if (!req.path.startsWith("/api/") || req.path.includes("://") || req.path.includes("@")) {
       throw new Error(`unsafe ServiceNow path: ${req.path}`);
     }
@@ -83,8 +84,20 @@ export class SnFetchClient implements SnHttpClient {
           ...(req.body !== undefined ? { "content-type": "application/json" } : {}),
         },
         ...(req.body !== undefined ? { body: JSON.stringify(req.body) } : {}),
+        // M-7: never auto-follow redirects with the Authorization bearer attached. Cloudflare's
+        // runtime forwards `Authorization` across cross-origin redirects (unlike browsers), and the
+        // SSRF allowlist (canonicalizeInstanceHost) only validates the INITIAL host — a 3xx from the
+        // instance (open redirect / on-path MITM / misconfig) would otherwise steer the
+        // credential-bearing request to an arbitrary host (S15 bypass + credential exfil). SN
+        // Table/scripted-REST APIs return data directly and never legitimately 3xx.
+        redirect: "manual",
         signal: ac.signal,
       });
+      // A redirect from a ServiceNow data API is anomalous; fail CLOSED rather than follow it with
+      // credentials attached. (With redirect:"manual" the 3xx is surfaced here, not followed.)
+      if (res.status >= 300 && res.status < 400) {
+        throw new Error(`refusing to follow a ${res.status} redirect from ServiceNow (credentials attached; off-allowlist egress risk)`);
+      }
       const text = await res.text();
       let json: unknown = null;
       try {

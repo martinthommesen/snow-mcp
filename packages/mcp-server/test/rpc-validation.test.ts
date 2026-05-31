@@ -330,3 +330,81 @@ describe("P1 — validateReason", () => {
     expect(() => validateReason("bad\u007freason")).toThrow(McpToolError);
   });
 });
+
+// ─── H-1 — runServerScript enforces the ActorPolicy maxMode ceiling at the sink ───
+// Regression test for the review's headline finding: the per-actor maxMode cap was enforced on
+// every read/write (assertActorPolicy) but NOT on runServerScript, so an actor pinned to `write`
+// could still run arbitrary admin script. The check must run at the dangerous sink, driven through
+// the RPC — not merely asserted on assertActorPolicy in isolation (isolation-only is what hid it).
+describe("H-1 — runServerScript respects ActorPolicy.maxMode", () => {
+  const SCRIPT_ARGS = { script: "return gs.getUserName();", reason: "audit reason", idempotencyKey: "run-1" };
+
+  it("DENIES admin_script when the actor's maxMode is write (the cap no longer fails open)", async () => {
+    const { rpc: r, http } = rpc({ policy: { ...permissivePolicy([INSTANCE]), maxMode: "write" } });
+    await expect(r.runServerScript(SCRIPT_ARGS)).rejects.toMatchObject({ code: "actor_policy_denied" });
+    expect(http.calls.length).toBe(0); // denied before any executor request (and before signing)
+  });
+
+  it("DENIES admin_script when the actor's maxMode is read_only", async () => {
+    const { rpc: r } = rpc({ policy: { ...permissivePolicy([INSTANCE]), maxMode: "read_only" } });
+    await expect(r.runServerScript(SCRIPT_ARGS)).rejects.toMatchObject({ code: "actor_policy_denied" });
+  });
+
+  it("does NOT over-block: maxMode admin_script passes the ceiling (fails later on unconfigured executor, not policy)", async () => {
+    // permissivePolicy.maxMode is admin_script and effectiveMode is admin_script -> the H-1 ceiling
+    // check passes; the call then fails because signing/executorPath are unwired in this unit — a
+    // DIFFERENT error, proving the policy gate itself did not deny.
+    const { rpc: r } = rpc(); // permissive policy (maxMode admin_script)
+    await expect(r.runServerScript(SCRIPT_ARGS)).rejects.toSatisfy(
+      (e: unknown) => !(e instanceof McpToolError) || e.code !== "actor_policy_denied",
+    );
+  });
+});
+
+// ─── M-6 — field masks apply to the query predicate, not just requested fields ───
+// A caller could filter ON a masked column without REQUESTING it (a row-selection / aggregate
+// oracle) and reconstruct the masked value. The mask must reject masked-field references in the
+// query — including TEXT operators (LIKE/IN/…), OR-clauses, ORDERBY, and dot-walk — without
+// over-rejecting legitimately-named fields.
+describe("M-6 — masked fields rejected in query predicates", () => {
+  const maskedPolicy = (): ActorPolicy => ({ ...permissivePolicy([INSTANCE]), fieldMasks: { incident: ["salary", "caller_id"] } });
+
+  it("DENIES tableQuery filtering on a masked field with a symbol operator", async () => {
+    const { rpc: r, http } = rpc({ policy: maskedPolicy() });
+    await expect(r.tableQuery({ table: "incident", query: "salary>500000", fields: ["number"] })).rejects.toMatchObject({
+      code: "actor_policy_denied",
+    });
+    expect(http.calls.length).toBe(0); // rejected before the ServiceNow request
+  });
+
+  it("DENIES a masked field behind a TEXT operator (salaryLIKE5) — the parser must not stop at the field run", async () => {
+    const { rpc: r } = rpc({ policy: maskedPolicy() });
+    await expect(r.tableQuery({ table: "incident", query: "salaryLIKE5", fields: ["number"] })).rejects.toMatchObject({
+      code: "actor_policy_denied",
+    });
+  });
+
+  it("DENIES a masked field in an OR-clause and in ORDERBY", async () => {
+    const { rpc: r } = rpc({ policy: maskedPolicy() });
+    await expect(r.tableQuery({ table: "incident", query: "active=true^ORsalary>1", fields: ["number"] })).rejects.toMatchObject({ code: "actor_policy_denied" });
+    await expect(r.tableQuery({ table: "incident", query: "active=true^ORDERBYsalary", fields: ["number"] })).rejects.toMatchObject({ code: "actor_policy_denied" });
+  });
+
+  it("DENIES a dot-walked masked reference (caller_id.name when caller_id is masked)", async () => {
+    const { rpc: r } = rpc({ policy: maskedPolicy() });
+    await expect(r.tableQuery({ table: "incident", query: "caller_id.name=Bob", fields: ["number"] })).rejects.toMatchObject({ code: "actor_policy_denied" });
+  });
+
+  it("DENIES a masked-field predicate in aggregate()", async () => {
+    const { rpc: r } = rpc({ policy: maskedPolicy() });
+    await expect(r.aggregate({ table: "incident", query: "salary>1", groupBy: ["state"] })).rejects.toMatchObject({ code: "actor_policy_denied" });
+  });
+
+  it("does NOT over-reject: a non-masked field, or a longer field that merely starts with the mask, is allowed", async () => {
+    const { rpc: r, http } = rpc({ policy: maskedPolicy() });
+    await expect(r.tableQuery({ table: "incident", query: "active=true", fields: ["number"] })).resolves.toBeDefined();
+    // `salary_band` starts with `salary` but is a distinct field — must NOT be rejected.
+    await expect(r.tableQuery({ table: "incident", query: "salary_band=high", fields: ["number"] })).resolves.toBeDefined();
+    expect(http.calls.length).toBe(2); // both legitimate queries reached ServiceNow
+  });
+});

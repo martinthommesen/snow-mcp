@@ -14,6 +14,11 @@ export interface AuditActor {
 
 export interface AuditRecord {
   ts: number;
+  /** L-2: UTC date (YYYY-MM-DD) of the mutation's INTENT, stamped once and reused for the outcome
+   *  row so intent + outcome share an AUDIT_KV key even across a UTC-midnight boundary (deriving it
+   *  from each row's own `ts` at write time would orphan the intent row). Optional for back-compat;
+   *  the sink falls back to the wall-clock date when absent. */
+  dateKey?: string;
   requestId: string;
   /** Per-run mutation ordinal (plan §P4): identifies the audit-event key within a run, so
    *  the intent row and its result row share a key (result supersedes intent) while
@@ -49,6 +54,7 @@ export async function hashValue(value: unknown): Promise<string> {
 
 export interface BuildAuditInput {
   ts: number;
+  dateKey?: string;
   requestId: string;
   ordinal?: number;
   instance: string;
@@ -73,6 +79,7 @@ export async function buildAuditRecord(input: BuildAuditInput): Promise<AuditRec
     op: input.op,
     status: input.status,
   };
+  if (input.dateKey !== undefined) rec.dateKey = input.dateKey;
   if (input.ordinal !== undefined) rec.ordinal = input.ordinal;
   if (input.table !== undefined) rec.table = input.table;
   if (input.sysId !== undefined) rec.sysId = input.sysId;

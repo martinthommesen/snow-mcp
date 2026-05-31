@@ -52,7 +52,13 @@ function utf8Len(s) {
   if (!auditId) { res.setStatus(500); res.setBody({ error: 'audit_unavailable' }); return; } // fail closed
 
   // 2) VERIFY the signed actor BEFORE trusting any actor field (§2.0). Fail closed.
-  if (!new x_mcp.x_mcp_verify().verify(code, actor, sig)) {
+  // I-7 (2026-05-31): verify() returns an OBJECT { verified } — `!obj` is ALWAYS false, so the
+  // original `if (!new ...verify(...))` reject branch was DEAD CODE (every forged/unsigned/replayed
+  // request fell through to eval — the exact shape of the production incident). Check `.verified`.
+  // This file is a DEPRECATED reference (do NOT install — use the Fluent wrapper); the guard is
+  // corrected so the landmine pattern cannot be copy-pasted from here.
+  var __verify = new x_mcp.x_mcp_verify().verify(code, actor, sig);
+  if (!__verify || !__verify.verified) {
     audit.status = 'rejected'; audit.error_class = 'actor_signature_invalid'; audit.update();
     res.setStatus(401); res.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return;
   }

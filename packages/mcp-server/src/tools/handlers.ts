@@ -41,10 +41,13 @@ class NotConnectedHttpClient implements SnHttpClient {
 export interface HandlerEnv extends PolicyEnv {
   LOADER: WorkerLoader;
   BUDGET_DO?: DurableObjectNamespace;
-  // Idempotency ledger (§7.3) — declared optional; wired into the mutating path in P4.
+  // Idempotency ledger (§7.3). Optional HERE BY DESIGN — read-only and test deployments omit it —
+  // but the worker `Env` (index.ts) requires it, and a mutation-capable deployment MUST bind it
+  // (buildHandlers warns once if absent; L-4). Present in the committed wrangler.jsonc.
   LEDGER_DO?: DurableObjectNamespace;
   SCHEMA_KV?: KVNamespace;
-  // Host audit (§7.2) + recovery snapshots (§7.7). Declared in P0; consumed in P4.
+  // Host audit (§7.2) + recovery snapshots (§7.7). AUDIT_KV optional by design (read-only/test);
+  // a mutation-capable deployment MUST bind it for audit-before-effect (L-4 warn covers absence).
   AUDIT_KV?: KVNamespace;
   SNAPSHOT_KV?: KVNamespace;
   SNOW_INSTANCE_HOST?: string;
@@ -120,8 +123,32 @@ export interface AuthContext {
   roleHash?: string;
 }
 
+// L-4: fire the missing-durability warning at most once per isolate (buildHandlers runs per
+// request, so an unconditional warn would spam and a hard throw would break read-only/test deploys
+// that legitimately omit the ledger/audit bindings).
+let warnedMissingDurability = false;
+
 export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandlers {
   const scopeMaxMode: Mode = auth?.scopeMaxMode ?? "read_only";
+  // L-4: a mutation-capable deployment (tenant/instance ceiling above read_only) MUST bind both the
+  // idempotency ledger and the durable audit sink; without them, mutations still run (the mandatory
+  // runKey gate is independent) but replay-dedup and audit-before-effect silently degrade. Warn
+  // once so a misconfigured deploy is detectable. (The committed wrangler.jsonc binds both.)
+  if (!warnedMissingDurability) {
+    const mutationCapable = parseMaxMode(env.TENANT_MAX_MODE) !== "read_only" && parseMaxMode(env.INSTANCE_MAX_MODE) !== "read_only";
+    if (mutationCapable && (!env.LEDGER_DO || !env.AUDIT_KV)) {
+      warnedMissingDurability = true;
+      console.warn(
+        JSON.stringify({
+          event: "missing_durability_bindings",
+          severity: "warn",
+          note: "mutation-capable deployment is missing LEDGER_DO and/or AUDIT_KV; idempotency replay-dedup and/or audit-before-effect are disabled (mutations still gated by the mandatory idempotencyKey).",
+          ledger: Boolean(env.LEDGER_DO),
+          audit: Boolean(env.AUDIT_KV),
+        }),
+      );
+    }
+  }
   // Canonicalize + allowlist the configured instance host ONCE here (plan §P6a, finding "OAuth
   // token off-allowlist"), then thread the canonical value to BOTH SnFetchClient AND the
   // SnOAuthConfig. tokenRequest() POSTs https://${instanceHost}/oauth_token.do with the client
@@ -316,7 +343,9 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   const auditSink = env.AUDIT_KV
     ? async (record: AuditRecord): Promise<void> => {
         await env.AUDIT_KV!.put(
-          auditKey(utcDateKey(), record.requestId, record.ordinal ?? 0),
+          // L-2: prefer the intent-stamped dateKey so intent + outcome share a key across a UTC
+          // midnight boundary; fall back to the wall-clock date for standalone rows (denials).
+          auditKey(record.dateKey ?? utcDateKey(), record.requestId, record.ordinal ?? 0),
           JSON.stringify(record),
           { expirationTtl: RETENTION_TTL_SECONDS },
         );

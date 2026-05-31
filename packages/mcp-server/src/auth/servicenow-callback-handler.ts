@@ -7,7 +7,7 @@
 //
 //   GET /servicenow/authorize?ticket=…
 //     VERIFY the host-HMAC ticket (its only authority) + exp → generate PKCE → create a
-//     single-use AuthCorrelationDO record {userId, instanceHost, pkceVerifier, nonce,
+//     single-use AuthCorrelationDO record {userId, instanceHost, pkceVerifier,
 //     expiresAt} keyed by an opaque random `state` → 302 to the instance OAuth authorize
 //     endpoint (response_type=code, PKCE S256, state).
 //
@@ -29,6 +29,7 @@ import {
 } from "./servicenow-oauth.js";
 import { TokenStore } from "./token-store.js";
 import { buildKekRing } from "./crypto.js";
+import { redactString } from "../observability/redact.js";
 import type { AuthCorrelationRecord } from "../do/auth-correlation.js";
 
 /** Minimal DO surface the routes need (test-injectable; real DOs satisfy these structurally). */
@@ -56,6 +57,10 @@ interface TokenStoreNamespace {
 export interface CallbackHandlerEnv {
   AUTH_DO: AuthCorrelationNamespace;
   TOKEN_DO: TokenStoreNamespace;
+  // I-1: configured public origin for the OAuth redirect_uri. Optional — when unset, the
+  // request-derived origin is used (unchanged behavior). When set, the redirect_uri no longer
+  // depends on the spoofable request Host.
+  WORKER_PUBLIC_ORIGIN?: string;
   SNOW_INSTANCE_HOST?: string;
   SNOW_OAUTH_CLIENT_ID?: string;
   SNOW_OAUTH_CLIENT_SECRET?: string;
@@ -123,7 +128,6 @@ async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promi
     userId: ticket.userId,
     instanceHost,
     pkceVerifier: verifier,
-    nonce: ticket.nonce,
     expiresAt: Date.now() + CORRELATION_TTL_MS,
   };
   const ns = env.AUTH_DO;
@@ -132,7 +136,7 @@ async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promi
   const authorize = new URL(`https://${instanceHost}/oauth_auth.do`);
   authorize.searchParams.set("response_type", "code");
   authorize.searchParams.set("client_id", env.SNOW_OAUTH_CLIENT_ID!);
-  authorize.searchParams.set("redirect_uri", redirectUri(url.origin));
+  authorize.searchParams.set("redirect_uri", redirectUri(env.WORKER_PUBLIC_ORIGIN ?? url.origin));
   authorize.searchParams.set("scope", SCOPE);
   authorize.searchParams.set("state", state);
   authorize.searchParams.set("code_challenge", challenge);
@@ -162,9 +166,9 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
   const cfg = oauthConfig(env, instanceHost);
   let tokens;
   try {
-    tokens = await authorizationCodeGrant(cfg, code, record.pkceVerifier, redirectUri(url.origin), Date.now());
+    tokens = await authorizationCodeGrant(cfg, code, record.pkceVerifier, redirectUri(env.WORKER_PUBLIC_ORIGIN ?? url.origin), Date.now());
   } catch (e) {
-    console.error("servicenow callback: code exchange failed:", e instanceof Error ? e.message : String(e));
+    console.error("servicenow callback: code exchange failed:", redactString(e instanceof Error ? e.message : String(e)));
     return new Response("ServiceNow token exchange failed.", { status: 400 });
   }
 

@@ -6,6 +6,8 @@ import { serviceNowAuthHandler } from "./auth/servicenow-auth-handler.js";
 import { isOriginAllowed, originDeniedResponse, type OriginConfig } from "./observability/origin.js";
 import { serviceNowCallbackHandler } from "./auth/servicenow-callback-handler.js";
 import type { Mode } from "@servicenow-codemode/shared";
+import { isValidMode } from "@servicenow-codemode/shared";
+import { redactString } from "./observability/redact.js";
 
 // Durable Objects must be exported from the entry module (plan §2.10).
 export { AuthCorrelationDO } from "./do/auth-correlation.js";
@@ -26,6 +28,9 @@ export interface Env {
   BUDGET_DO: DurableObjectNamespace;
   LEDGER_DO: DurableObjectNamespace;
   ALLOWED_ORIGINS?: string;
+  // I-1: pin the worker's public origin for OAuth redirect_uri / reauth URLs instead of deriving
+  // it from the (spoofable) request Host. Optional — falls back to the request origin when unset.
+  WORKER_PUBLIC_ORIGIN?: string;
   MCP_OPERATOR_SECRET?: string;
   SNOW_INSTANCE_HOST?: string;
   SNOW_DEV_ROPC_USERNAME?: string;
@@ -92,11 +97,14 @@ const apiHandler = {
     try {
       if (!isOriginAllowed(request, originConfig(env))) return originDeniedResponse();
       const props = ((ctx as { props?: unknown }).props as Record<string, unknown>) ?? {};
-      const scopeMaxMode = (props.maxMode as Mode) ?? "read_only";
+      // I-3: validate (not just null-coalesce) — a set-but-invalid maxMode falls back to read_only,
+      // consistent with parseMaxMode/loadActorPolicy. modeRisk would already block escalation, but
+      // this keeps the fail-closed posture uniform across every ceiling input.
+      const scopeMaxMode: Mode = isValidMode(props.maxMode) ? props.maxMode : "read_only";
       // The worker's own public origin (request-derived) so handlers can build the §6b reauth
       // ticket URL `${origin}/servicenow/authorize?ticket=…`. It matches the callback's derived
       // redirect_uri (same host) — see servicenow-callback-handler.ts.
-      const workerOrigin = new URL(request.url).origin;
+      const workerOrigin = env.WORKER_PUBLIC_ORIGIN ?? new URL(request.url).origin;
       // §6b: resolve the per-user SN principal's roleHash for the SchemaCache identity, so a role
       // change busts the cache. roleHash() is async (SHA-256) but buildHandlers is sync, so we
       // compute it here and thread it via AuthContext. Best-effort + "default" outside
@@ -109,7 +117,9 @@ const apiHandler = {
       })(request, env, ctx);
     } catch (e) {
       // Fail closed with a generic message (never leak internals); detail to the log only.
-      console.error("apiHandler error:", e instanceof Error ? e.message : String(e));
+      // I-5: redact the logged message (matches sn/errors.ts) so a secret-bearing error can't reach
+      // server logs unscrubbed.
+      console.error("apiHandler error:", redactString(e instanceof Error ? e.message : String(e)));
       return Response.json({ error: "internal_error" }, { status: 500 });
     }
   },
@@ -150,7 +160,7 @@ export default {
       if (snRoute) return snRoute;
       return await provider.fetch(request, env, ctx);
     } catch (e) {
-      console.error("top-level fetch error:", e instanceof Error ? e.message : String(e));
+      console.error("top-level fetch error:", redactString(e instanceof Error ? e.message : String(e)));
       return Response.json({ error: "internal_error" }, { status: 500 });
     }
   },

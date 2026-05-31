@@ -14,6 +14,15 @@ API token is present.
   Worker Loader.
 - ✅ Secrets present in `.dev.vars` (instance host, ROPC creds, HMAC key, KEKs, OAuth client).
 
+> **Secret entropy (M-8).** `TOKEN_KEK*`, `SNAPSHOT_KEK*`, `OAUTH_PROVIDER_SECRET`, and
+> `X_MCP_EXECUTOR_HMAC_KEY` MUST be CSPRNG-generated 32-byte values — generate each with
+> `openssl rand -base64 32`. KEK derivation is an unsalted single SHA-256 (kept deterministic so
+> the versioned ring can still decrypt existing envelopes), so a low-entropy passphrase would be
+> offline-guessable if envelopes ever leak. The Worker logs a structured `weak_secret_warning` at
+> startup when a KEK does not look CSPRNG-strong — treat it as a release blocker, not noise. Do
+> NOT change `deriveKeyBytes` to add salting/stretching without a KEK rotation (it would make every
+> existing encrypted token/snapshot undecryptable).
+
 ## The one blocker: `CLOUDFLARE_API_TOKEN`
 
 Alchemy authenticates via `CLOUDFLARE_API_TOKEN` (not wrangler's OAuth session). Mint one:

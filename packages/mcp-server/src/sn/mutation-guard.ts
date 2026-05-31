@@ -163,6 +163,10 @@ export function auditKey(utcDateKey: string, requestId: string, ordinal: number)
  *      the durable row then stays "intent", reading as unresolved, never a false success.
  */
 export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<T>): Promise<T> {
+  // L-2: pin the audit-key date ONCE at intent time and reuse it for the outcome (ok/error) row, so
+  // intent + outcome share an AUDIT_KV key even if the effect straddles UTC midnight (deriving the
+  // date from each row's own write-time `ts` would leave the day-D intent row orphaned/unresolved).
+  const auditDateKey = new Date(guard.now()).toISOString().slice(0, 10);
   // The tool-level idempotencyKey is mandatory for any mutation (no host-generated
   // fallback). A missing key is itself a DENIAL and is audited as such.
   if (!guard.run.runKey) {
@@ -217,6 +221,7 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
     try {
       const intent = await buildAuditRecord({
         ts: guard.now(),
+        dateKey: auditDateKey,
         requestId: guard.run.requestId,
         ordinal: eff.ordinal,
         instance: guard.instance,
@@ -254,7 +259,7 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
     // NOT stay "ok". Supersede it with an "error" row (same key) carrying the error class +
     // whether the outcome was indeterminate. Best-effort: the effect already left the host,
     // so a dropped error-audit is a durability gap, not a safety one (mirrors the success path).
-    await emitOutcomeError(guard, eff, e, indeterminate);
+    await emitOutcomeError(guard, eff, e, indeterminate, auditDateKey);
     // The effect throw is NOT a host-side denial — surface it as-is (it may carry a typed code).
     throw e;
   }
@@ -265,6 +270,7 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
     try {
       const done = await buildAuditRecord({
         ts: guard.now(),
+        dateKey: auditDateKey,
         requestId: guard.run.requestId,
         ordinal: eff.ordinal,
         instance: guard.instance,
@@ -311,12 +317,13 @@ async function emitDenial<T>(guard: MutationGuard, eff: GuardedEffect<T>, err: u
 /** Supersede the intent row with an "error" outcome row (same ordinal key) when the effect
  *  threw. Best-effort — the effect already left the host. `indeterminate` distinguishes a
  *  post-send-unknown (retry blocked) from a clean failure (retry-safe). */
-async function emitOutcomeError<T>(guard: MutationGuard, eff: GuardedEffect<T>, err: unknown, indeterminate: boolean): Promise<void> {
+async function emitOutcomeError<T>(guard: MutationGuard, eff: GuardedEffect<T>, err: unknown, indeterminate: boolean, dateKey: string): Promise<void> {
   if (!guard.audit) return;
   const code = err instanceof McpToolError ? err.code : "internal_error";
   try {
     const rec = await buildAuditRecord({
       ts: guard.now(),
+      dateKey, // L-2: reuse the intent-time date so this outcome row supersedes its intent row
       requestId: guard.run.requestId,
       ordinal: eff.ordinal,
       instance: guard.instance,

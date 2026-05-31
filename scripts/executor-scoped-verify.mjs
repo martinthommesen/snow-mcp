@@ -84,9 +84,11 @@ await new Promise((r) => setTimeout(r, 2000));
 // deleted). Assert it STAYS dead: an unsigned POST must not execute (route gone => 400/404, never
 // 200). No other test guards this path — the bug was invisible because everything else hits the
 // scoped wrapper. Re-arming X_MCP_INSTALL_GLOBAL_REST=1 or any leftover global op trips this.
-{
-  const r = await api("POST", "/api/1793136/x_mcp/executor/run", { script: "return 1;", actor: {}, actor_sig: "" });
-  check("S8b — GLOBAL numeric shadow endpoint is RETIRED (/api/1793136/x_mcp/executor/run is dead)",
+// L-3: assert BOTH deprecated global forms are dead — the numeric-namespace form AND the
+// scope-name form `/api/x_mcp/executor/run` (the old rpc.ts default). Neither must execute.
+for (const deadPath of ["/api/1793136/x_mcp/executor/run", "/api/x_mcp/executor/run"]) {
+  const r = await api("POST", deadPath, { script: "return 1;", actor: {}, actor_sig: "" });
+  check(`S8b — GLOBAL shadow endpoint is RETIRED (${deadPath} is dead)`,
     r.status === 404 || r.status === 400, `(status ${r.status} — must be 404/400, never 200)`);
 }
 
@@ -96,9 +98,13 @@ await new Promise((r) => setTimeout(r, 3000)); // role-cache propagation
 
 let auditIdSeen = "";
 {
+  // B1 also IS the I-8 round-trip check: a HOST-signed actor (host b64-decodes X_MCP_EXECUTOR_HMAC_KEY
+  // to raw bytes) verifying in-scope (GlideCertificateEncryption.generateMac) proves the key-encoding
+  // contract end-to-end. A 200 here means the host/verifier MAC agree; a contract mismatch fails CLOSED
+  // (401), never silently — so this case is the deploy-time guard the executor's 0.13a TODO asked for.
   const r = await call(await signed("return gs.getUserName();"));
   auditIdSeen = r.body?.audit_id ?? "";
-  check("B1 valid signed actor -> delegates to global core -> executes (returns user)", r.status === 200 && typeof r.body?.result === "string", `(status ${r.status}, result ${JSON.stringify(r.body?.result)})`);
+  check("B1 valid signed actor -> delegates to global core -> executes (returns user) [I-8 HMAC round-trip]", r.status === 200 && typeof r.body?.result === "string", `(status ${r.status}, result ${JSON.stringify(r.body?.result)})`);
 }
 {
   const r = await call(await signed("return 1;", { forge: true }));
@@ -217,6 +223,22 @@ skip("SIGNED reason persisted in x_1793136_mcp_audit_log.reason column", "scoped
   const reuse = await call(await signed("return 1;", { nonce: freshNonce }));
   check("SIZE/413 runs BEFORE nonce-burn: oversized -> 413, SAME nonce then reused on valid call -> 200",
     rejected413 && reuse.status === 200, `(oversized ${oversized.status}, reuse ${reuse.status})`);
+}
+
+// L-6: the scoped `MCP Nonce Purge` ScheduledScript's interval serializes to a bad string under
+// now-sdk 4.7.1 ("[object Object]"), needing a one-time UI fix. This is FAIL-SAFE for replay
+// (more retained nonces only strengthen the unique-index defense), so a bad/missing period is an
+// operational note, NOT a hard failure. PASS when the period looks valid; SKIP (operator-verify)
+// otherwise so the suite still exits 0 on a green security run.
+{
+  const job = (await api("GET", "/api/now/table/sysauto_script?sysparm_query=nameLIKEMCP Nonce Purge&sysparm_limit=1&sysparm_fields=sys_id,run_period,run_type")).json?.result?.[0];
+  const period = String(job?.run_period ?? "");
+  const valid = Boolean(job) && period !== "" && !period.includes("[object Object]");
+  if (valid) {
+    check("L-6 — MCP Nonce Purge job has a valid run_period (table stays bounded)", true, `(run_period "${period}", run_type "${job.run_type}")`);
+  } else {
+    skip("L-6 — MCP Nonce Purge run_period", `set it in the UI (System Definition > Scheduled Jobs) — now-sdk 4.7.1 serializes it as "${period || "MISSING"}"; replay protection is unaffected (fail-safe), only purge is deferred`);
+  }
 }
 
 console.log(`\n${fail === 0 ? "SCOPED EXECUTOR: ALL PASS" : "SCOPED EXECUTOR: FAILURES"} — ${pass} passed, ${fail} failed, ${skipped} skipped`);
