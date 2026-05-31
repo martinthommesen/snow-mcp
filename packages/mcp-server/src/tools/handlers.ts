@@ -12,12 +12,12 @@ import { ServiceNowRPC } from "../sn/rpc.js";
 import { SnFetchClient, type SnHttpClient } from "../sn/http.js";
 import { canonicalizeInstanceHost } from "../sn/url-allowlist.js";
 import { describeTable, listTables, type DiscoveryDeps } from "../sn/discovery.js";
-import { permissivePolicy, type ActorPolicy } from "../authz/actor-policy.js";
+import { loadActorPolicy, type ActorPolicy, type PolicyEnv } from "../authz/actor-policy.js";
 import { McpToolError, toToolResult } from "../sn/errors.js";
 import { RunBudget } from "../sn/run-budget.js";
 import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
 import { MODE_RISK } from "@servicenow-codemode/shared";
-import { SchemaCache } from "../cache/schema.js";
+import { SchemaCache, roleHash } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
 import { getServiceNowBearer, preflightAuth, resolveSnPrincipal, type SnOAuthConfig } from "../auth/servicenow-oauth.js";
 import { mintTicket } from "../auth/servicenow-ticket.js";
@@ -38,7 +38,7 @@ class NotConnectedHttpClient implements SnHttpClient {
   }
 }
 
-export interface HandlerEnv {
+export interface HandlerEnv extends PolicyEnv {
   LOADER: WorkerLoader;
   BUDGET_DO?: DurableObjectNamespace;
   // Idempotency ledger (§7.3) — declared optional; wired into the mutating path in P4.
@@ -113,6 +113,11 @@ export interface AuthContext {
   /** The worker's own public origin (request-derived in apiHandler), used to build the §6b
    *  reauth ticket URL `${origin}/servicenow/authorize?ticket=…`. Absent in non-HTTP callers. */
   workerOrigin?: string;
+  /** Hash of the per-user SN principal's roles (§6b) for the SchemaCache identity, so a role
+   *  change busts the cache. Computed async in apiHandler (roleHash() is SHA-256; buildHandlers
+   *  is sync). Absent ⇒ shared "default" — the role-change cache-bust applies ONLY to
+   *  per_user_oauth (integration_user has no per-user principal). */
+  roleHash?: string;
 }
 
 export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandlers {
@@ -127,7 +132,12 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     ? canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST, { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] })
     : "unconfigured.invalid";
   const userId = (auth?.props?.userId as string) ?? "operator";
-  const policy: ActorPolicy = permissivePolicy([instanceHost]); // single-operator dev default
+  // §6b: configurable RESTRICTIVE ActorPolicy. NON-BREAKING — with NO policy config set this
+  // returns the permissive single-operator policy (live deployment unchanged). When policy vars
+  // ARE set it builds a restrictive policy (table allowlist + field masks + row filters + per-run
+  // row/byte ceilings) and validates the configured rowFilters at load (fail-closed). The dead
+  // maxRowsPerRun/maxBytesPerRun fields now bite via makeRunBudget below under a restrictive policy.
+  const policy: ActorPolicy = loadActorPolicy(env, instanceHost);
 
   // Authorization header strategy (preference order):
   //  1. Per-user ServiceNow OAuth Bearer — tokens minted/refreshed and stored encrypted in
@@ -405,9 +415,14 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget: new RunBudget() };
   }
 
-  // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Keyed by the authenticated
-  // user so ACL-filtered field visibility never leaks across users (S6).
-  const cache = env.SCHEMA_KV ? new SchemaCache(env.SCHEMA_KV, { instanceHost, userId, roleHash: "default" }) : undefined;
+  // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Keyed by the authenticated user so
+  // ACL-filtered field visibility never leaks across users (S6). §6b: the roleHash comes from the
+  // per-user SN principal's roles (computed async in apiHandler, threaded via auth.roleHash) so a
+  // role change busts the cache; it falls back to the shared "default" in integration_user (no
+  // per-user principal) or any non-HTTP caller that did not resolve it.
+  const cache = env.SCHEMA_KV
+    ? new SchemaCache(env.SCHEMA_KV, { instanceHost, userId, roleHash: auth?.roleHash ?? "default" })
+    : undefined;
 
   return {
     runCode: (input) => runCode(input, runCodeDeps),
@@ -430,4 +445,44 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
       }
     },
   };
+}
+
+/**
+ * Resolve the SchemaCache `roleHash` for a /mcp request (§6b). roleHash() is async (SHA-256) but
+ * buildHandlers is sync, so apiHandler computes the hash here and threads it via AuthContext.roleHash.
+ *
+ * Returns the shared `"default"` (no extra work, no decrypt) UNLESS the deployment is in
+ * per_user_oauth mode with the OAuth path fully configured — so the live integration_user
+ * deployment is completely untouched (no second TokenStore read). In per_user_oauth this is a
+ * second TokenStore decrypt per /mcp request (the price of keeping buildHandlers sync); flagged
+ * for the reviewer. BEST-EFFORT: any failure (missing/undecryptable token, no resolved roles)
+ * falls back to `"default"` — it NEVER throws, so it cannot block the reauth_required path.
+ */
+export async function resolveRoleHash(env: HandlerEnv, userId: string): Promise<string> {
+  const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
+  const credentialMode = env.SERVICENOW_CREDENTIAL_MODE ?? "integration_user";
+  const oauthReady = Boolean(
+    env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST,
+  );
+  if (credentialMode !== "per_user_oauth" || !oauthReady) return "default";
+  try {
+    const instanceHost = canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST!, {
+      allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES],
+    });
+    const stub = env.TOKEN_DO!.get(env.TOKEN_DO!.idFromName(`${userId}|${instanceHost}`)) as unknown as {
+      putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>; revokeAll(): Promise<void>;
+    };
+    const store = new TokenStore(stub, await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV), userId, instanceHost);
+    const tokens = await store.get("servicenow").catch(() => null);
+    const roles = tokens?.roles;
+    if (!roles || roles.length === 0) return "default";
+    return await roleHash(roles);
+  } catch (e) {
+    // Best-effort: a role-hash failure must NEVER block the request (no throw). But a transient
+    // TokenStore decrypt/read failure silently stops busting the SchemaCache, so ACL-filtered
+    // visibility can go stale for up to the 24h TTL (userId stays in the key — no cross-user
+    // leak). Log so a PERSISTENT degrade is observable; the error object only (no token/key data).
+    console.error("resolveRoleHash failed; SchemaCache not busted on role change", e);
+    return "default";
+  }
 }

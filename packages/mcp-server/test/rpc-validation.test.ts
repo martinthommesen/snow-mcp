@@ -9,7 +9,7 @@ import {
   type ActorPolicy,
 } from "../src/authz/actor-policy.js";
 import { describeTable, type DiscoveryDeps } from "../src/sn/discovery.js";
-import { validateReason } from "../src/sn/validate.js";
+import { validateReason, validateUserQuery, assertMandatoryRowFilterSafe } from "../src/sn/validate.js";
 import { McpToolError } from "../src/sn/errors.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 
@@ -191,6 +191,33 @@ describe("P1 — structural-operator guard under a restrictive row filter", () =
     const { rpc: r } = rpc(); // permissive
     await expect(r.tableQuery({ table: "incident", query: "a=1^ORb=2" })).resolves.toBeDefined();
   });
+
+  // ─── P6b — token-boundary tightening: ^ORDERBY is benign, not a structural escape ──
+  // Pre-P6b the guard was `/\^(NQ|OR|EQ)/i`, so `^ORDERBY` matched the `^OR` prefix and an
+  // ordering clause was over-rejected once a restrictive rowFilter was active. The tightened
+  // `OR(?!DERBY)` lookahead allows ORDERBY/ORDERBYDESC while still rejecting the genuine ^OR escape.
+  it("allows a ^ORDERBY / ^ORDERBYDESC ordering clause under a mandatory filter (AND-ed, not rejected)", async () => {
+    const { rpc: r, http } = rpc({ policy: restrictive });
+    await r.tableQuery({ table: "incident", query: "priority=1^ORDERBYnumber" });
+    expect(http.calls[0]!.query!.sysparm_query).toBe("active=true^priority=1^ORDERBYnumber");
+    await r.tableQuery({ table: "incident", query: "priority=1^ORDERBYDESCnumber" });
+    expect(http.calls[1]!.query!.sysparm_query).toBe("active=true^priority=1^ORDERBYDESCnumber");
+  });
+
+  it("still rejects a genuine ^OR escape under a mandatory filter, in any case (reject-not-bypass)", async () => {
+    const { rpc: r, http } = rpc({ policy: restrictive });
+    await expect(r.tableQuery({ table: "incident", query: "priority=1^ORpriority=2" })).rejects.toMatchObject({
+      code: "path_denied",
+    });
+    // /i rejects the lowercase ^or escape too (a potential escape if SN parses case-insensitively).
+    await expect(r.tableQuery({ table: "incident", query: "priority=1^orpriority=2" })).rejects.toMatchObject({
+      code: "path_denied",
+    });
+    // But a MIXED-CASE ^ORderby<field> reads as the benign ^ORDERBY clause under /i and is ALLOWED
+    // (the rare P8 case-sensitivity ambiguity; see STRUCTURAL_OP in validate.ts).
+    await r.tableQuery({ table: "incident", query: "priority=1^ORderbyfield=2" });
+    expect(http.calls.at(-1)!.query!.sysparm_query).toBe("active=true^priority=1^ORderbyfield=2");
+  });
 });
 
 describe("P1 — aggregate masks grouped/counted fields", () => {
@@ -267,6 +294,34 @@ describe("P1 — validateReason", () => {
 
   it("rejects an over-1024-char reason", () => {
     expect(() => validateReason("a".repeat(1025))).toThrow(McpToolError);
+  });
+
+  it("P6b — validateUserQuery allows ^ORDERBY / ^ORDERBYDESC under a mandatory filter (any case)", () => {
+    expect(validateUserQuery("priority=1^ORDERBYnumber", true)).toBe("priority=1^ORDERBYnumber");
+    expect(validateUserQuery("priority=1^ORDERBYDESCnumber", true)).toBe("priority=1^ORDERBYDESCnumber");
+    expect(validateUserQuery("^ORDERBYnumber", true)).toBe("^ORDERBYnumber");
+    // /i keeps the (?!DERBY) lookahead case-insensitive, so a lowercase ordering clause is allowed too.
+    expect(validateUserQuery("priority=1^orderbynumber", true)).toBe("priority=1^orderbynumber");
+  });
+
+  it("P6b-2 — validateUserQuery rejects the ^OR / ^NQ / ^EQ escapes in ANY case (case-insensitive)", () => {
+    // Reject-not-bypass: the guard is `/i`, so a lowercase `^or`/`^nq`/`^eq` (a potential escape if
+    // SN parses operators case-insensitively, P8-unconfirmed) is REJECTED just like the uppercase form.
+    for (const q of ["a=1^ORb=2", "a^NQb", "a^EQ", "a=1^orb=2", "a^nqb", "a^eq"]) {
+      expect(() => validateUserQuery(q, true)).toThrow(McpToolError);
+    }
+  });
+
+  it("P6b-2 — a MIXED-CASE ^ORderby<field> resolves to ALLOWED (the P8 case-sensitivity gate)", () => {
+    // With `/i` the `(?!DERBY)` lookahead is also case-insensitive, so `^ORderbyfield=1` reads as
+    // the benign ^ORDERBY clause and is ALLOWED. This is the rare residual ambiguity flagged as a
+    // P8 live-confirmation gate; we accept it in exchange for rejecting all lowercase ^or escapes.
+    expect(validateUserQuery("active=true^ORderbyfield=1", true)).toBe("active=true^ORderbyfield=1");
+  });
+
+  it("P6b — assertMandatoryRowFilterSafe rejects ^OR but accepts ^ORDERBY (shares the token boundary)", () => {
+    expect(() => assertMandatoryRowFilterSafe("incident", "active=true^ORactive=false")).toThrow();
+    expect(() => assertMandatoryRowFilterSafe("incident", "active=true^ORDERBYnumber")).not.toThrow();
   });
 
   it("rejects a control-char reason", () => {

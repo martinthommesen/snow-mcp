@@ -1,7 +1,7 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp";
 import { createServer } from "./server.js";
-import { buildHandlers } from "./tools/handlers.js";
+import { buildHandlers, resolveRoleHash } from "./tools/handlers.js";
 import { serviceNowAuthHandler } from "./auth/servicenow-auth-handler.js";
 import { isOriginAllowed, originDeniedResponse, type OriginConfig } from "./observability/origin.js";
 import { serviceNowCallbackHandler } from "./auth/servicenow-callback-handler.js";
@@ -52,6 +52,15 @@ export interface Env {
   ADMIN_SCRIPT_ALLOWLIST?: string;
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string;
   ADMIN_SCRIPT_REQUIRED_GROUP?: string;
+  // Restrictive ActorPolicy (§6b). All optional: with NONE set the policy falls back to the
+  // permissive single-operator default (live deployment unchanged); set ANY to build a
+  // restrictive policy (table allowlist + field masks + row filters + per-run ceilings).
+  ACTOR_POLICY_TABLE_ALLOWLIST?: string;
+  ACTOR_POLICY_FIELD_MASKS?: string;
+  ACTOR_POLICY_ROW_FILTERS?: string;
+  ACTOR_POLICY_MAX_ROWS_PER_RUN?: string;
+  ACTOR_POLICY_MAX_BYTES_PER_RUN?: string;
+  ACTOR_POLICY_MAX_MODE?: Mode;
 }
 
 function originConfig(env: Env): OriginConfig {
@@ -88,8 +97,14 @@ const apiHandler = {
       // ticket URL `${origin}/servicenow/authorize?ticket=…`. It matches the callback's derived
       // redirect_uri (same host) — see servicenow-callback-handler.ts.
       const workerOrigin = new URL(request.url).origin;
+      // §6b: resolve the per-user SN principal's roleHash for the SchemaCache identity, so a role
+      // change busts the cache. roleHash() is async (SHA-256) but buildHandlers is sync, so we
+      // compute it here and thread it via AuthContext. Best-effort + "default" outside
+      // per_user_oauth (the live integration_user deployment does no extra decrypt).
+      const userId = (props.userId as string) ?? "operator";
+      const roleHash = await resolveRoleHash(env, userId);
       // Per-request server (§2.3); auth props flow to tools via getMcpAuthContext().
-      return await createMcpHandler(createServer(buildHandlers(env, { scopeMaxMode, props, workerOrigin })), {
+      return await createMcpHandler(createServer(buildHandlers(env, { scopeMaxMode, props, workerOrigin, roleHash })), {
         authContext: { props },
       })(request, env, ctx);
     } catch (e) {

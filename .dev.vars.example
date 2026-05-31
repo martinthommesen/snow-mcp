@@ -39,6 +39,18 @@ ADMIN_SCRIPT_ALLOWLIST=""            # comma-separated actor userIds permitted a
 ADMIN_SCRIPT_APPROVAL_TOKENS=""      # comma-separated valid approval tokens
 ADMIN_SCRIPT_REQUIRED_GROUP=""       # required access-group name (token OR group satisfies the second approval)
 
+# --- Restrictive ActorPolicy (§6b) ---
+# NON-BREAKING: leave ALL empty to keep the permissive single-operator default (today's live
+# deployment is unchanged). Set ANY var to build a RESTRICTIVE host-side policy. The values below
+# are a RECOMMENDED conservative example (commented out) — uncomment + tailor per tenant. A
+# self-defeating mandatory row filter (one containing ^NQ/^OR/^EQ) is REJECTED at load (fail-closed).
+# ACTOR_POLICY_TABLE_ALLOWLIST="incident,problem,change_request,task,sc_request"   # only these tables (whole-name match)
+# ACTOR_POLICY_FIELD_MASKS="incident:caller_id,u_ssn;sys_user:vip"                  # table:field,field;table:field (stripped from reads, rejected on writes; dot-aware)
+# ACTOR_POLICY_ROW_FILTERS="incident:active=true"                                   # table:encodedQuery;table:encodedQuery (AND-ed into every read; no ^NQ/^OR/^EQ)
+# ACTOR_POLICY_MAX_ROWS_PER_RUN="10000"                                             # per-run row ceiling (RunBudget enforces → budget_exceeded)
+# ACTOR_POLICY_MAX_BYTES_PER_RUN="5000000"                                          # per-run byte ceiling
+# ACTOR_POLICY_MAX_MODE="read_only"                                                 # highest mode this actor may request (read_only | write | admin_script)
+
 # --- Executor actor-signing HMAC (§2.0) ---
 # Mirror this value to the ServiceNow property `x_mcp.executor.hmac_secret` on the instance.
 X_MCP_EXECUTOR_HMAC_KEY=""

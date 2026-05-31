@@ -23,12 +23,25 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/;
 const REASON_MAX = 1024;
 // Encoded-query structural operators a snippet must not smuggle into a value when a
 // restrictive mandatory row filter is AND-ed in (would let a caller OR/NQ past it).
-// NOTE (P6b handoff): `^OR` also prefix-matches the benign `^ORDERBY` clause, so this
-// over-rejects ordering when a restrictive policy is active. It is DORMANT in P1
-// (permissivePolicy has no rowFilters, so the guard never fires) and the over-match is
-// safe-direction (reject, not bypass). Tighten to a token boundary when P6b wires the
-// restrictive-policy loader and can add an ORDERBY test.
-const STRUCTURAL_OP = /\^(NQ|OR|EQ)/i;
+// TOKEN-BOUNDARY (P6b): `^OR` is a PREFIX of the benign `^ORDERBY`/`^ORDERBYDESC` ordering
+// clauses, so a naive `^OR` over-rejected ordering once a restrictive rowFilter became active.
+// The `OR(?!DERBY)` negative lookahead matches the genuine `^OR` escape (which is followed by a
+// field name, e.g. `^ORpriority=2`) but NOT `^ORDERBY`/`^ORDERBYDESC` (ORDERBYDESC begins with
+// ORDERBY, so one lookahead covers both). `^NQ`/`^EQ` have no benign longer forms (confirmed
+// against the ServiceNow encoded-query operator set: the only `^OR`-prefixed keywords are
+// ORDERBY/ORDERBYDESC).
+//
+// CASE: matched case-INSENSITIVELY (`/i`), the REJECT-NOT-BYPASS direction. If ServiceNow parses
+// these operators case-insensitively (P8-unconfirmed), a lowercase `^or`/`^nq`/`^eq` would be a
+// real row-filter escape, so we REJECT it in ANY case rather than risk passing it through. The
+// `(?!DERBY)` lookahead is likewise case-insensitive under `/i`, so `^ORDERBY`/`^ORDERBYDESC` stay
+// ALLOWED in any case (`^orderby...`, `^ORDERBYDESC...`). This errs toward rejecting escapes.
+// One residual ambiguity: a MIXED-CASE `^ORderby<field>=<value>` (real `^OR` escape whose field
+// happens to start with the letters "derby") resolves to ALLOWED here, because the lookahead reads
+// "derby" as ORDERBY under `/i`. The precise SN case-sensitivity that disambiguates this rare case
+// is a P8 LIVE-CONFIRMATION GATE; until then we accept that one edge in exchange for rejecting all
+// lowercase `^or`/`^nq`/`^eq` escapes.
+const STRUCTURAL_OP = /\^(NQ|EQ|OR(?!DERBY))/i;
 
 function isControlChar(code: number): boolean {
   return code <= 0x1f || code === 0x7f;

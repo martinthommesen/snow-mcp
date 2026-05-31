@@ -42,7 +42,11 @@ export class SchemaCache {
 
   /** Cache-through for a table listing (user-aware; keyed by filter). */
   async listTables(filter: string | undefined, fetcher: () => Promise<TableInfo[]>): Promise<{ tables: TableInfo[]; cached: boolean }> {
-    const k = this.key("list", filter ?? "*");
+    // Collision-proof key: a literal `"*"` filter must NOT alias the no-filter case. Encode
+    // PRESENCE structurally — absent is the single char `"0"`, present always starts `"1:"` —
+    // so no real filter value can ever collide with the no-filter marker (the old `filter ?? "*"`
+    // let `listTables("*")` and `listTables(undefined)` share a key).
+    const k = this.key("list", filter === undefined ? "0" : `1:${filter}`);
     const hit = await this.kv.get<TableInfo[]>(k, "json");
     if (hit) return { tables: hit, cached: true };
     const tables = await fetcher();

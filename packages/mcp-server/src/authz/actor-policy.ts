@@ -7,7 +7,7 @@
 
 import { McpToolError } from "../sn/errors.js";
 import { assertMandatoryRowFilterSafe } from "../sn/validate.js";
-import { modeRisk, type Mode } from "@servicenow-codemode/shared";
+import { isValidMode, modeRisk, type Mode } from "@servicenow-codemode/shared";
 
 export interface ActorPolicy {
   /** Instance hosts this actor may reach. Empty = none. */
@@ -44,6 +44,121 @@ export function assertPolicyRowFiltersSafe(policy: ActorPolicy): void {
   for (const [table, filter] of Object.entries(policy.rowFilters ?? {})) {
     assertMandatoryRowFilterSafe(table, filter);
   }
+}
+
+/** The env slice the policy loader reads (narrow + unit-testable in isolation). */
+export interface PolicyEnv {
+  /** Comma-separated table names this actor may touch (each anchored to a whole-name match). */
+  ACTOR_POLICY_TABLE_ALLOWLIST?: string;
+  /** `table:field,field;table:field` — fields stripped from reads AND rejected on writes. */
+  ACTOR_POLICY_FIELD_MASKS?: string;
+  /** `table:encoded^query;table:encoded^query` — mandatory filter AND-ed into every read. */
+  ACTOR_POLICY_ROW_FILTERS?: string;
+  /** Per-run row ceiling (positive integer). */
+  ACTOR_POLICY_MAX_ROWS_PER_RUN?: string;
+  /** Per-run byte ceiling (positive integer). */
+  ACTOR_POLICY_MAX_BYTES_PER_RUN?: string;
+  /** Highest mode this actor may request (read_only | write | admin_script). */
+  ACTOR_POLICY_MAX_MODE?: Mode;
+}
+
+/** Escape a table name into an anchored whole-name RegExp (substring matches would let
+ *  `incident` admit `incident_extra`). Names are lowercase alnum + underscore; we anchor
+ *  defensively in case a config value carries regex metacharacters. */
+function tableNameRegExp(name: string): RegExp {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped}$`);
+}
+
+function parseList(value: string | undefined): string[] {
+  return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Parse `table:a,b;table2:c` into `{ table: [a,b], table2: [c] }`. */
+function parseTableMap(value: string | undefined): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const entry of (value ?? "").split(";").map((s) => s.trim()).filter(Boolean)) {
+    const idx = entry.indexOf(":");
+    if (idx < 0) continue;
+    const table = entry.slice(0, idx).trim();
+    const fields = parseList(entry.slice(idx + 1));
+    if (table && fields.length > 0) out[table] = fields;
+  }
+  return out;
+}
+
+/** Parse `table:encoded^query;table2:other^query` into `{ table: "encoded^query" }`. The value
+ *  is everything after the FIRST colon (a filter may itself contain `:` in date/time literals). */
+function parseRowFilters(value: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const entry of (value ?? "").split(";").map((s) => s.trim()).filter(Boolean)) {
+    const idx = entry.indexOf(":");
+    if (idx < 0) continue;
+    const table = entry.slice(0, idx).trim();
+    const filter = entry.slice(idx + 1).trim();
+    if (table && filter) out[table] = filter;
+  }
+  return out;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`ActorPolicy ceiling must be a positive integer, got: ${value}`);
+  }
+  return n;
+}
+
+/**
+ * Load the host-side ActorPolicy from env config (P6b).
+ *
+ * DEFAULT DECISION (preserve the live single-operator deployment; mirror P4/P5's opt-in gates):
+ * when NO policy config var is set, FALL BACK to the existing `permissivePolicy` so today's
+ * deployment keeps working — we do NOT flip the runtime default to deny-all. When ANY policy var
+ * IS provided, build a RESTRICTIVE policy from it (table allowlist + field masks + row filters +
+ * per-run row/byte ceilings + max mode) and VALIDATE the configured rowFilters at load
+ * (`assertPolicyRowFiltersSafe` → throws on a self-defeating `^NQ`/`^OR`/`^EQ` filter = fail-closed).
+ * The recommended restrictive config ships as a DOCUMENTED EXAMPLE (.dev.vars.example), not as the
+ * hardcoded runtime default.
+ */
+export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPolicy {
+  const allowlist = parseList(env.ACTOR_POLICY_TABLE_ALLOWLIST);
+  const fieldMasks = parseTableMap(env.ACTOR_POLICY_FIELD_MASKS);
+  const rowFilters = parseRowFilters(env.ACTOR_POLICY_ROW_FILTERS);
+  const configured =
+    allowlist.length > 0 ||
+    Object.keys(fieldMasks).length > 0 ||
+    Object.keys(rowFilters).length > 0 ||
+    env.ACTOR_POLICY_MAX_ROWS_PER_RUN !== undefined ||
+    env.ACTOR_POLICY_MAX_BYTES_PER_RUN !== undefined ||
+    env.ACTOR_POLICY_MAX_MODE !== undefined;
+
+  if (!configured) return permissivePolicy([instanceHost]); // live single-operator default, unchanged.
+
+  // FAIL-CLOSED on the mode ceiling (P6b-2): validate the configured maxMode BEFORE building
+  // the policy. assertActorPolicy compares `modeRisk(ctx.mode) > modeRisk(policy.maxMode)`, and
+  // modeRisk(non-Mode) is +Infinity. Because maxMode is the CEILING (right) operand, a SET-but-
+  // INVALID value (operator typo: "readonly"/"Read_Only"/"read-only") would make every finite
+  // requested risk `< +Infinity` and silently DISABLE the ceiling — a fail-OPEN that admits
+  // admin_script. So coerce a set-but-invalid value to "read_only" (the most restrictive ceiling),
+  // mirroring handlers.ts:parseMaxMode for the sibling tenant/instance ceilings. Unset stays
+  // "read_only" too (restrictive default). isValidMode collapses both cases.
+  const maxMode: Mode = isValidMode(env.ACTOR_POLICY_MAX_MODE) ? env.ACTOR_POLICY_MAX_MODE : "read_only";
+
+  const policy: ActorPolicy = {
+    allowedInstances: [instanceHost],
+    tables: allowlist.length > 0 ? { allow: allowlist.map(tableNameRegExp) } : {},
+    fieldMasks,
+    maxMode, // restrictive default: read_only unless raised (set-but-invalid coerced to read_only).
+    maxRowsPerRun: parsePositiveInt(env.ACTOR_POLICY_MAX_ROWS_PER_RUN, 10_000),
+    maxBytesPerRun: parsePositiveInt(env.ACTOR_POLICY_MAX_BYTES_PER_RUN, 5_000_000),
+    ...(Object.keys(rowFilters).length > 0 ? { rowFilters } : {}),
+  };
+  // Fail-closed: a self-defeating mandatory filter (one that itself contains a structural
+  // operator) is rejected at LOAD, before it can ever let a caller escape the AND-ed filter.
+  assertPolicyRowFiltersSafe(policy);
+  return policy;
 }
 
 function tableAllowed(policy: ActorPolicy, table: string): boolean {
