@@ -63,16 +63,24 @@ function utf8Slice(s, maxBytes) {
         return
     }
 
-    // Kill switch + egress toggle (scoped-allowed: gs.getProperty). Property namespace is the
-    // scoped vendor prefix x_1793136_mcp.executor.* (plan §P7 item 5).
-    if (gs.getProperty('x_1793136_mcp.executor.enabled', 'true') !== 'true') {
+    // Kill switch + egress toggle (scoped-allowed: gs.getProperty). The live namespace is the
+    // scoped vendor prefix x_1793136_mcp.executor.* (plan §P7 item 5). Finding 7: ALSO honor the
+    // LEGACY x_mcp.executor.* namespace so an operator who disabled the executor BEFORE upgrading
+    // keeps it disabled — fail-closed if EITHER namespace is explicitly off. gs.getProperty
+    // returns the 'true' default when a name is absent/unreadable, so a fresh scoped install (no
+    // legacy property) is unaffected and only an explicit legacy 'false' disables. NOTE: the
+    // cross-scope read of the legacy global property is pending live P8 confirmation; if blocked,
+    // the default makes the legacy check a no-op — never LESS safe than the prior code.
+    if (gs.getProperty('x_1793136_mcp.executor.enabled', 'true') !== 'true' ||
+        gs.getProperty('x_mcp.executor.enabled', 'true') !== 'true') {
         audit.status = 'killed'
         audit.update()
         response.setStatus(503)
         response.setBody({ error: 'executor_disabled', audit_id: auditId + '' })
         return
     }
-    if (gs.getProperty('x_1793136_mcp.executor.run_server_script_enabled', 'true') !== 'true') {
+    if (gs.getProperty('x_1793136_mcp.executor.run_server_script_enabled', 'true') !== 'true' ||
+        gs.getProperty('x_mcp.executor.run_server_script_enabled', 'true') !== 'true') {
         audit.status = 'killed'
         audit.error_class = 'egress_disabled'
         audit.update()
@@ -170,10 +178,21 @@ function utf8Slice(s, maxBytes) {
     // POST field. The host no longer sends a top-level body.reason.
     audit.reason = String(actor.reason || '')
 
+    // MINT the execute() capability (finding 6): execute() now REQUIRES a secret-derived cap so
+    // that instantiating global.x_mcp_verify and calling execute() directly cannot eval attacker
+    // code. We mint it HERE — AFTER the single-use nonce INSERT succeeded — binding it to this
+    // nonce + the exact code hash. Only a holder of the scoped secret can produce it; we read the
+    // secret from our own scope and hand it to the global _hmacBase64 (which takes the key as an
+    // argument, so it is not a minting oracle). A caller that skipped verify -> consume-nonce has
+    // no secret and cannot forge a matching cap.
+    var execSecret = gs.getProperty('x_1793136_mcp.executor.hmac_secret', '')
+    var execCodeHash = new GlideDigest().getSHA256Base64(code)
+    var execCap = core._hmacBase64(execSecret, 'x_mcp_exec_cap|' + nonceVal + '|' + execCodeHash)
+
     // EXECUTE the verified script (eval is global-only). execute() catches internally and never
     // throws, so the audit row always closes below — no 'running'-stuck row on the execute path.
     var out
-    out = core.execute(code)
+    out = core.execute(code, nonceVal, execCap)
     var err = out.error
     var status = err ? 'error' : 'ok'
     var serialized = out.serialized

@@ -15,6 +15,7 @@ export { AuthCorrelationDO } from "./do/auth-correlation.js";
 export { TokenStoreDO } from "./do/token-store.js";
 export { BudgetDO } from "./do/budget.js";
 export { MutationLedgerDO } from "./do/mutation-ledger.js";
+export { ConsentRateDO } from "./do/consent-rate.js";
 
 export interface Env {
   LOADER: WorkerLoader;
@@ -28,6 +29,9 @@ export interface Env {
   TOKEN_DO: DurableObjectNamespace;
   BUDGET_DO: DurableObjectNamespace;
   LEDGER_DO: DurableObjectNamespace;
+  // Consent-write rate limiter (finding 4). Optional: when unbound (older config/tests), the
+  // GET /authorize admission check is skipped — wire it in wrangler.jsonc to enable.
+  CONSENT_RATE_DO?: DurableObjectNamespace<import("./do/consent-rate.js").ConsentRateDO>;
   ALLOWED_ORIGINS?: string;
   // I-1: pin the worker's public origin for OAuth redirect_uri / reauth URLs instead of deriving
   // it from the request Host. Required when SERVICENOW_CREDENTIAL_MODE=per_user_oauth.

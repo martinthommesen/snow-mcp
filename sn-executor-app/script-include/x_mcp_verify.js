@@ -22,7 +22,10 @@
 //   verify(code, actor, sig) -> { verified:boolean, error? }   — HMAC + script-bind + instance-
 //                                                                claim + freshness. NO nonce
 //                                                                single-use, NO eval.
-//   execute(code)            -> { serialized, error }          — new Function eval + serialize.
+//   execute(code, nonce, cap) -> { serialized, error }        — cap-gated new Function eval +
+//                                                                serialize (finding 6). cap is
+//                                                                minted by the scoped wrapper
+//                                                                after the nonce INSERT.
 // SINGLE-USE NONCE consumption is now owned by the SCOPED Fluent wrapper (it INSERTs into the
 // scoped x_1793136_mcp_nonce table, which has a DB UNIQUE index — the live, deployable store).
 // The core no longer touches any nonce table (the global x_mcp_nonce table could not be created
@@ -140,9 +143,22 @@ x_mcp_verify.prototype = {
     return { verified: true };
   },
 
-  // PUBLIC: eval the verified script (plan §P7 item 2). Caller MUST have called verify() and
-  // consumed the nonce first. Returns { serialized, error }.
-  execute: function (code) {
+  // PUBLIC: eval the verified script (plan §P7 item 2 / finding 6). REQUIRES a capability that
+  // only a holder of the executor HMAC secret can mint:
+  //   cap = base64(HMAC(hmac_secret, 'x_mcp_exec_cap|' + nonce + '|' + SHA256(code)))
+  // The SCOPED wrapper mints it (it reads the scoped secret) ONLY AFTER the single-use nonce
+  // INSERT succeeds, then passes (code, nonce, cap) here. A caller that instantiates this global
+  // core and calls execute() DIRECTLY — bypassing verify -> consume-nonce — cannot produce a
+  // valid cap (no secret), and re-running verify() alone does NOT mint one. _hmacBase64 takes the
+  // key as a parameter, so it is not a minting oracle. FAIL-CLOSED: a missing secret or any cap
+  // mismatch refuses eval. Closes the public-execute() HMAC/nonce-replay bypass.
+  execute: function (code, nonce, cap) {
+    var secret = gs.getProperty('x_1793136_mcp.executor.hmac_secret', '');
+    var codeHash = new GlideDigest().getSHA256Base64(String(code || ''));
+    var expected = this._hmacBase64(secret, 'x_mcp_exec_cap|' + String(nonce || '') + '|' + codeHash);
+    if (!secret || !this._constantTimeEquals(cap, expected)) {
+      return { serialized: null, error: 'capability_required' };
+    }
     var result, err = null;
     try {
       var fn = new Function('gs', 'GlideRecord', 'GlideRecordSecure', 'GlideAggregate', '"use strict";\n' + code);

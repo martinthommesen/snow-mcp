@@ -250,32 +250,43 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
         return ns.get(ns.idFromName(utcDateKey())) as unknown as {
           reserve: (req: Record<string, number>, capOverride?: Record<string, number>, userId?: string) => Promise<{ ok: boolean; dimension?: string }>;
           increment: (req: Record<string, number>, userId?: string) => Promise<void>;
+          reconcile: (delta: Record<string, number>, userId?: string) => Promise<void>;
         };
       }
     : undefined;
 
-  // PRE-RUN reserve (§P5 tier 1): reserve a unique Worker AND one ServiceNow request slot,
-  // plus the daily rows/bytes ADMISSION check (BudgetDO denies the next run when the day is
-  // already over the rows/bytes cap). Per-user tally updated in the same gate via `userId`.
+  // PRE-RUN reserve (§P5 tier 1 / finding 5): reserve a unique Worker AND the PER-RUN MAXIMUMS
+  // for the two dimensions a single run can spend many of (serviceNowRequests, sandboxRpcCalls),
+  // so concurrent runs admission-check at the true ceiling and cannot collectively overshoot the
+  // daily cap. Also runs the daily rows/bytes/sandboxRpcCalls ADMISSION check (deny-next-run when
+  // already at/over cap). Per-user tally updated in the same gate via `userId`. The unused
+  // reservation is refunded post-run by reconcileDailyBudget.
   const reserveDailyBudget = budgetObj
     ? async (): Promise<{ ok: boolean; dimension?: string }> =>
-        budgetObj().reserve({ uniqueWorkers: 1, serviceNowRequests: 1 }, undefined, userId)
+        budgetObj().reserve(
+          {
+            uniqueWorkers: 1,
+            serviceNowRequests: BUDGETS.perRun.serviceNowRequestLimit,
+            sandboxRpcCalls: BUDGETS.perRun.rpcCallLimit,
+          },
+          undefined,
+          userId,
+        )
     : undefined;
 
-  // POST-RUN accrual (§P5 tier 3): fold the per-run actuals into the daily global + per-user
-  // counters. Called on every run_code exit path. The dimension names map RunBudget.snapshot()
-  // onto BudgetDimension; uniqueWorkers was already reserved pre-run (not re-accrued here).
-  const accrueDailyBudget = budgetObj
-    ? async (snapshot: Record<string, number>): Promise<void> => {
-        await budgetObj().increment(
+  // POST-RUN reconcile (§P5 tier 3 / finding 5): fold the per-run actuals into the daily global +
+  // per-user counters by REFUNDING the unused reservation. Reserved dimensions get a negative
+  // delta (actual − reserved); the unreserved rows/bytes get a positive accrual. `snapshot` is
+  // undefined on a post-reserve early exit (transpile failure) — nothing was spent, so the full
+  // reservation is refunded. uniqueWorkers stays reserved (not reconciled).
+  const reconcileDailyBudget = budgetObj
+    ? async (snapshot?: Record<string, number>): Promise<void> => {
+        await budgetObj().reconcile(
           {
-            sandboxRpcCalls: snapshot.rpcCalls ?? 0,
-            // reserveDailyBudget pre-committed serviceNowRequests:1; the snapshot already
-            // includes that slot, so accrue only the EXCESS to avoid double-counting (mirrors
-            // uniqueWorkers, which is reserved pre-run and excluded from accrual entirely).
-            serviceNowRequests: Math.max(0, (snapshot.serviceNowRequests ?? 0) - 1),
-            rowsReturned: snapshot.rowsReturned ?? 0,
-            bytesReturned: snapshot.bytesReturned ?? 0,
+            serviceNowRequests: (snapshot?.serviceNowRequests ?? 0) - BUDGETS.perRun.serviceNowRequestLimit,
+            sandboxRpcCalls: (snapshot?.rpcCalls ?? 0) - BUDGETS.perRun.rpcCallLimit,
+            rowsReturned: snapshot?.rowsReturned ?? 0,
+            bytesReturned: snapshot?.bytesReturned ?? 0,
           },
           userId,
         );
@@ -439,7 +450,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       }),
     ...(preflightAuthDep ? { preflightAuth: preflightAuthDep } : {}),
     ...(reserveDailyBudget ? { reserveDailyBudget } : {}),
-    ...(accrueDailyBudget ? { accrueDailyBudget } : {}),
+    ...(reconcileDailyBudget ? { reconcileDailyBudget } : {}),
   };
 
   function discoveryDeps(): DiscoveryDeps {

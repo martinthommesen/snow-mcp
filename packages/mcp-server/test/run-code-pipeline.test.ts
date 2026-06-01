@@ -387,45 +387,65 @@ describe("Phase 4 — run_code pipeline", () => {
     expect((res.structuredContent?.detail as { dimension?: string } | undefined)?.dimension).toBe("bytesReturned");
   });
 
-  it("§P5 — post-run accrual is called on a SUCCESS path with the actual spend", async () => {
-    let accrued: Record<string, number> | undefined;
+  it("§P5 — post-run reconcile is called on a SUCCESS path with the actual spend", async () => {
+    let reconciled: Record<string, number> | undefined;
     const base = deps({ scope: "read_only", tenant: "read_only", instance: "read_only" });
     const res = await runCode(
       { code: `async () => { const r = await servicenow.tableQuery({ table: "incident" }); return r.rows.length; }` },
-      { ...base, accrueDailyBudget: async (snap) => { accrued = snap; } },
+      { ...base, reserveDailyBudget: async () => ({ ok: true }), reconcileDailyBudget: async (snap) => { reconciled = snap; } },
     );
     expect(res.isError).toBe(false);
-    expect(accrued?.rowsReturned).toBe(1); // one masked row was returned to the snippet
-    expect((accrued?.bytesReturned ?? 0)).toBeGreaterThan(0); // bytes are now metered
-    expect((accrued?.serviceNowRequests ?? 0)).toBeGreaterThan(0);
+    expect(reconciled?.rowsReturned).toBe(1); // one masked row was returned to the snippet
+    expect((reconciled?.bytesReturned ?? 0)).toBeGreaterThan(0); // bytes are now metered
+    expect((reconciled?.serviceNowRequests ?? 0)).toBeGreaterThan(0);
   });
 
-  it("§P5 — post-run accrual is STILL called on an ERROR path (finally)", async () => {
-    let accrued: Record<string, number> | undefined;
+  it("§P5 — post-run reconcile is STILL called on an ERROR path (finally)", async () => {
+    let reconciled: Record<string, number> | undefined;
     const base = deps({
       scope: "read_only", tenant: "read_only", instance: "read_only",
       makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxRows: 1 }),
     });
-    // Loop past the 1-row cap so the run errors with budget_exceeded; accrual must still fire.
+    // Loop past the 1-row cap so the run errors with budget_exceeded; reconcile must still fire.
     const res = await runCode(
       { code: `async () => { for (let i = 0; i < 5; i++) { await servicenow.tableQuery({ table: "incident" }); } return "done"; }` },
-      { ...base, accrueDailyBudget: async (snap) => { accrued = snap; } },
+      { ...base, reserveDailyBudget: async () => ({ ok: true }), reconcileDailyBudget: async (snap) => { reconciled = snap; } },
     );
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("budget_exceeded");
-    expect(accrued).toBeDefined(); // accrued even though the run threw
-    expect((accrued?.rowsReturned ?? 0)).toBeGreaterThan(0);
+    expect(reconciled).toBeDefined(); // reconciled even though the run threw
+    expect((reconciled?.rowsReturned ?? 0)).toBeGreaterThan(0);
   });
 
-  it("§P5 — accrual is NOT called when an early throw fires before the budget exists", async () => {
+  it("§P5 — reconcile is NOT called when an early throw fires BEFORE the reserve", async () => {
     let called = false;
     const base = deps({});
-    // Oversize code throws code_size BEFORE the RunBudget is created — nothing spent.
+    // Oversize code throws code_size BEFORE reserveDailyBudget runs — nothing reserved.
     const big = `async () => { /* ${"x".repeat(70_000)} */ return 1; }`;
-    const res = await runCode({ code: big }, { ...base, accrueDailyBudget: async () => { called = true; } });
+    const res = await runCode({ code: big }, { ...base, reconcileDailyBudget: async () => { called = true; } });
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("code_size");
     expect(called).toBe(false);
+  });
+
+  it("§P5 / finding 5 — reconcile DOES fire (with no snapshot) when transpile fails AFTER a reserve", async () => {
+    // The reserve committed the per-run maximums; a transpile failure throws before RunBudget
+    // exists. The finally must still reconcile to refund the reservation — snapshot is undefined.
+    let reconciled = false;
+    let snapshotArg: Record<string, number> | undefined = { sentinel: 1 };
+    const base = deps({ scope: "read_only", tenant: "read_only", instance: "read_only" });
+    const res = await runCode(
+      { code: `this is not valid typescript ::: !!!` },
+      {
+        ...base,
+        reserveDailyBudget: async () => ({ ok: true }),
+        reconcileDailyBudget: async (snap) => { reconciled = true; snapshotArg = snap; },
+      },
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("transpile_error");
+    expect(reconciled).toBe(true); // refunded despite no RunBudget
+    expect(snapshotArg).toBeUndefined(); // full-refund signal
   });
 
   it("§P5 — a tenantMaxMode ceiling caps the effective mode below the OAuth scope", async () => {

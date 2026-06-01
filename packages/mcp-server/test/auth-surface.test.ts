@@ -134,6 +134,61 @@ function postConsent(fields: Record<string, string>, provider: ReturnType<typeof
   );
 }
 
+/** Fake CONSENT_RATE_DO namespace whose stub.allow() returns a scripted sequence. */
+function fakeRateDo(allowResults: boolean[]) {
+  const calls: string[] = [];
+  let i = 0;
+  const ns = {
+    idFromName: (_n: string) => ({}) as unknown as DurableObjectId,
+    get: (_id: unknown) => ({
+      allow: async (key: string, _now: number) => {
+        calls.push(key);
+        return allowResults[i++] ?? true;
+      },
+    }),
+  };
+  return { calls, ns: ns as never };
+}
+
+describe("finding 4 — consent-write admission cap on GET /authorize", () => {
+  it("429s (and does NOT mint a consent nonce) when the limiter denies", async () => {
+    const provider = fakeProvider({ clientId: "flooder", scope: ["servicenow:read"] });
+    const rate = fakeRateDo([false]);
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize?response_type=code&client_id=flooder", {
+        headers: { "CF-Connecting-IP": "203.0.113.7" },
+      }),
+      { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV, CONSENT_RATE_DO: rate.ns },
+    );
+    expect(res.status).toBe(429);
+    expect(await res.text()).not.toContain('name="consent"'); // no consent page minted
+    expect(rate.calls).toEqual(["flooder|203.0.113.7"]); // keyed by client_id + IP
+  });
+
+  it("passes through (200 + consent nonce) when the limiter allows", async () => {
+    const provider = fakeProvider({ clientId: "c1", scope: ["servicenow:read"] });
+    const rate = fakeRateDo([true]);
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize?response_type=code&client_id=c1"),
+      { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV, CONSENT_RATE_DO: rate.ns },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('name="consent"');
+  });
+
+  it("rejects an unknown OAuth client with 400 BEFORE consulting the limiter", async () => {
+    const provider = fakeProvider({ clientId: "ghost", scope: ["servicenow:read"] });
+    provider.helper.lookupClient = (async () => null) as never; // unknown client
+    const rate = fakeRateDo([true]);
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize?response_type=code&client_id=ghost"),
+      { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV, CONSENT_RATE_DO: rate.ns },
+    );
+    expect(res.status).toBe(400);
+    expect(rate.calls).toEqual([]); // limiter never consulted for an unknown client
+  });
+});
+
 describe("§P6a signed/stored consent state (finding 22)", () => {
   it("GET stores the auth-request server-side and returns a nonce (no round-tripped oauth JSON)", async () => {
     const provider = fakeProvider({ clientId: "c1", scope: ["servicenow:read"] });

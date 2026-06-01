@@ -19,6 +19,7 @@
 //
 //   node scripts/executor-install.mjs   # installs the global verify() core + properties only
 import { readFileSync } from "node:fs";
+import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
 
 const verifyScript = readFileSync(new URL("../sn-executor-app/script-include/x_mcp_verify.js", import.meta.url), "utf8");
 
@@ -28,7 +29,11 @@ function dv(k) {
     if (t.startsWith(`${k}=`)) { let v = t.slice(k.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
   }
 }
-const host = dv("SNOW_INSTANCE_HOST");
+// SSRF guard (S15 / finding 2): canonicalize the configured host against the ServiceNow
+// allowlist BEFORE any credentialed fetch, so a tampered SNOW_INSTANCE_HOST (userinfo,
+// private IP, off-allowlist domain) can't exfiltrate the admin Basic credential. Throws on a
+// bad host before the first request below.
+const host = canonicalizeInstanceHost(dv("SNOW_INSTANCE_HOST"), { allowedHostSuffixes: ["service-now.com"] });
 // Table/index DDL (sys_db_object/sys_dictionary/sys_index) requires admin rights the ROPC
 // service account usually lacks (it 403s on table creation). Allow an admin-credential
 // OVERRIDE via env for the install run ONLY — not persisted to .dev.vars:

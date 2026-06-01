@@ -65,6 +65,10 @@ export const worker = await Worker("servicenow-codemode-mcp", {
     TOKEN_DO: DurableObjectNamespace("TOKEN_DO", { className: "TokenStoreDO", sqlite: true }),
     BUDGET_DO: DurableObjectNamespace("BUDGET_DO", { className: "BudgetDO", sqlite: true }),
     LEDGER_DO: DurableObjectNamespace("LEDGER_DO", { className: "MutationLedgerDO", sqlite: true }),
+    // Consent-write rate limiter (finding 4 / CDX-4). MUST be declared here too — alchemy is the
+    // production deploy path; without this the binding is unbound and the GET /authorize admission
+    // cap silently no-ops in production (the handler guards on `if (env.CONSENT_RATE_DO)`).
+    CONSENT_RATE_DO: DurableObjectNamespace("CONSENT_RATE_DO", { className: "ConsentRateDO", sqlite: true }),
 
     // Non-sensitive config (plain bindings)
     SNOW_INSTANCE_HOST: reqEnv("SNOW_INSTANCE_HOST"),

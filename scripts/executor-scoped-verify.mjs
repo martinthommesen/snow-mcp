@@ -2,6 +2,18 @@
 // S8 role-gating (no role -> 403), then B1 valid/forged after assigning the role.
 import { readFileSync } from "node:fs";
 import { canonicalize, hmacSha256Base64, sha256Base64 } from "../packages/mcp-server/dist/auth/actor.js";
+import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
+
+// Transport-level path guard mirroring SnFetchClient (finding 3): a tampered SNOW_EXECUTOR_PATH
+// must not change host or traverse out of /api/. Rejects userinfo (@), scheme (://), and
+// dot-segments (literal or percent-encoded) BEFORE the path is glued onto the trusted host.
+function assertApiPath(p) {
+  const lowered = String(p).toLowerCase();
+  if (!p.startsWith("/api/") || p.includes("://") || p.includes("@") || lowered.includes("..") || lowered.includes("%2e")) {
+    throw new Error(`unsafe SNOW_EXECUTOR_PATH: ${p}`);
+  }
+  return p;
+}
 
 function dv(k) {
   for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
@@ -9,13 +21,15 @@ function dv(k) {
     if (t.startsWith(`${k}=`)) { let v = t.slice(k.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
   }
 }
-const host = dv("SNOW_INSTANCE_HOST");
+// SSRF guard (finding 3): canonicalize the host against the ServiceNow allowlist before any
+// credentialed fetch, so a tampered SNOW_INSTANCE_HOST can't exfiltrate the Basic credential.
+const host = canonicalizeInstanceHost(dv("SNOW_INSTANCE_HOST"), { allowedHostSuffixes: ["service-now.com"] });
 const basic = "Basic " + Buffer.from(`${dv("SNOW_DEV_ROPC_USERNAME")}:${dv("SNOW_DEV_ROPC_PASSWORD")}`).toString("base64");
 const keyBytes = Uint8Array.from(atob(dv("X_MCP_EXECUTOR_HMAC_KEY")), (c) => c.charCodeAt(0));
 // Hit the EXACT endpoint the live Worker calls (SNOW_EXECUTOR_PATH in .dev.vars, e.g. the
 // numeric scoped form /api/1793136/x_mcp/executor/run) so a scope-name-vs-numeric path-form
 // mismatch can't 404. Falls back to the scope-name form if SNOW_EXECUTOR_PATH is unset.
-const ENDPOINT = `https://${host}${dv("SNOW_EXECUTOR_PATH") || "/api/x_1793136_mcp/x_mcp/executor/run"}`;
+const ENDPOINT = `https://${host}${assertApiPath(dv("SNOW_EXECUTOR_PATH") || "/api/x_1793136_mcp/x_mcp/executor/run")}`;
 const h = { authorization: basic, accept: "application/json" };
 
 async function api(method, path, body) {
