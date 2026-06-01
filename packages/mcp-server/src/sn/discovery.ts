@@ -7,7 +7,7 @@
 import type { SnHttpClient } from "./http.js";
 import { mapServiceNowError } from "./errors.js";
 import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
-import { assertActorPolicy, type ActorPolicy } from "../authz/actor-policy.js";
+import { assertActorPolicy, isFieldMasked, isTableAllowed, type ActorPolicy } from "../authz/actor-policy.js";
 import { validateTableName } from "./validate.js";
 import { utf8Len } from "../sandbox/serialize.js";
 import type { RunBudget } from "./run-budget.js";
@@ -100,11 +100,10 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
 
   const rows = ((res.json as { result?: Record<string, unknown>[] }).result ?? []);
   deps.runBudget.countRows(rows.length);
-  const masked = new Set(deps.actorPolicy.fieldMasks[validTable] ?? []);
   const byName = new Map<string, FieldInfo>();
   for (const r of rows) {
     const name = String(r.element ?? "");
-    if (!name || masked.has(name) || byName.has(name)) continue; // dedupe across hierarchy; hide masked
+    if (!name || isFieldMasked(deps.actorPolicy, validTable, name) || byName.has(name)) continue; // dedupe across hierarchy; hide masked
     const internalType = r.internal_type;
     const type = typeof internalType === "object" && internalType
       ? String((internalType as { value?: unknown }).value ?? "")
@@ -147,16 +146,8 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
   deps.runBudget.countRows(rows.length);
   const tables = rows
     .map((r) => ({ name: String(r.name ?? ""), label: String(r.label ?? "") }))
-    .filter((t) => t.name && isTableVisible(deps.actorPolicy, t.name));
+    .filter((t) => t.name && isTableAllowed(deps.actorPolicy, t.name));
   // L-5: meter returned bytes (see describeTable note).
   deps.runBudget.countBytes(utf8Len(JSON.stringify(tables)));
   return tables;
-}
-
-function isTableVisible(policy: ActorPolicy, table: string): boolean {
-  if (policy.tables.deny?.some((re) => re.test(table))) return false;
-  if (policy.tables.allow && policy.tables.allow.length > 0) {
-    return policy.tables.allow.some((re) => re.test(table));
-  }
-  return true;
 }

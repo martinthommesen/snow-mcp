@@ -1,11 +1,12 @@
 // Runtime input validation at the ServiceNowRPC boundary (plan P1; closes the
 // "unvalidated identifier boundary" findings 7/8/9 + the discovery comma-injection
 // sibling). transpileTs() strips types without type-checking and the sandbox hands the
-// RPC `unknown` values, so `table`, `sys_id`, `limit`, `fields`, update keys,
-// `idempotencyKey`, and `reason` are an untrusted trust boundary. These validators run
-// at the TOP of each async RPC method body (so a rejection flows through `coded()` and
-// the typed `path_denied` code survives the sandbox boundary, §3.5) and BEFORE the
-// TypeScript `as` cast — which is a compile-time fiction with no runtime effect.
+// RPC `unknown` values, so `table`, `sys_id`, `limit`, `fields`, and update keys are an
+// untrusted trust boundary. Tool-level `idempotencyKey` and `reason` are validated before
+// building the host-authoritative run context. RPC validators run at the TOP of each async
+// method body (so a rejection flows through `coded()` and the typed `path_denied` code
+// survives the sandbox boundary, §3.5) and BEFORE the TypeScript `as` cast — which is a
+// compile-time fiction with no runtime effect.
 //
 // Pure host logic, fully verifiable locally. P1 adds NO new ErrorCode; rejections reuse
 // the existing `path_denied` member with a descriptive message + structured detail.
@@ -23,25 +24,21 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/;
 const REASON_MAX = 1024;
 // Encoded-query structural operators a snippet must not smuggle into a value when a
 // restrictive mandatory row filter is AND-ed in (would let a caller OR/NQ past it).
-// TOKEN-BOUNDARY (P6b): `^OR` is a PREFIX of the benign `^ORDERBY`/`^ORDERBYDESC` ordering
-// clauses, so a naive `^OR` over-rejected ordering once a restrictive rowFilter became active.
-// The `OR(?!DERBY)` negative lookahead matches the genuine `^OR` escape (which is followed by a
-// field name, e.g. `^ORpriority=2`) but NOT `^ORDERBY`/`^ORDERBYDESC` (ORDERBYDESC begins with
-// ORDERBY, so one lookahead covers both). `^NQ`/`^EQ` have no benign longer forms (confirmed
-// against the ServiceNow encoded-query operator set: the only `^OR`-prefixed keywords are
-// ORDERBY/ORDERBYDESC).
-//
-// CASE: matched case-INSENSITIVELY (`/i`), the REJECT-NOT-BYPASS direction. If ServiceNow parses
-// these operators case-insensitively (P8-unconfirmed), a lowercase `^or`/`^nq`/`^eq` would be a
-// real row-filter escape, so we REJECT it in ANY case rather than risk passing it through. The
-// `(?!DERBY)` lookahead is likewise case-insensitive under `/i`, so `^ORDERBY`/`^ORDERBYDESC` stay
-// ALLOWED in any case (`^orderby...`, `^ORDERBYDESC...`). This errs toward rejecting escapes.
-// One residual ambiguity: a MIXED-CASE `^ORderby<field>=<value>` (real `^OR` escape whose field
-// happens to start with the letters "derby") resolves to ALLOWED here, because the lookahead reads
-// "derby" as ORDERBY under `/i`. The precise SN case-sensitivity that disambiguates this rare case
-// is a P8 LIVE-CONFIRMATION GATE; until then we accept that one edge in exchange for rejecting all
-// lowercase `^or`/`^nq`/`^eq` escapes.
-const STRUCTURAL_OP = /\^(NQ|EQ|OR(?!DERBY))/i;
+// Exact uppercase ORDERBY/ORDERBYDESC are allowed ordering clauses; all OR/NQ/EQ case
+// variants are denied. This deliberately rejects ambiguous mixed/lower-case ordering tokens
+// such as ^ORderby... because they can also parse as a ^OR escape with a derby... field.
+function hasStructuralOperator(query: string): boolean {
+  for (let i = 0; i < query.length; i++) {
+    const atStart = i === 0;
+    const afterCaret = query.charCodeAt(i) === 94; // ^
+    if (!atStart && !afterCaret) continue;
+    const tokenStart = afterCaret ? i + 1 : i;
+    if (query.startsWith("ORDERBYDESC", tokenStart) || query.startsWith("ORDERBY", tokenStart)) continue;
+    const op = query.slice(tokenStart, tokenStart + 2).toUpperCase();
+    if (op === "OR" || op === "NQ" || op === "EQ") return true;
+  }
+  return false;
+}
 
 function isControlChar(code: number): boolean {
   return code <= 0x1f || code === 0x7f;
@@ -128,7 +125,7 @@ export function validateReason(reason: unknown): string {
 export function validateUserQuery(query: unknown, hasMandatoryFilter: boolean): string {
   if (query === undefined) return "";
   if (typeof query !== "string") deny(`Invalid query (expected a string).`);
-  if (hasMandatoryFilter && STRUCTURAL_OP.test(query as string)) {
+  if (hasMandatoryFilter && hasStructuralOperator(query as string)) {
     deny(`Query may not contain a structural operator (^NQ/^OR/^EQ) under a restrictive row filter.`);
   }
   return query as string;
@@ -139,7 +136,7 @@ export function validateUserQuery(query: unknown, hasMandatoryFilter: boolean): 
  * with / contains a structural operator is self-defeating (it would not constrain rows).
  */
 export function assertMandatoryRowFilterSafe(table: string, filter: string): void {
-  if (STRUCTURAL_OP.test(filter)) {
+  if (hasStructuralOperator(filter)) {
     throw new Error(`Mandatory rowFilter for "${table}" must not contain a structural operator (^NQ/^OR/^EQ): ${filter}`);
   }
 }

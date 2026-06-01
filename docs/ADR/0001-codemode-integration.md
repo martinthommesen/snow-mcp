@@ -58,8 +58,7 @@ await executor.execute(js, [
 
 ## Decision 6 — Import policy (0.8b)
 
-- **Mechanism (proven):** the executor's `modules: Record<specifier, source>` map is injected into the sandbox module map and is reachable via dynamic `import("<specifier>")` inside the snippet (`test/import-policy.test.ts`).
-- **v1 policy:** pass **no** modules. Arbitrary npm imports are **disabled**; the only capability is the `servicenow` provider. Zero supply-chain surface. A future vetted allowlist is a config change to `createExecutor({ modules })`, not a rewrite.
+- **v1 policy:** pass **no** modules. Arbitrary npm imports are **disabled**; the only capability is the `servicenow` provider. Zero supply-chain surface. We intentionally removed the unused module-injection option from the host wrapper; a future vetted allowlist should reintroduce it with a concrete design and tests.
 - **Type-checking:** esbuild `transform` **strips types, does not type-check**. v1 accepts **runtime-only typing** — a *type* error still runs (proven). Rationale: a `tsc --noEmit` per snippet adds latency and a second toolchain in-Worker for little safety gain, because the typed `servicenow.*` surface in the tool description already steers the model. Revisit if mistyped snippets become a real failure mode.
 
 ## Decision 7 — `export default`: rejected by convention
@@ -69,5 +68,5 @@ await executor.execute(js, [
 ## Consequences
 
 - `tools/run_code.ts` (Phase 4) builds `{ code, mode?, reason?, idempotencyKey? }` → `transpileTs` → `createExecutor(env.LOADER, { timeoutMs })` → `executeSnippet(js, [{ name:"servicenow", fns }])` → serialize `ExecuteResult`.
-- The tool description embeds the `declare const servicenow: { … }` surface (single-level) generated for the ServiceNow RPC methods (Phase 4.3).
+- The `run_code` tool description names the single-level `servicenow.*` provider and gives a minimal shape example; schema discovery comes from `describe_table` and `list_tables`.
 - The sandbox inner-Worker compat date is **hardcoded to `2025-06-01` inside codemode 0.3.8** — not our unified host date `2026-05-13`. We cannot change it without forking the SDK. Recorded as a delta; acceptable because the sandbox only runs transpiled user code against the RPC proxy.

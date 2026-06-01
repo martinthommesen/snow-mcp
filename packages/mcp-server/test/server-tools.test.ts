@@ -6,17 +6,20 @@ import { createServer, type ServerHandlers } from "../src/server.js";
 // ─── MCP surface — the three tools, registered with schemas + annotations ─────
 // Verifies the wire-level surface a real client sees (per the build-mcp-server skill).
 
-function fakeHandlers(): ServerHandlers {
+function fakeHandlers(seen?: { runCodeInput?: Parameters<ServerHandlers["runCode"]>[0] }): ServerHandlers {
   const ok = async () => ({ content: [{ type: "text" as const, text: "ok" }], isError: false });
   return {
-    runCode: async ({ code }) => ({ content: [{ type: "text" as const, text: `ran:${code.length}` }], isError: false }),
+    runCode: async (input) => {
+      if (seen) seen.runCodeInput = input;
+      return { content: [{ type: "text" as const, text: `ran:${input.code.length}` }], isError: false };
+    },
     describeTable: ok,
     listTables: ok,
   };
 }
 
-async function connect() {
-  const server = createServer(fakeHandlers());
+async function connect(handlers: ServerHandlers = fakeHandlers()) {
+  const server = createServer(handlers);
   const client = new Client({ name: "test", version: "0" });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverT), client.connect(clientT)]);
@@ -40,6 +43,17 @@ describe("MCP surface", () => {
     const client = await connect();
     const res = await client.callTool({ name: "run_code", arguments: { code: "async () => 1", mode: "read_only" } });
     expect((res.content as { type: string; text: string }[])[0]!.text).toBe("ran:13");
+  });
+
+  it("run_code accepts approvalToken and passes it to the handler", async () => {
+    const seen: { runCodeInput?: Parameters<ServerHandlers["runCode"]>[0] } = {};
+    const client = await connect(fakeHandlers(seen));
+    const res = await client.callTool({
+      name: "run_code",
+      arguments: { code: "async () => 1", mode: "admin_script", reason: "approve", approvalToken: "token-1" },
+    });
+    expect(res.isError).not.toBe(true);
+    expect(seen.runCodeInput).toMatchObject({ approvalToken: "token-1" });
   });
 
   it("rejects an unknown mode enum value at the schema boundary", async () => {

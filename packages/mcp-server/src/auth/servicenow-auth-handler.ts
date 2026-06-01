@@ -36,6 +36,9 @@ interface OAuthHelpersLike {
 interface HandlerEnv {
   OAUTH_PROVIDER: OAuthHelpersLike;
   MCP_OPERATOR_SECRET?: string;
+  MCP_OPERATOR_USER_ID?: string;
+  MCP_OPERATOR_EMAIL?: string;
+  MCP_OPERATOR_ACCESS_GROUPS?: string;
   OAUTH_KV?: KVNamespace;
 }
 
@@ -52,10 +55,13 @@ function maxModeFromScopes(scopes: string[]): Mode {
   return "read_only";
 }
 
-/** Granted scopes = requested ∩ supported, defaulting to read when none requested. */
+/** Granted scopes = requested ∩ supported; empty intersections are denied. */
 function grantScopes(requested: string[]): string[] {
-  const g = requested.filter((s) => (SUPPORTED_SCOPES as readonly string[]).includes(s));
-  return g.length > 0 ? g : ["servicenow:read"];
+  return requested.filter((s) => (SUPPORTED_SCOPES as readonly string[]).includes(s));
+}
+
+function unsupportedScopesResponse(): Response {
+  return new Response("No supported ServiceNow OAuth scopes requested.", { status: 400 });
 }
 
 function esc(s: string): string {
@@ -101,6 +107,7 @@ export const serviceNowAuthHandler = {
 
       if (request.method === "GET") {
         const oauth = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+        if (grantScopes(oauth.scope).length === 0) return unsupportedScopesResponse();
         const client = await env.OAUTH_PROVIDER.lookupClient(oauth.clientId);
         // Bind the authoritative auth-request to server-side state under a server-minted nonce;
         // only the nonce is ever sent to the client. Scope can no longer be tampered between
@@ -117,6 +124,8 @@ export const serviceNowAuthHandler = {
         const stored = nonce ? await kv.get(CONSENT_KEY_PREFIX + nonce) : null;
         if (!stored) return new Response("Invalid or expired consent request.", { status: 400 });
         const oauth = JSON.parse(stored) as AuthRequestInfo;
+        const scope = grantScopes(oauth.scope);
+        if (scope.length === 0) return unsupportedScopesResponse();
 
         const secret = String(form.get("operator_secret") ?? "");
         const expected = env.MCP_OPERATOR_SECRET ?? "";
@@ -127,13 +136,23 @@ export const serviceNowAuthHandler = {
         }
         // Single-use on success: burn the consent nonce so the grant can't be replayed.
         await kv.delete(CONSENT_KEY_PREFIX + nonce);
-        const scope = grantScopes(oauth.scope);
+        const operatorUserId = env.MCP_OPERATOR_USER_ID?.trim();
+        if (!operatorUserId) {
+          return new Response("MCP_OPERATOR_USER_ID is required.", { status: 500 });
+        }
+        const operatorEmail = env.MCP_OPERATOR_EMAIL?.trim();
+        const props = {
+          userId: operatorUserId,
+          scopes: scope,
+          maxMode: maxModeFromScopes(scope),
+          ...(operatorEmail ? { email: operatorEmail } : {}),
+        };
         const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
           request: oauth,
-          userId: "operator",
+          userId: operatorUserId,
           metadata: { via: "operator-secret" },
           scope,
-          props: { userId: "operator", scopes: scope, maxMode: maxModeFromScopes(scope) },
+          props,
         });
         return Response.redirect(redirectTo, 302);
       }

@@ -4,7 +4,7 @@
 
 import { redactValue } from "./redact.js";
 
-export type MutationOp = "create" | "update" | "delete" | "importSet" | "runServerScript" | "attachmentWrite";
+export type MutationOp = "update" | "runServerScript";
 
 export interface AuditActor {
   mcpActorUserId: string;

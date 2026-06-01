@@ -4,7 +4,10 @@ import {
   getServiceNowBearer,
   preflightAuth,
   resolveSnPrincipal,
+  resolveStoredSnPrincipal,
+  SN_PRINCIPAL_TTL_MS,
   generatePkce,
+  authorizationCodeGrant,
   type SnOAuthConfig,
 } from "../src/auth/servicenow-oauth.js";
 import { TokenStore } from "../src/auth/token-store.js";
@@ -18,11 +21,11 @@ const ring: KekRing = { current: { version: "current", keyBytes: new Uint8Array(
 const store = (u: string) => new TokenStore(NS.get(NS.idFromName(`${u}|inst1`)), ring, u, "inst1");
 
 function mockFetch(responses: Record<string, unknown>) {
-  const calls: { grant: string }[] = [];
+  const calls: { grant: string; redirect?: RequestRedirect }[] = [];
   const fetchImpl = (async (_url: string, init: RequestInit) => {
     const body = new URLSearchParams(String(init.body));
     const grant = body.get("grant_type") ?? "";
-    calls.push({ grant });
+    calls.push({ grant, redirect: init.redirect });
     return new Response(JSON.stringify(responses[grant] ?? { error: "unsupported" }), { headers: { "content-type": "application/json" } });
   }) as unknown as typeof fetch;
   return { fetchImpl, calls };
@@ -38,7 +41,7 @@ describe("§2.8 getServiceNowBearer", () => {
     const s = store("oa1");
     const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 1000);
     expect(tok).toBe("AT1");
-    expect(calls).toEqual([{ grant: "password" }]);
+    expect(calls).toEqual([{ grant: "password", redirect: "manual" }]);
     expect((await s.get("servicenow"))?.refresh_token).toBe("RT1");
   });
 
@@ -57,8 +60,15 @@ describe("§2.8 getServiceNowBearer", () => {
     const { fetchImpl, calls } = mockFetch({ refresh_token: { access_token: "NEW", expires_in: 1800 } }); // no refresh_token returned
     const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 5_000); // after expiry
     expect(tok).toBe("NEW");
-    expect(calls).toEqual([{ grant: "refresh_token" }]);
+    expect(calls).toEqual([{ grant: "refresh_token", redirect: "manual" }]);
     expect((await s.get("servicenow"))?.refresh_token).toBe("RKEEP"); // carried forward
+  });
+
+  it("exchanges authorization-code tokens with redirect following disabled", async () => {
+    const { fetchImpl, calls } = mockFetch({ authorization_code: { access_token: "AT-CODE", expires_in: 1800 } });
+    const tok = await authorizationCodeGrant(baseCfg(fetchImpl), "code-1", "verifier-1", "https://worker/cb", 1000);
+    expect(tok.access_token).toBe("AT-CODE");
+    expect(calls).toEqual([{ grant: "authorization_code", redirect: "manual" }]);
   });
 });
 
@@ -80,7 +90,7 @@ describe("§P3 getServiceNowBearer — corrupt token fail-closed re-mint", () =>
     const { fetchImpl, calls } = mockFetch({ password: { access_token: "REMINT", refresh_token: "RT", expires_in: 1800 } });
     const tok = await getServiceNowBearer(baseCfg(fetchImpl), reader, 5_000, "integration_user");
     expect(tok).toBe("REMINT");
-    expect(calls).toEqual([{ grant: "password" }]); // re-minted, never refreshed the corrupt token
+    expect(calls).toEqual([{ grant: "password", redirect: "manual" }]); // re-minted, never refreshed the corrupt token
   });
 
   it("per_user_oauth: an undecryptable token raises reauth_required and NEVER hits the network", async () => {
@@ -123,18 +133,80 @@ describe("§6b getServiceNowBearer — per_user_oauth missing token reauths (nev
     const { fetchImpl, calls } = mockFetch({ password: { access_token: "MINTED", expires_in: 1800 } });
     const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 1000, "integration_user");
     expect(tok).toBe("MINTED");
-    expect(calls).toEqual([{ grant: "password" }]);
+    expect(calls).toEqual([{ grant: "password", redirect: "manual" }]);
   });
 
   it("per_user_oauth: a refresh that carries the principal forward keeps sys_id/roles", async () => {
     const s = store("oaRefreshPrincipalPU");
-    await s.put("servicenow", { access_token: "OLD", refresh_token: "RKEEP", expires_at: 1_000, sys_id: "U123", roles: ["itil"] });
+    await s.put("servicenow", {
+      access_token: "OLD",
+      refresh_token: "RKEEP",
+      expires_at: 1_000,
+      sys_id: "U123",
+      roles: ["itil"],
+      principal_resolved_at: 1_000,
+    });
     const { fetchImpl } = mockFetch({ refresh_token: { access_token: "NEW", expires_in: 1800 } });
     const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 5_000, "per_user_oauth");
     expect(tok).toBe("NEW");
     const after = await s.get("servicenow");
     expect(after?.sys_id).toBe("U123"); // principal not dropped on refresh
     expect(after?.roles).toEqual(["itil"]);
+    expect(after?.principal_resolved_at).toBe(1_000);
+  });
+});
+
+describe("§6b resolveStoredSnPrincipal freshness", () => {
+  it("reuses a fresh stored principal without a ServiceNow identity fetch", async () => {
+    const s = store("oaFreshPrincipal");
+    const now = 10_000;
+    await s.put("servicenow", {
+      access_token: "AT",
+      sys_id: "FRESH_SYS",
+      roles: ["itil"],
+      principal_resolved_at: now - 1_000,
+    });
+    const { fetchImpl, calls } = mockFetch({});
+    const principal = await resolveStoredSnPrincipal(baseCfg(fetchImpl), s, now);
+    expect(principal).toEqual({ sys_id: "FRESH_SYS", roles: ["itil"] });
+    expect(calls).toEqual([]);
+  });
+
+  it("refreshes stale stored principal metadata and preserves the latest token bundle", async () => {
+    const s = store("oaStalePrincipal");
+    const now = 1_000_000;
+    await s.put("servicenow", {
+      access_token: "AT",
+      refresh_token: "RT",
+      expires_at: now + 60_000,
+      sys_id: "OLD_SYS",
+      roles: ["old_role"],
+      principal_resolved_at: now - SN_PRINCIPAL_TTL_MS - 1,
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      calls.push(url);
+      expect((init?.headers as Record<string, string>).authorization).toBe("Bearer AT");
+      if (url.includes("/api/now/ui/user/current_user")) {
+        return new Response(JSON.stringify({ result: { user_sys_id: "NEW_SYS" } }), { headers: { "content-type": "application/json" } });
+      }
+      if (url.includes("/api/now/table/sys_user_has_role")) {
+        return new Response(JSON.stringify({ result: [{ "role.name": "admin" }] }), { headers: { "content-type": "application/json" } });
+      }
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+
+    const principal = await resolveStoredSnPrincipal(baseCfg(fetchImpl), s, now, { accessToken: "AT" });
+    expect(principal).toEqual({ sys_id: "NEW_SYS", roles: ["admin"] });
+    expect(calls).toHaveLength(2);
+    const after = await s.get("servicenow");
+    expect(after).toMatchObject({
+      access_token: "AT",
+      refresh_token: "RT",
+      sys_id: "NEW_SYS",
+      roles: ["admin"],
+      principal_resolved_at: now,
+    });
   });
 });
 
@@ -169,7 +241,9 @@ describe("§6b preflightAuth", () => {
 // ─── §6b — resolveSnPrincipal (current user sys_id + roles) ────────────────────
 describe("§6b resolveSnPrincipal", () => {
   it("reads the current user's sys_id from /current_user and roles from sys_user_has_role", async () => {
-    const fetchImpl = (async (url: string) => {
+    const calls: { url: string; redirect?: RequestRedirect; authorization?: string }[] = [];
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      calls.push({ url, redirect: init?.redirect, authorization: (init?.headers as Record<string, string> | undefined)?.authorization });
       if (url.includes("/api/now/ui/user/current_user")) {
         return new Response(JSON.stringify({ result: { user_sys_id: "SYS123", user_name: "alice" } }), { headers: { "content-type": "application/json" } });
       }
@@ -181,6 +255,10 @@ describe("§6b resolveSnPrincipal", () => {
     const cfg: SnOAuthConfig = { instanceHost: "inst1", clientId: "c", clientSecret: "s", fetchImpl };
     const principal = await resolveSnPrincipal(cfg, "BEARER");
     expect(principal).toEqual({ sys_id: "SYS123", roles: ["itil", "admin"] });
+    expect(calls).toEqual([
+      expect.objectContaining({ redirect: "manual", authorization: "Bearer BEARER" }),
+      expect.objectContaining({ redirect: "manual", authorization: "Bearer BEARER" }),
+    ]);
   });
 
   it("resolves the BEARER's sys_id (current_user), NOT the first sys_user table row", async () => {

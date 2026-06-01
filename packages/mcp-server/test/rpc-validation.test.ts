@@ -91,55 +91,20 @@ describe("P1 — identifier validation rejects malformed input", () => {
   it("tableUpdate rejects update keys that are not strict field names (no dot-walk)", async () => {
     const { rpc: r } = rpc();
     await expect(
-      r.tableUpdate({ table: "incident", sys_id: HEX, fields: { "caller_id.name": "x" }, idempotencyKey: "k1" }),
+      r.tableUpdate({ table: "incident", sys_id: HEX, fields: { "caller_id.name": "x" } }),
     ).rejects.toMatchObject({ code: "path_denied" });
     await expect(
-      r.tableUpdate({ table: "incident", sys_id: HEX, fields: {}, idempotencyKey: "k1" }),
-    ).rejects.toMatchObject({ code: "path_denied" });
-  });
-
-  it("tableUpdate rejects a bad idempotencyKey", async () => {
-    const { rpc: r } = rpc();
-    await expect(
-      r.tableUpdate({ table: "incident", sys_id: HEX, fields: { state: 2 }, idempotencyKey: "bad key with spaces" }),
+      r.tableUpdate({ table: "incident", sys_id: HEX, fields: {} }),
     ).rejects.toMatchObject({ code: "path_denied" });
   });
 
   it("runServerScript rejects an empty/non-string script (path_denied)", async () => {
     const { rpc: r } = rpc();
     await expect(
-      r.runServerScript({ script: "", reason: "fix", idempotencyKey: "k1" }),
+      r.runServerScript({ script: "" }),
     ).rejects.toMatchObject({ code: "path_denied" });
     await expect(
-      r.runServerScript({ script: 123 as unknown as string, reason: "fix", idempotencyKey: "k1" }),
-    ).rejects.toMatchObject({ code: "path_denied" });
-  });
-
-  it("runServerScript rejects an empty reason (path_denied)", async () => {
-    const { rpc: r } = rpc();
-    await expect(
-      r.runServerScript({ script: "gs.info('x');", reason: "", idempotencyKey: "k1" }),
-    ).rejects.toMatchObject({ code: "path_denied" });
-  });
-
-  it("runServerScript rejects an over-1024-char reason (path_denied)", async () => {
-    const { rpc: r } = rpc();
-    await expect(
-      r.runServerScript({ script: "gs.info('x');", reason: "a".repeat(1025), idempotencyKey: "k1" }),
-    ).rejects.toMatchObject({ code: "path_denied" });
-  });
-
-  it("runServerScript rejects a control-char reason (path_denied)", async () => {
-    const { rpc: r } = rpc();
-    await expect(
-      r.runServerScript({ script: "gs.info('x');", reason: "bad\u0000reason", idempotencyKey: "k1" }),
-    ).rejects.toMatchObject({ code: "path_denied" });
-  });
-
-  it("runServerScript rejects a malformed idempotencyKey (path_denied)", async () => {
-    const { rpc: r } = rpc();
-    await expect(
-      r.runServerScript({ script: "gs.info('x');", reason: "fix", idempotencyKey: "bad key with spaces" }),
+      r.runServerScript({ script: 123 as unknown as string }),
     ).rejects.toMatchObject({ code: "path_denied" });
   });
 
@@ -192,10 +157,7 @@ describe("P1 — structural-operator guard under a restrictive row filter", () =
     await expect(r.tableQuery({ table: "incident", query: "a=1^ORb=2" })).resolves.toBeDefined();
   });
 
-  // ─── P6b — token-boundary tightening: ^ORDERBY is benign, not a structural escape ──
-  // Pre-P6b the guard was `/\^(NQ|OR|EQ)/i`, so `^ORDERBY` matched the `^OR` prefix and an
-  // ordering clause was over-rejected once a restrictive rowFilter was active. The tightened
-  // `OR(?!DERBY)` lookahead allows ORDERBY/ORDERBYDESC while still rejecting the genuine ^OR escape.
+  // ─── P6b — token-boundary tightening: exact ^ORDERBY is benign, ^OR remains structural ──
   it("allows a ^ORDERBY / ^ORDERBYDESC ordering clause under a mandatory filter (AND-ed, not rejected)", async () => {
     const { rpc: r, http } = rpc({ policy: restrictive });
     await r.tableQuery({ table: "incident", query: "priority=1^ORDERBYnumber" });
@@ -205,22 +167,28 @@ describe("P1 — structural-operator guard under a restrictive row filter", () =
   });
 
   it("still rejects a genuine ^OR escape under a mandatory filter, in any case (reject-not-bypass)", async () => {
-    const { rpc: r, http } = rpc({ policy: restrictive });
+    const { rpc: r } = rpc({ policy: restrictive });
     await expect(r.tableQuery({ table: "incident", query: "priority=1^ORpriority=2" })).rejects.toMatchObject({
       code: "path_denied",
     });
-    // /i rejects the lowercase ^or escape too (a potential escape if SN parses case-insensitively).
     await expect(r.tableQuery({ table: "incident", query: "priority=1^orpriority=2" })).rejects.toMatchObject({
       code: "path_denied",
     });
-    // But a MIXED-CASE ^ORderby<field> reads as the benign ^ORDERBY clause under /i and is ALLOWED
-    // (the rare P8 case-sensitivity ambiguity; see STRUCTURAL_OP in validate.ts).
-    await r.tableQuery({ table: "incident", query: "priority=1^ORderbyfield=2" });
-    expect(http.calls.at(-1)!.query!.sysparm_query).toBe("active=true^priority=1^ORderbyfield=2");
+    await expect(r.tableQuery({ table: "incident", query: "priority=1^ORderbyfield=2" })).rejects.toMatchObject({
+      code: "path_denied",
+    });
+  });
+
+  it("rejects leading structural operators before the mandatory filter is prepended", async () => {
+    const { rpc: r } = rpc({ policy: restrictive });
+    for (const query of ["NQpriority=1", "ORpriority=1", "EQ", "nqpriority=1"]) {
+      await expect(r.tableQuery({ table: "incident", query })).rejects.toMatchObject({ code: "path_denied" });
+      await expect(r.aggregate({ table: "incident", query })).rejects.toMatchObject({ code: "path_denied" });
+    }
   });
 });
 
-describe("P1 — aggregate masks grouped/counted fields", () => {
+describe("P1 — aggregate masks grouped fields", () => {
   const masked: ActorPolicy = {
     ...permissivePolicy([INSTANCE]),
     fieldMasks: { incident: ["u_ssn"] },
@@ -233,12 +201,6 @@ describe("P1 — aggregate masks grouped/counted fields", () => {
     });
   });
 
-  it("rejects counting a masked field", async () => {
-    const { rpc: r } = rpc({ policy: masked });
-    await expect(r.aggregate({ table: "incident", countField: "u_ssn" })).rejects.toMatchObject({
-      code: "actor_policy_denied",
-    });
-  });
 });
 
 describe("P1 — dot-aware field masking (request AND response)", () => {
@@ -260,8 +222,47 @@ describe("P1 — dot-aware field masking (request AND response)", () => {
   it("tableUpdate denies writing a masked field (mask applies to writes too)", async () => {
     const { rpc: r } = rpc({ policy });
     await expect(
-      r.tableUpdate({ table: "incident", sys_id: HEX, fields: { caller_id: "x" }, idempotencyKey: "k1" }),
+      r.tableUpdate({ table: "incident", sys_id: HEX, fields: { caller_id: "x" } }),
     ).rejects.toMatchObject({ code: "actor_policy_denied" });
+  });
+});
+
+describe("P4 — mutating RPC methods require mutation safety wiring", () => {
+  it("tableUpdate fails closed after validation/capability gates when mutation deps are absent", async () => {
+    const { rpc: r, http } = rpc();
+    await expect(
+      r.tableUpdate({ table: "incident", sys_id: HEX, fields: { state: 2 } }),
+    ).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+  });
+
+  it("runServerScript fails closed before the executor POST when mutation deps are absent", async () => {
+    const http = new MockHttp();
+    const r = new ServiceNowRPC({
+      http,
+      instanceHost: INSTANCE,
+      effectiveMode: "admin_script",
+      actorPolicy: permissivePolicy([INSTANCE]),
+      runBudget: new RunBudget(),
+      signing: {
+        claims: {
+          mcp_actor_user_id: "operator",
+          mcp_actor_email: "op@example.com",
+          snow_effective_user_sys_id: "",
+          instance: INSTANCE,
+          request_id: "req-1",
+        },
+        hmacKey: new Uint8Array(32).fill(7),
+        nonce: () => crypto.randomUUID(),
+        now: () => 1_700_000_000_000,
+      },
+      executorPath: "/api/x_mcp/executor/run",
+    });
+
+    await expect(
+      r.runServerScript({ script: "gs.info('x');" }),
+    ).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 });
 
@@ -296,31 +297,23 @@ describe("P1 — validateReason", () => {
     expect(() => validateReason("a".repeat(1025))).toThrow(McpToolError);
   });
 
-  it("P6b — validateUserQuery allows ^ORDERBY / ^ORDERBYDESC under a mandatory filter (any case)", () => {
+  it("P6b — validateUserQuery allows exact ^ORDERBY / ^ORDERBYDESC under a mandatory filter", () => {
+    expect(validateUserQuery("ORDERBYnumber", true)).toBe("ORDERBYnumber");
     expect(validateUserQuery("priority=1^ORDERBYnumber", true)).toBe("priority=1^ORDERBYnumber");
     expect(validateUserQuery("priority=1^ORDERBYDESCnumber", true)).toBe("priority=1^ORDERBYDESCnumber");
     expect(validateUserQuery("^ORDERBYnumber", true)).toBe("^ORDERBYnumber");
-    // /i keeps the (?!DERBY) lookahead case-insensitive, so a lowercase ordering clause is allowed too.
-    expect(validateUserQuery("priority=1^orderbynumber", true)).toBe("priority=1^orderbynumber");
   });
 
   it("P6b-2 — validateUserQuery rejects the ^OR / ^NQ / ^EQ escapes in ANY case (case-insensitive)", () => {
-    // Reject-not-bypass: the guard is `/i`, so a lowercase `^or`/`^nq`/`^eq` (a potential escape if
-    // SN parses operators case-insensitively, P8-unconfirmed) is REJECTED just like the uppercase form.
-    for (const q of ["a=1^ORb=2", "a^NQb", "a^EQ", "a=1^orb=2", "a^nqb", "a^eq"]) {
+    for (const q of ["NQb", "ORb", "EQ", "a=1^ORb=2", "a^NQb", "a^EQ", "a=1^orb=2", "a^nqb", "a^eq", "a^ORderbyfield=1", "a^orderbynumber"]) {
       expect(() => validateUserQuery(q, true)).toThrow(McpToolError);
     }
   });
 
-  it("P6b-2 — a MIXED-CASE ^ORderby<field> resolves to ALLOWED (the P8 case-sensitivity gate)", () => {
-    // With `/i` the `(?!DERBY)` lookahead is also case-insensitive, so `^ORderbyfield=1` reads as
-    // the benign ^ORDERBY clause and is ALLOWED. This is the rare residual ambiguity flagged as a
-    // P8 live-confirmation gate; we accept it in exchange for rejecting all lowercase ^or escapes.
-    expect(validateUserQuery("active=true^ORderbyfield=1", true)).toBe("active=true^ORderbyfield=1");
-  });
-
-  it("P6b — assertMandatoryRowFilterSafe rejects ^OR but accepts ^ORDERBY (shares the token boundary)", () => {
+  it("P6b — assertMandatoryRowFilterSafe rejects ^OR variants but accepts exact ^ORDERBY", () => {
+    expect(() => assertMandatoryRowFilterSafe("incident", "NQactive=false")).toThrow();
     expect(() => assertMandatoryRowFilterSafe("incident", "active=true^ORactive=false")).toThrow();
+    expect(() => assertMandatoryRowFilterSafe("incident", "active=true^ORderbyfield=1")).toThrow();
     expect(() => assertMandatoryRowFilterSafe("incident", "active=true^ORDERBYnumber")).not.toThrow();
   });
 
@@ -337,7 +330,7 @@ describe("P1 — validateReason", () => {
 // could still run arbitrary admin script. The check must run at the dangerous sink, driven through
 // the RPC — not merely asserted on assertActorPolicy in isolation (isolation-only is what hid it).
 describe("H-1 — runServerScript respects ActorPolicy.maxMode", () => {
-  const SCRIPT_ARGS = { script: "return gs.getUserName();", reason: "audit reason", idempotencyKey: "run-1" };
+  const SCRIPT_ARGS = { script: "return gs.getUserName();" };
 
   it("DENIES admin_script when the actor's maxMode is write (the cap no longer fails open)", async () => {
     const { rpc: r, http } = rpc({ policy: { ...permissivePolicy([INSTANCE]), maxMode: "write" } });

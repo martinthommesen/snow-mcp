@@ -9,7 +9,7 @@ const NS = (env as unknown as TestEnv).TOKEN_DO;
 
 function backend(userId: string, instanceHost: string) {
   const id = NS.idFromName(`${userId}|${instanceHost}`);
-  return NS.get(id); // the DO stub IS the TokenStoreBackend (putToken/getToken/revokeAll)
+  return NS.get(id); // the DO stub IS the TokenStoreBackend (putToken/getToken)
 }
 const ring: KekRing = { current: { version: "2026-05", keyBytes: new Uint8Array(32).fill(5) } };
 const store = (u: string, h: string, r: KekRing = ring) => new TokenStore(backend(u, h), r, u, h);
@@ -23,13 +23,11 @@ describe("§2.7 / S7 token store", () => {
     expect(await store("uA", "inst1").get("servicenow")).toEqual({ access_token: "SECRET-AT-123", refresh_token: "R1" });
   });
 
-  it("rotate replaces tokens; revoke clears them", async () => {
+  it("rotate replaces tokens", async () => {
     const s = store("uRot", "inst1");
     await s.put("servicenow", { access_token: "a1", refresh_token: "r1" });
     await s.rotate("servicenow", { access_token: "a2", refresh_token: "r2" });
     expect((await s.get("servicenow"))?.access_token).toBe("a2");
-    await s.revoke();
-    expect(await s.get("servicenow")).toBeNull();
   });
 
   it("S2-auth — one user's tokens never decrypt under another user's store (AAD-bound)", async () => {

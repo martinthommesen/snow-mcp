@@ -2,16 +2,14 @@
 // CONFIGURED tables, so a `tableUpdate` is reversible. Reuses the AES-GCM envelope
 // (auth/crypto.ts) under a dedicated SNAPSHOT_KEK. The snapshot store is itself
 // sensitive (RETENTION.md): retention window, KEK rotation, access control, PII class,
-// tenant opt-out. Pure host logic (crypto) — unit-verified; the persistent store +
-// scheduled purge are operational (not built here).
+// and explicit table enablement. Pure host logic (crypto) — unit-verified; persistent
+// storage retention is enforced by the KV write TTL in tools/handlers.ts.
 
 import { seal, open, type KekRing, type TokenEnvelope } from "../auth/crypto.js";
 
 export interface SnapshotConfig {
   /** Tables for which before/after snapshots are stored. Others: no snapshot (claim narrowed). */
   enabledTables: readonly string[];
-  /** Retention window in ms (RETENTION.md default 30 days). */
-  retentionMs: number;
 }
 
 export interface Snapshot {
@@ -53,9 +51,4 @@ export async function readSnapshot(
 /** The field map to write to revert `tableUpdate` to its pre-change state. */
 export async function reversalFields(ring: KekRing, snap: Snapshot): Promise<Record<string, unknown>> {
   return (await readSnapshot(ring, snap)).before;
-}
-
-/** True when a snapshot is older than the retention window (eligible for purge). */
-export function isExpired(config: SnapshotConfig, snap: Snapshot, now: number): boolean {
-  return now - snap.takenAt > config.retentionMs;
 }

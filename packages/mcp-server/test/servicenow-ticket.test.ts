@@ -15,9 +15,21 @@ describe("§6b reauth ticket mint/verify", () => {
     expect(verified).toEqual(ticket);
   });
 
+  it("round-trips UTF-8 user ids without changing the TokenStore partition key", async () => {
+    const ticket = { userId: "åse-操作", instanceHost: "inst1.service-now.com", nonce: "n1", exp: 10_000 };
+    const token = await mintTicket(ticket, SECRET);
+    const verified = await verifyTicket(token, SECRET, 5_000);
+    expect(verified).toEqual(ticket);
+  });
+
   it("rejects an expired ticket (null, fail closed)", async () => {
     const token = await mintTicket({ userId: "alice", instanceHost: "inst1", nonce: "n", exp: 1_000 }, SECRET);
     expect(await verifyTicket(token, SECRET, 5_000)).toBeNull(); // now > exp
+  });
+
+  it("rejects a ticket without a nonce", async () => {
+    const token = await mintTicket({ userId: "alice", instanceHost: "inst1", nonce: "", exp: 10_000 }, SECRET);
+    expect(await verifyTicket(token, SECRET, 5_000)).toBeNull();
   });
 
   it("rejects a ticket signed with a DIFFERENT secret (forgery)", async () => {

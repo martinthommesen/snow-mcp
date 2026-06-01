@@ -81,9 +81,42 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const http = new MockHttp();
     const r = rpc({ http, mutation: mutationDeps({ runContext: { requestId: "r-nokey" } }) });
     await expect(
-      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "snippet-key" }),
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
     ).rejects.toMatchObject({ code: "capability_denied" });
     // No PATCH ever left the host.
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+  });
+
+  it("FAILS CLOSED when the live path requires durability but the ledger is missing", async () => {
+    const http = new MockHttp();
+    const r = rpc({
+      http,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-no-ledger", runKey: "k1" },
+        durabilityRequired: true,
+        audit: async () => {},
+      }),
+    });
+    await expect(
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
+    ).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+  });
+
+  it("FAILS CLOSED when the live path requires durability but audit is missing", async () => {
+    const runKey = `no-audit-${crypto.randomUUID()}`;
+    const http = new MockHttp();
+    const r = rpc({
+      http,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-no-audit", runKey },
+        durabilityRequired: true,
+        ledger: realLedger(runKey),
+      }),
+    });
+    await expect(
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
+    ).rejects.toMatchObject({ code: "internal_error" });
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 
@@ -91,14 +124,14 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const runKey = `dedup-${crypto.randomUUID()}`;
     const http1 = new MockHttp();
     const r1 = rpc({ http: http1, mutation: mutationDeps({ runContext: { requestId: "r1", runKey }, ledger: realLedger(runKey) }) });
-    const first = await r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    const first = await r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     expect(first).toMatchObject({ updated: true });
     expect(http1.calls.filter((c) => c.method === "PATCH")).toHaveLength(1);
 
     // Fresh run (fresh RPC => ordinal resets to 1), same runKey => same ledger object.
     const http2 = new MockHttp();
     const r2 = rpc({ http: http2, mutation: mutationDeps({ runContext: { requestId: "r2", runKey }, ledger: realLedger(runKey) }) });
-    const replay = await r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    const replay = await r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     expect(replay).toMatchObject({ updated: true });
     // Replay returns the stored result without re-sending the PATCH.
     expect(http2.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
@@ -109,13 +142,13 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const http1 = new MockHttp();
     http1.patchHandler = () => ({ status: 503, json: { error: { message: "gateway" } } }); // post-send unknown
     const r1 = rpc({ http: http1, mutation: mutationDeps({ runContext: { requestId: "r1", runKey }, ledger: realLedger(runKey) }) });
-    await expect(r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" })).rejects.toBeTruthy();
+    await expect(r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toBeTruthy();
 
     // Retry the SAME logical mutation — must be blocked (indeterminate), no second PATCH.
     const http2 = new MockHttp();
     const r2 = rpc({ http: http2, mutation: mutationDeps({ runContext: { requestId: "r2", runKey }, ledger: realLedger(runKey) }) });
     await expect(
-      r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" }),
+      r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
     ).rejects.toMatchObject({ code: "capability_denied" });
     expect(http2.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
@@ -125,12 +158,12 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const http1 = new MockHttp();
     http1.patchHandler = () => ({ status: 403, json: { error: { message: "ACL" } } }); // did NOT apply
     const r1 = rpc({ http: http1, mutation: mutationDeps({ runContext: { requestId: "r1", runKey }, ledger: realLedger(runKey) }) });
-    await expect(r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" })).rejects.toMatchObject({ code: "actor_policy_denied" });
+    await expect(r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toMatchObject({ code: "actor_policy_denied" });
 
     // Retry: a clean failure permits a fresh attempt (now succeeds).
     const http2 = new MockHttp();
     const r2 = rpc({ http: http2, mutation: mutationDeps({ runContext: { requestId: "r2", runKey }, ledger: realLedger(runKey) }) });
-    const ok = await r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    const ok = await r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     expect(ok).toMatchObject({ updated: true });
     expect(http2.calls.filter((c) => c.method === "PATCH")).toHaveLength(1);
   });
@@ -139,13 +172,13 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const runKey = `diverge-${crypto.randomUUID()}`;
     const http1 = new MockHttp();
     const r1 = rpc({ http: http1, mutation: mutationDeps({ runContext: { requestId: "r1", runKey }, ledger: realLedger(runKey) }) });
-    await r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    await r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
 
     // Same runKey+ordinal but DIFFERENT fields => different requestHash => conflict.
     const http2 = new MockHttp();
     const r2 = rpc({ http: http2, mutation: mutationDeps({ runContext: { requestId: "r2", runKey }, ledger: realLedger(runKey) }) });
     await expect(
-      r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "9" }, idempotencyKey: "x" }),
+      r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "9" } }),
     ).rejects.toMatchObject({ code: "capability_denied" });
     expect(http2.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
@@ -154,8 +187,8 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const runKey = `multi-${crypto.randomUUID()}`;
     const http = new MockHttp();
     const r = rpc({ http, mutation: mutationDeps({ runContext: { requestId: "r1", runKey }, ledger: realLedger(runKey) }) });
-    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
-    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
+    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     // Same logical fields but DIFFERENT ordinals => two real PATCHes (not deduped within a run).
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(2);
   });
@@ -169,7 +202,7 @@ describe("P4 — host audit wired (audit-before-effect, fail-closed)", () => {
       http,
       mutation: mutationDeps({ runContext: { requestId: "r-audit", runKey: "k1", reason: "fix it" }, audit: async (rec) => { rows.push(rec); } }),
     });
-    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     // PRE-effect intent row (status "intent") then the superseding OUTCOME row (status "ok"),
     // both for ordinal 1 (the result row supersedes the intent at the same audit key).
     expect(rows.length).toBe(2);
@@ -198,8 +231,8 @@ describe("P4 — host audit wired (audit-before-effect, fail-closed)", () => {
         captureSnapshot: async (input) => { snapshots.push({ ordinal: input.ordinal }); return true; },
       }),
     });
-    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
-    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "3" }, idempotencyKey: "x" });
+    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
+    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "3" } });
 
     // Each successful mutation emits an intent row + a superseding outcome row, across two
     // DISTINCT ordinals (1, 2) — i.e. two audit-event keys, never overwriting each other.
@@ -215,7 +248,7 @@ describe("P4 — host audit wired (audit-before-effect, fail-closed)", () => {
     const r = rpc({
       mutation: mutationDeps({ runContext: { requestId: "r-deny" }, audit: async (rec) => { rows.push(rec); } }),
     });
-    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" })).rejects.toBeTruthy();
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toBeTruthy();
     expect(rows.some((x) => x.status === "denied")).toBe(true);
   });
 
@@ -231,7 +264,7 @@ describe("P4 — host audit wired (audit-before-effect, fail-closed)", () => {
         audit: async (rec) => { byOrdinal.set(rec.ordinal ?? -1, rec); },
       }),
     });
-    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" })).rejects.toBeTruthy();
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toBeTruthy();
     const durable = byOrdinal.get(1)!;
     expect(durable.status).toBe("error"); // NOT "ok"
     expect(durable.errorClass).toContain("indeterminate"); // 503 is post-send unknown
@@ -243,7 +276,7 @@ describe("P4 — host audit wired (audit-before-effect, fail-closed)", () => {
       http,
       mutation: mutationDeps({ runContext: { requestId: "r-failclosed", runKey: "k1" }, audit: async () => { throw new Error("kv down"); } }),
     });
-    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" })).rejects.toBeTruthy();
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toBeTruthy();
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 });
@@ -262,7 +295,7 @@ describe("P4 — recovery snapshot wired (before-state, fail-closed)", () => {
         captureSnapshot: async () => { order.push("snapshot"); return true; },
       }),
     });
-    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     // before-state GET + snapshot persist BOTH happen before the PATCH (fail-closed ordering).
     expect(order.indexOf("snapshot")).toBeLessThan(order.indexOf("patch"));
     expect(order.indexOf("get-before")).toBeLessThan(order.indexOf("patch"));
@@ -278,7 +311,7 @@ describe("P4 — recovery snapshot wired (before-state, fail-closed)", () => {
         captureSnapshot: async () => { throw new Error("snapshot store down"); },
       }),
     });
-    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" })).rejects.toBeTruthy();
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toBeTruthy();
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 
@@ -293,7 +326,7 @@ describe("P4 — recovery snapshot wired (before-state, fail-closed)", () => {
         captureSnapshot: async () => { captured = true; return true; },
       }),
     });
-    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" }, idempotencyKey: "x" });
+    await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     expect(captured).toBe(false);
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(1);
   });
@@ -301,6 +334,40 @@ describe("P4 — recovery snapshot wired (before-state, fail-closed)", () => {
 
 describe("P4 — second-approval gate wired into runServerScript", () => {
   const SCRIPT = "return gs.getUserName();";
+  const APPROVED = { adminScriptAllowlist: ["userA"], requiredAccessGroup: "mcp-admins", actorAccessGroups: ["mcp-admins"] };
+
+  it("FAILS CLOSED when the live executor path requires durability but the ledger is missing", async () => {
+    const http = new MockHttp();
+    const r = rpc({
+      http, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-script-no-ledger", runKey: "k1", reason: "rotate" },
+        durabilityRequired: true,
+        audit: async () => {},
+      }),
+    });
+    await expect(
+      r.runServerScript({ script: SCRIPT }),
+    ).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("FAILS CLOSED when the live executor path requires durability but audit is missing", async () => {
+    const runKey = `script-no-audit-${crypto.randomUUID()}`;
+    const http = new MockHttp();
+    const r = rpc({
+      http, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-script-no-audit", runKey, reason: "rotate" },
+        durabilityRequired: true,
+        ledger: realLedger(runKey),
+      }),
+    });
+    await expect(
+      r.runServerScript({ script: SCRIPT }),
+    ).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
 
   it("ENFORCES when a policy is configured: admin_script with no valid token/group is DENIED (no POST)", async () => {
     const http = new MockHttp();
@@ -312,7 +379,7 @@ describe("P4 — second-approval gate wired into runServerScript", () => {
       }),
     });
     await expect(
-      r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" }),
+      r.runServerScript({ script: SCRIPT }),
     ).rejects.toMatchObject({ code: "capability_denied" });
     expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
@@ -326,33 +393,79 @@ describe("P4 — second-approval gate wired into runServerScript", () => {
         approval: { adminScriptAllowlist: ["userA"], requiredAccessGroup: "mcp-admins", actorAccessGroups: ["mcp-admins"] },
       }),
     });
-    const out = await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
+    const out = await r.runServerScript({ script: SCRIPT });
     expect(out).toMatchObject({ ok: true });
     expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(1);
   });
 
-  it("PRESERVES single-operator: with NO approval policy configured, admin_script runs (gate skipped)", async () => {
+  it("PASSES when the actor is allowlisted AND the host-level approvalToken is valid (POST sent)", async () => {
+    const http = new MockHttp();
+    const r = rpc({
+      http, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-approve-token-ok", runKey: "k1", reason: "rotate", approvalToken: "token-1" },
+        approval: { adminScriptAllowlist: ["userA"], validApprovalTokens: new Set(["token-1"]) },
+      }),
+    });
+    const out = await r.runServerScript({ script: SCRIPT });
+    expect(out).toMatchObject({ ok: true });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it("DENIES an idempotency replay when the current second approval is missing", async () => {
+    const runKey = `approve-replay-${crypto.randomUUID()}`;
+    const approval = { adminScriptAllowlist: ["userA"], validApprovalTokens: new Set(["token-1"]) };
+    const http1 = new MockHttp();
+    const r1 = rpc({
+      http: http1, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-approve-replay-1", runKey, reason: "rotate", approvalToken: "token-1" },
+        ledger: realLedger(runKey),
+        approval,
+      }),
+    });
+    await r1.runServerScript({ script: SCRIPT });
+    expect(http1.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+
+    const http2 = new MockHttp();
+    const r2 = rpc({
+      http: http2, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-approve-replay-2", runKey, reason: "rotate" },
+        ledger: realLedger(runKey),
+        approval,
+      }),
+    });
+    await expect(
+      r2.runServerScript({ script: SCRIPT }),
+    ).rejects.toMatchObject({ code: "capability_denied" });
+    expect(http2.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("FAILS CLOSED with NO approval policy configured (empty policy denies admin_script)", async () => {
     const http = new MockHttp();
     const r = rpc({
       http, mode: "admin_script", signing: true,
       mutation: mutationDeps({ runContext: { requestId: "r-solo", runKey: "k1", reason: "rotate" } }), // no approval
     });
-    const out = await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
-    expect(out).toMatchObject({ ok: true });
+    await expect(r.runServerScript({ script: SCRIPT })).rejects.toMatchObject({
+      code: "capability_denied",
+    });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 
-  it("uses the HOST tool-level reason (not the snippet's args.reason) for the POST body + audit", async () => {
+  it("uses the HOST tool-level reason for the POST body + audit", async () => {
     const rows: AuditRecord[] = [];
     const http = new MockHttp();
     const r = rpc({
       http, mode: "admin_script", signing: true,
       mutation: mutationDeps({
         runContext: { requestId: "r-hostreason", runKey: "k1", reason: "HOST-REASON" },
+        approval: APPROVED,
         audit: async (rec) => { rows.push(rec); },
       }),
     });
-    // Snippet supplies a DIFFERENT (shape-valid) reason — it must NOT be the audited/sent value.
-    await r.runServerScript({ script: SCRIPT, reason: "SNIPPET-REASON", idempotencyKey: "x" });
+    await r.runServerScript({ script: SCRIPT });
     const post = http.calls.find((c) => c.method === "POST")!;
     // P7 item 1: reason is now SIGNED into the actor payload (integrity-bound), not sent as
     // an unsigned top-level body.reason. The executor verifies + audits actor.reason.
@@ -360,7 +473,6 @@ describe("P4 — second-approval gate wired into runServerScript", () => {
     expect(body.actor.reason).toBe("HOST-REASON");
     expect(body.reason).toBeUndefined();
     expect(rows.every((x) => x.reason === "HOST-REASON")).toBe(true);
-    expect(rows.some((x) => x.reason === "SNIPPET-REASON")).toBe(false);
   });
 
   it("runServerScript hard-requires the tool-level idempotencyKey (runKey)", async () => {
@@ -370,7 +482,7 @@ describe("P4 — second-approval gate wired into runServerScript", () => {
       mutation: mutationDeps({ runContext: { requestId: "r-nokey", reason: "rotate" } }), // no runKey
     });
     await expect(
-      r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" }),
+      r.runServerScript({ script: SCRIPT }),
     ).rejects.toMatchObject({ code: "capability_denied" });
     expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
@@ -394,7 +506,7 @@ describe("P4 — write field-mask + update-key validation hold on the guarded pa
   it("denies writing a masked field (exact-match caller_id) via the actor-policy mask", async () => {
     const { rpc: r, http } = maskRpc();
     await expect(
-      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { caller_id: "x" }, idempotencyKey: "x" }),
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { caller_id: "x" } }),
     ).rejects.toMatchObject({ code: "actor_policy_denied" });
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
@@ -404,7 +516,7 @@ describe("P4 — write field-mask + update-key validation hold on the guarded pa
     // BEFORE the mask gate is ever consulted — so the rejection is path_denied, not the mask.
     const { rpc: r, http } = maskRpc();
     await expect(
-      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { "caller_id.value": "x" }, idempotencyKey: "x" }),
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { "caller_id.value": "x" } }),
     ).rejects.toMatchObject({ code: "path_denied" });
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
@@ -416,6 +528,7 @@ describe("P4 — write field-mask + update-key validation hold on the guarded pa
 // the base "" claim. These assert the NEW behavior end-to-end through signActor → POST body.
 describe("§6b runServerScript binds the resolved effective-user sys_id into the signed actor", () => {
   const SCRIPT = "return gs.getUserName();";
+  const APPROVED = { adminScriptAllowlist: ["userA"], requiredAccessGroup: "mcp-admins", actorAccessGroups: ["mcp-admins"] };
 
   function signingRpc(resolver?: () => Promise<string>): { rpc: ServiceNowRPC; http: MockHttp } {
     const http = new MockHttp();
@@ -431,29 +544,30 @@ describe("§6b runServerScript binds the resolved effective-user sys_id into the
         ...(resolver ? { resolveEffectiveUserSysId: resolver } : {}),
       },
       executorPath: "/api/x_1793136_mcp/x_mcp/executor/run",
-      mutation: mutationDeps({ runContext: { requestId: "r-eff", runKey: "k1", reason: "rotate" } }),
+      mutation: mutationDeps({ runContext: { requestId: "r-eff", runKey: "k1", reason: "rotate" }, approval: APPROVED }),
     });
     return { rpc: r, http };
   }
 
   it("per_user_oauth: the signed actor carries the resolved sys_id (not the base \"\")", async () => {
     const { rpc: r, http } = signingRpc(async () => "EFFECTIVE_SYS_ID");
-    await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
+    await r.runServerScript({ script: SCRIPT });
     const post = http.calls.find((c) => c.method === "POST")!;
     expect((post.body as { actor: { snow_effective_user_sys_id: string } }).actor.snow_effective_user_sys_id).toBe("EFFECTIVE_SYS_ID");
   });
 
   it("integration_user (no resolver): the signed actor keeps snow_effective_user_sys_id \"\"", async () => {
     const { rpc: r, http } = signingRpc(); // no resolveEffectiveUserSysId
-    await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
+    await r.runServerScript({ script: SCRIPT });
     const post = http.calls.find((c) => c.method === "POST")!;
     expect((post.body as { actor: { snow_effective_user_sys_id: string } }).actor.snow_effective_user_sys_id).toBe("");
   });
 
-  it("a resolver that yields \"\" (principal unresolved) keeps the base claim \"\"", async () => {
+  it("per_user_oauth: an unresolved principal fails closed before the executor POST", async () => {
     const { rpc: r, http } = signingRpc(async () => "");
-    await r.runServerScript({ script: SCRIPT, reason: "rotate", idempotencyKey: "x" });
-    const post = http.calls.find((c) => c.method === "POST")!;
-    expect((post.body as { actor: { snow_effective_user_sys_id: string } }).actor.snow_effective_user_sys_id).toBe("");
+    await expect(r.runServerScript({ script: SCRIPT })).rejects.toMatchObject({
+      code: "reauth_required",
+    });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 });

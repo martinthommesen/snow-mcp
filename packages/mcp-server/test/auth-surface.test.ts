@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { serviceNowAuthHandler } from "../src/auth/servicenow-auth-handler.js";
 import { MissingOAuthKvError } from "../src/auth/oauth-kv.js";
+import { authenticatedUserId } from "../src/index.js";
 
 // ─── Phase P6a — Auth-surface hardening ───────────────────────────────────────
 // The top-level fetch wrapper (index.ts) runs the SAME OriginConfig as /mcp on the
@@ -64,6 +65,16 @@ describe("§P6a origin guard on the auth surface (finding 32)", () => {
   });
 });
 
+describe("authenticated /mcp identity", () => {
+  it("requires a non-empty string userId before building handler identity", () => {
+    expect(authenticatedUserId({ userId: "u1" })).toBe("u1");
+    expect(authenticatedUserId({})).toBeUndefined();
+    expect(authenticatedUserId({ userId: "" })).toBeUndefined();
+    expect(authenticatedUserId({ userId: "   " })).toBeUndefined();
+    expect(authenticatedUserId({ userId: 123 })).toBeUndefined();
+  });
+});
+
 // ─── §P6a signed/stored consent state (finding 22) ────────────────────────────
 // The consent POST binds the granted scope to SERVER-SIDE state (OAUTH_KV under a
 // server-minted nonce), never re-parsing a client-controlled hidden field. A tampered
@@ -76,7 +87,7 @@ const KV = (env as unknown as OAuthKvEnv).OAUTH_KV;
 
 /** A fake OAuthProvider helper that records what scope completeAuthorization was given. */
 function fakeProvider(authRequest: { clientId: string; scope: string[] }) {
-  const seen: { scope?: string[]; props?: unknown } = {};
+  const seen: { userId?: string; scope?: string[]; props?: unknown } = {};
   const helper = {
     parseAuthRequest: async () => ({
       responseType: "code",
@@ -88,7 +99,8 @@ function fakeProvider(authRequest: { clientId: string; scope: string[] }) {
       codeChallengeMethod: "S256",
     }),
     lookupClient: async () => ({ clientName: "Test Client" }),
-    completeAuthorization: async (opts: { scope: string[]; props: unknown }) => {
+    completeAuthorization: async (opts: { userId: string; scope: string[]; props: unknown }) => {
+      seen.userId = opts.userId;
       seen.scope = opts.scope;
       seen.props = opts.props;
       return { redirectTo: "https://client.example/cb?code=abc" };
@@ -98,6 +110,7 @@ function fakeProvider(authRequest: { clientId: string; scope: string[] }) {
 }
 
 const SECRET = "operator-secret-value";
+const OPERATOR_USER_ID = "test-operator";
 
 async function getConsent(provider: ReturnType<typeof fakeProvider>): Promise<{ nonce: string; status: number }> {
   const res = await serviceNowAuthHandler.fetch(
@@ -117,7 +130,7 @@ function postConsent(fields: Record<string, string>, provider: ReturnType<typeof
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: form.toString(),
     }),
-    { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV },
+    { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV, MCP_OPERATOR_USER_ID: OPERATOR_USER_ID },
   );
 }
 
@@ -131,6 +144,28 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
     const html = await res.text();
     expect(html).toContain('name="consent"');
     expect(html).not.toContain('name="oauth"'); // the client-controlled field is gone
+  });
+
+  it("denies consent when the auth request has no scopes instead of defaulting to read", async () => {
+    const provider = fakeProvider({ clientId: "c1", scope: [] });
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize?response_type=code&client_id=c1"),
+      { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV },
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("No supported ServiceNow OAuth scopes requested.");
+    expect(provider.seen.scope).toBeUndefined();
+  });
+
+  it("denies consent when every requested scope is unsupported", async () => {
+    const provider = fakeProvider({ clientId: "c1", scope: ["profile", "email"] });
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize?response_type=code&client_id=c1"),
+      { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV },
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("No supported ServiceNow OAuth scopes requested.");
+    expect(provider.seen.scope).toBeUndefined();
   });
 
   it("grants the GET-time scope from server state, IGNORING a tampered hidden field", async () => {
@@ -158,6 +193,21 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
     expect(provider.seen.scope).toBeUndefined(); // completeAuthorization never called
   });
 
+  it("fails CLOSED when MCP_OPERATOR_USER_ID is not configured", async () => {
+    const provider = fakeProvider({ clientId: "c1", scope: ["servicenow:read"] });
+    const { nonce } = await getConsent(provider);
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ consent: nonce, operator_secret: SECRET }).toString(),
+      }),
+      { OAUTH_PROVIDER: provider.helper as never, MCP_OPERATOR_SECRET: SECRET, OAUTH_KV: KV },
+    );
+    expect(res.status).toBe(500);
+    expect(provider.seen.scope).toBeUndefined();
+  });
+
   it("a wrong operator secret re-renders with the SAME nonce (retry stays valid) and does not grant", async () => {
     const provider = fakeProvider({ clientId: "c1", scope: ["servicenow:read"] });
     const { nonce } = await getConsent(provider);
@@ -177,6 +227,46 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
     // Replaying the same nonce now fails closed (the KV entry was deleted).
     const replay = await postConsent({ consent: nonce, operator_secret: SECRET }, provider);
     expect(replay.status).toBe(400);
+  });
+
+  it("uses configured operator subject metadata without persisting authorization groups into the OAuth grant", async () => {
+    const provider = fakeProvider({ clientId: "c1", scope: ["servicenow:admin_script"] });
+    const get = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize?response_type=code&client_id=c1"),
+      {
+        OAUTH_PROVIDER: provider.helper as never,
+        MCP_OPERATOR_SECRET: SECRET,
+        OAUTH_KV: KV,
+        MCP_OPERATOR_USER_ID: "ada-operator",
+        MCP_OPERATOR_EMAIL: "ada@example.com",
+        MCP_OPERATOR_ACCESS_GROUPS: "mcp-admins, change-approvers",
+      },
+    );
+    const nonce = /name="consent" value="([^"]+)"/.exec(await get.text())![1]!;
+    const form = new URLSearchParams({ consent: nonce, operator_secret: SECRET });
+    const post = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      }),
+      {
+        OAUTH_PROVIDER: provider.helper as never,
+        MCP_OPERATOR_SECRET: SECRET,
+        OAUTH_KV: KV,
+        MCP_OPERATOR_USER_ID: "ada-operator",
+        MCP_OPERATOR_EMAIL: "ada@example.com",
+        MCP_OPERATOR_ACCESS_GROUPS: "mcp-admins, change-approvers",
+      },
+    );
+    expect(post.status).toBe(302);
+    expect(provider.seen.userId).toBe("ada-operator");
+    expect(provider.seen.props).toMatchObject({
+      userId: "ada-operator",
+      email: "ada@example.com",
+      maxMode: "admin_script",
+    });
+    expect((provider.seen.props as { accessGroups?: unknown }).accessGroups).toBeUndefined();
   });
 
   it("fails CLOSED (throws) when OAUTH_KV is unbound", async () => {

@@ -56,7 +56,7 @@ describe("describe_table", () => {
     // tableHierarchy re-validates each parent's super_class.name before it enters the
     // `nameIN${chain.map(esc).join(",")}` join. `esc` strips ^/= but NOT commas, so a
     // malicious parent like "evil,sys_user" would comma-inject the describe query if the
-    // TABLE_NAME_RE re-validation were absent (CODE_REVIEW.md:552-559).
+    // TABLE_NAME_RE re-validation were absent.
     const http = new MockHttp((req) => {
       if (req.path === "/api/now/table/sys_db_object") {
         return { status: 200, json: { result: [{ "super_class.name": "evil,sys_user" }] } };

@@ -188,9 +188,31 @@ describe("§6b loadActorPolicy", () => {
     expect(() => assertRequestedFieldsAllowed(p, "sys_user", ["vip"])).toThrow(McpToolError);
   });
 
+  it("rejects malformed field-mask config instead of silently ignoring it", () => {
+    expect(() => loadActorPolicy({ ACTOR_POLICY_FIELD_MASKS: "incident" }, INSTANCE)).toThrow(/ACTOR_POLICY_FIELD_MASKS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_FIELD_MASKS: "incident:" }, INSTANCE)).toThrow(/ACTOR_POLICY_FIELD_MASKS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_FIELD_MASKS: ";" }, INSTANCE)).toThrow(/ACTOR_POLICY_FIELD_MASKS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_FIELD_MASKS: "incident:caller id" }, INSTANCE)).toThrow(/ACTOR_POLICY_FIELD_MASKS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_FIELD_MASKS: "incident.*:caller_id" }, INSTANCE)).toThrow(/ACTOR_POLICY_FIELD_MASKS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_FIELD_MASKS: "incident:caller_id;incident:u_ssn" }, INSTANCE)).toThrow(/duplicate table entry/);
+  });
+
   it("parses row filters (table:encoded^query) and AND-s them in", () => {
     const p = loadActorPolicy({ ACTOR_POLICY_ROW_FILTERS: "incident:active=true" }, INSTANCE);
     expect(applyRowFilter(p, "incident", "priority=1")).toBe("active=true^priority=1");
+  });
+
+  it("rejects malformed row-filter config instead of silently ignoring it", () => {
+    expect(() => loadActorPolicy({ ACTOR_POLICY_ROW_FILTERS: "incident" }, INSTANCE)).toThrow(/ACTOR_POLICY_ROW_FILTERS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_ROW_FILTERS: "incident:" }, INSTANCE)).toThrow(/ACTOR_POLICY_ROW_FILTERS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_ROW_FILTERS: ";" }, INSTANCE)).toThrow(/ACTOR_POLICY_ROW_FILTERS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_ROW_FILTERS: "incident.*:active=true" }, INSTANCE)).toThrow(/ACTOR_POLICY_ROW_FILTERS/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_ROW_FILTERS: "incident:active=true;incident:priority=1" }, INSTANCE)).toThrow(/duplicate table entry/);
+  });
+
+  it("rejects malformed allowlist table names at load", () => {
+    expect(() => loadActorPolicy({ ACTOR_POLICY_TABLE_ALLOWLIST: "incident, sys user" }, INSTANCE)).toThrow(/ACTOR_POLICY_TABLE_ALLOWLIST/);
+    expect(() => loadActorPolicy({ ACTOR_POLICY_TABLE_ALLOWLIST: "," }, INSTANCE)).toThrow(/ACTOR_POLICY_TABLE_ALLOWLIST/);
   });
 
   it("REJECTS a self-defeating mandatory rowFilter (^OR) AT LOAD (fail-closed)", () => {
@@ -252,10 +274,8 @@ describe("§3.5 mode→capability gating", () => {
     expect(() => requireCapability("read_only", "runServerScript")).toThrow(McpToolError);
   });
 
-  it("only admin_script permits runServerScript and deleteRecords", () => {
+  it("only admin_script permits runServerScript", () => {
     expect(() => requireCapability("write", "runServerScript")).toThrow(McpToolError);
-    expect(() => requireCapability("write", "deleteRecords")).toThrow(McpToolError);
     expect(() => requireCapability("admin_script", "runServerScript")).not.toThrow();
-    expect(() => requireCapability("admin_script", "deleteRecords")).not.toThrow();
   });
 });

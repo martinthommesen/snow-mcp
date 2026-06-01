@@ -2,6 +2,8 @@
 // WebCrypto only — fully unit-verified locally (round-trip, AAD-mismatch fail-closed,
 // current+previous KEK rotation window).
 
+import { base64ToBytes, bytesToBase64, bytesToHex } from "./encoding.js";
+
 export interface TokenEnvelope {
   version: 1;
   kekVersion: string;
@@ -22,26 +24,21 @@ export interface KekRing {
   previous?: Kek; // accepted during a rotation window
 }
 
-function b64encode(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]!);
-  return btoa(s);
-}
-function b64decode(s: string): Uint8Array {
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
+const aesKeys = new WeakMap<Uint8Array, Promise<CryptoKey>>();
 
 async function importKey(kek: Kek): Promise<CryptoKey> {
   if (kek.keyBytes.length !== 32) {
     throw new Error(`KEK "${kek.version}" must be 32 bytes (AES-256), got ${kek.keyBytes.length}.`);
   }
-  return crypto.subtle.importKey("raw", kek.keyBytes as BufferSource, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
+  let key = aesKeys.get(kek.keyBytes);
+  if (!key) {
+    key = crypto.subtle.importKey("raw", kek.keyBytes as BufferSource, { name: "AES-GCM" }, false, [
+      "encrypt",
+      "decrypt",
+    ]);
+    aesKeys.set(kek.keyBytes, key);
+  }
+  return key;
 }
 
 const enc = new TextEncoder();
@@ -62,9 +59,9 @@ export async function seal(plaintext: string, aad: string, ring: KekRing): Promi
     version: 1,
     kekVersion: ring.current.version,
     alg: "AES-256-GCM",
-    iv: b64encode(iv),
+    iv: bytesToBase64(iv),
     aad,
-    ciphertext: b64encode(ct),
+    ciphertext: bytesToBase64(ct),
   };
 }
 
@@ -86,8 +83,8 @@ export async function open(envelope: TokenEnvelope, expectedAad: string, ring: K
     if (ring.previous) candidates.push(ring.previous);
   }
 
-  const iv = b64decode(envelope.iv);
-  const ct = b64decode(envelope.ciphertext);
+  const iv = base64ToBytes(envelope.iv);
+  const ct = base64ToBytes(envelope.ciphertext);
   let lastErr: unknown;
   for (const kek of candidates) {
     try {
@@ -151,12 +148,6 @@ export function warnIfWeakSecret(name: string, secret: string): void {
   }
 }
 
-function hex(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += bytes[i]!.toString(16).padStart(2, "0");
-  return s;
-}
-
 /**
  * Content-addressed KEK version label: `kek-${hex(sha256(keyBytes)).slice(0,8)}`. Distinct
  * keys are overwhelmingly unlikely to share a label (32-bit content address), which avoids
@@ -167,7 +158,7 @@ function hex(bytes: Uint8Array): string {
  */
 async function kekLabel(keyBytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", keyBytes as BufferSource));
-  return `kek-${hex(digest).slice(0, 8)}`;
+  return `kek-${bytesToHex(digest).slice(0, 8)}`;
 }
 
 /**

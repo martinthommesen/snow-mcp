@@ -48,14 +48,14 @@ npx alchemy deploy      # reads .dev.vars; provisions Worker + bindings; prints 
    the ServiceNow instance via the dev Basic-Auth path; `run_code` runs in the real
    Worker-Loader sandbox (the piece this local env couldn't exercise).
 3. For the executor (`runServerScript`), install `sn-executor-app/` on ServiceNow first and
-   mirror `X_MCP_EXECUTOR_HMAC_KEY` to the `x_mcp.executor.hmac_secret` property (still
+   mirror `X_MCP_EXECUTOR_HMAC_KEY` to the `x_1793136_mcp.executor.hmac_secret` property (still
    pending — Studio install).
 
 ## Remaining external work (P8 — live verification + redeploy, operator-gated)
 
 - Build + install the **canonical Fluent scoped-app executor** `x_1793136_mcp` (D11) — hardened
   in source in P7 (instance-claim, null-safe MAC, signed/audited `reason`, byte-safe sample,
-  DB-unique-indexed `x_mcp_nonce` replay-close, admin ACLs); install via `now-sdk install` + the
+  DB-unique-indexed `x_1793136_mcp_nonce` replay-close, admin ACLs); install via `now-sdk install` + the
   global `x_mcp_verify` helper, then prove S8/S9/S16, B1, B6 on `dev374488` in P8.
 - The OAuthProvider consent/PKCE flow + per-user TokenStoreDO storage are now **wired in source**
   (P6a signed consent-state; P6b per-user OAuth authorize/callback + TokenStoreDO). The SN token

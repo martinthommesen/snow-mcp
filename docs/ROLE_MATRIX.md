@@ -7,10 +7,10 @@ applies depends on the credential mode (§2.0, Decision 2).
 | Identity / Role | Where | Grants | Why |
 |---|---|---|---|
 | `mcp_integration_user` (integration_user mode) | ServiceNow `sys_user` | `rest_api_explorer`, `itil`, `sn_customerservice_agent`, `import_transformer`, `snc_platform_rest_api_access`, + read ACLs on `sys_db_object`/`sys_dictionary`/`sys_glide_object` | Primary integration identity; high aggregate access via well-known roles, not literal admin. Revocable. |
-| `x_mcp.executor` (scoped app) | ServiceNow scoped app | Required by the executor REST_Endpoint ACL. May create/close its OWN audit row; cannot read/alter other rows, change properties, or grant roles. | Decouples "run arbitrary script" from "hit Table API". Revoke this one role to kill executor reach. |
-| `x_mcp.admin` (scoped app) | ServiceNow scoped app | Manages `x_mcp_audit_log`, kill-switch + egress properties, role assignments. **Not the integration user.** | Separation of duty: the executor identity cannot read/disable the audit trail. |
+| `x_1793136_mcp.executor` (scoped app) | ServiceNow scoped app | Required by the executor REST_Endpoint ACL. May create/close its OWN audit row; cannot read/alter other rows, change properties, or grant roles. | Decouples "run arbitrary script" from "hit Table API". Revoke this one role to kill executor reach. |
+| `x_1793136_mcp.admin` (scoped app) | ServiceNow scoped app | Manages `x_1793136_mcp_audit_log`, kill-switch + egress properties, role assignments. **Not the integration user.** | Separation of duty: the executor identity cannot read/disable the audit trail. |
 | Cloudflare deploy identity | Cloudflare account | wrangler / Alchemy IaC | Per-engineer scoped tokens; rotate. |
-| MCP-client OAuth identity (per end user) | Cloudflare (OAuthProvider) | Maps end user → signed actor metadata (§2.0); in `per_user_oauth`, → that user's ServiceNow tokens | Per-user attribution propagates into `x_mcp_audit_log`. |
+| MCP-client OAuth identity (per end user) | Cloudflare (OAuthProvider) | Maps end user → signed actor metadata (§2.0); in `per_user_oauth`, → that user's ServiceNow tokens | Per-user attribution propagates into `x_1793136_mcp_audit_log`. |
 
 ## Credential-mode branch (Decision 2, §2.0)
 
@@ -35,5 +35,7 @@ applies depends on the credential mode (§2.0, Decision 2).
   (dot-aware field masking, P1; configurable restrictive policy is opt-in, P6b-2). The host-side
   enforcement was live-verified **pre-hardening** (B5) and is re-verified in P8.
 - The `admin_script` second-approval gate (allowlist + token/access-group, §7.9) is now **wired**
-  on the live mutating path (P4) and unit-tested; it is **opt-in** (no policy configured ⇒ the
-  single-operator default still permits `admin_script` with reason + HMAC).
+  on the live mutating path (P4) and unit-tested; `MCP_OPERATOR_ACCESS_GROUPS` supplies the
+  single-operator group branch, and tool-level `approvalToken` supplies the token branch. Empty
+  approval settings deny `admin_script`; operators must explicitly configure an allowlisted actor
+  and either a token or required group.

@@ -9,10 +9,12 @@ import { McpToolError } from "../sn/errors.js";
 import { assertMandatoryRowFilterSafe } from "../sn/validate.js";
 import { isValidMode, modeRisk, type Mode } from "@servicenow-codemode/shared";
 
+export type TableRule = string | RegExp;
+
 export interface ActorPolicy {
   /** Instance hosts this actor may reach. Empty = none. */
   allowedInstances: string[];
-  tables: { allow?: RegExp[]; deny?: RegExp[] };
+  tables: { allow?: TableRule[]; deny?: TableRule[] };
   /** table -> forbidden field names stripped from request AND response. */
   fieldMasks: Record<string, string[]>;
   maxMode: Mode;
@@ -62,41 +64,80 @@ export interface PolicyEnv {
   ACTOR_POLICY_MAX_MODE?: Mode;
 }
 
-/** Escape a table name into an anchored whole-name RegExp (substring matches would let
- *  `incident` admit `incident_extra`). Names are lowercase alnum + underscore; we anchor
- *  defensively in case a config value carries regex metacharacters. */
-function tableNameRegExp(name: string): RegExp {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^${escaped}$`);
-}
+const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
+const FIELD_NAME_RE = /^[a-z0-9_.]{1,80}$/;
 
 function parseList(value: string | undefined): string[] {
   return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+function hasNonEmptyConfig(value: string | undefined): boolean {
+  return value !== undefined && value.trim() !== "";
+}
+
+function assertConfiguredTableName(label: string, table: string, entry: string): void {
+  if (!TABLE_NAME_RE.test(table)) {
+    throw new Error(`${label} contains invalid table name "${table}" in entry "${entry}".`);
+  }
+}
+
+function assertConfiguredFieldName(label: string, field: string, entry: string): void {
+  if (!FIELD_NAME_RE.test(field)) {
+    throw new Error(`${label} contains invalid field name "${field}" in entry "${entry}".`);
+  }
+}
+
+function assertUniqueTableEntry(label: string, out: Record<string, unknown>, table: string, entry: string): void {
+  if (Object.hasOwn(out, table)) {
+    throw new Error(`${label} contains duplicate table entry "${table}" in entry "${entry}".`);
+  }
+}
+
+function parseTableAllowlist(value: string | undefined): string[] {
+  const tables = parseList(value);
+  if (hasNonEmptyConfig(value) && tables.length === 0) {
+    throw new Error("ACTOR_POLICY_TABLE_ALLOWLIST is set but contains no table names.");
+  }
+  for (const table of tables) {
+    assertConfiguredTableName("ACTOR_POLICY_TABLE_ALLOWLIST", table, table);
+  }
+  return tables;
+}
+
 /** Parse `table:a,b;table2:c` into `{ table: [a,b], table2: [c] }`. */
-function parseTableMap(value: string | undefined): Record<string, string[]> {
+function parseTableMap(value: string | undefined, label: string): Record<string, string[]> {
   const out: Record<string, string[]> = {};
-  for (const entry of (value ?? "").split(";").map((s) => s.trim()).filter(Boolean)) {
+  const entries = (value ?? "").split(";").map((s) => s.trim()).filter(Boolean);
+  if (hasNonEmptyConfig(value) && entries.length === 0) throw new Error(`${label} is set but contains no entries.`);
+  for (const entry of entries) {
     const idx = entry.indexOf(":");
-    if (idx < 0) continue;
+    if (idx <= 0) throw new Error(`${label} entry must be "table:field,field", got "${entry}".`);
     const table = entry.slice(0, idx).trim();
+    assertConfiguredTableName(label, table, entry);
+    assertUniqueTableEntry(label, out, table, entry);
     const fields = parseList(entry.slice(idx + 1));
-    if (table && fields.length > 0) out[table] = fields;
+    if (fields.length === 0) throw new Error(`${label} entry must include at least one field, got "${entry}".`);
+    for (const field of fields) assertConfiguredFieldName(label, field, entry);
+    out[table] = fields;
   }
   return out;
 }
 
 /** Parse `table:encoded^query;table2:other^query` into `{ table: "encoded^query" }`. The value
  *  is everything after the FIRST colon (a filter may itself contain `:` in date/time literals). */
-function parseRowFilters(value: string | undefined): Record<string, string> {
+function parseRowFilters(value: string | undefined, label: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const entry of (value ?? "").split(";").map((s) => s.trim()).filter(Boolean)) {
+  const entries = (value ?? "").split(";").map((s) => s.trim()).filter(Boolean);
+  if (hasNonEmptyConfig(value) && entries.length === 0) throw new Error(`${label} is set but contains no entries.`);
+  for (const entry of entries) {
     const idx = entry.indexOf(":");
-    if (idx < 0) continue;
+    if (idx <= 0) throw new Error(`${label} entry must be "table:encoded_query", got "${entry}".`);
     const table = entry.slice(0, idx).trim();
+    assertConfiguredTableName(label, table, entry);
+    assertUniqueTableEntry(label, out, table, entry);
     const filter = entry.slice(idx + 1).trim();
-    if (table && filter) out[table] = filter;
+    if (!filter) throw new Error(`${label} entry must include a non-empty encoded query, got "${entry}".`);
+    out[table] = filter;
   }
   return out;
 }
@@ -123,13 +164,13 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * hardcoded runtime default.
  */
 export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPolicy {
-  const allowlist = parseList(env.ACTOR_POLICY_TABLE_ALLOWLIST);
-  const fieldMasks = parseTableMap(env.ACTOR_POLICY_FIELD_MASKS);
-  const rowFilters = parseRowFilters(env.ACTOR_POLICY_ROW_FILTERS);
+  const allowlist = parseTableAllowlist(env.ACTOR_POLICY_TABLE_ALLOWLIST);
+  const fieldMasks = parseTableMap(env.ACTOR_POLICY_FIELD_MASKS, "ACTOR_POLICY_FIELD_MASKS");
+  const rowFilters = parseRowFilters(env.ACTOR_POLICY_ROW_FILTERS, "ACTOR_POLICY_ROW_FILTERS");
   const configured =
-    allowlist.length > 0 ||
-    Object.keys(fieldMasks).length > 0 ||
-    Object.keys(rowFilters).length > 0 ||
+    hasNonEmptyConfig(env.ACTOR_POLICY_TABLE_ALLOWLIST) ||
+    hasNonEmptyConfig(env.ACTOR_POLICY_FIELD_MASKS) ||
+    hasNonEmptyConfig(env.ACTOR_POLICY_ROW_FILTERS) ||
     env.ACTOR_POLICY_MAX_ROWS_PER_RUN !== undefined ||
     env.ACTOR_POLICY_MAX_BYTES_PER_RUN !== undefined ||
     env.ACTOR_POLICY_MAX_MODE !== undefined;
@@ -142,13 +183,13 @@ export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPoli
   // INVALID value (operator typo: "readonly"/"Read_Only"/"read-only") would make every finite
   // requested risk `< +Infinity` and silently DISABLE the ceiling — a fail-OPEN that admits
   // admin_script. So coerce a set-but-invalid value to "read_only" (the most restrictive ceiling),
-  // mirroring handlers.ts:parseMaxMode for the sibling tenant/instance ceilings. Unset stays
+  // mirroring effective-mode.ts:parseMaxMode for the sibling tenant/instance ceilings. Unset stays
   // "read_only" too (restrictive default). isValidMode collapses both cases.
   const maxMode: Mode = isValidMode(env.ACTOR_POLICY_MAX_MODE) ? env.ACTOR_POLICY_MAX_MODE : "read_only";
 
   const policy: ActorPolicy = {
     allowedInstances: [instanceHost],
-    tables: allowlist.length > 0 ? { allow: allowlist.map(tableNameRegExp) } : {},
+    tables: allowlist.length > 0 ? { allow: allowlist } : {},
     fieldMasks,
     maxMode, // restrictive default: read_only unless raised (set-but-invalid coerced to read_only).
     maxRowsPerRun: parsePositiveInt(env.ACTOR_POLICY_MAX_ROWS_PER_RUN, 10_000),
@@ -161,10 +202,64 @@ export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPoli
   return policy;
 }
 
-function tableAllowed(policy: ActorPolicy, table: string): boolean {
-  if (policy.tables.deny?.some((re) => re.test(table))) return false;
-  if (policy.tables.allow && policy.tables.allow.length > 0) {
-    return policy.tables.allow.some((re) => re.test(table));
+interface CompiledTableRules {
+  exact: ReadonlySet<string>;
+  patterns: readonly RegExp[];
+}
+
+interface MaskIndex {
+  readonly fields: ReadonlySet<string>;
+}
+
+interface CompiledPolicy {
+  allowedInstances: ReadonlySet<string>;
+  deny: CompiledTableRules;
+  allow: CompiledTableRules;
+  hasAllowRules: boolean;
+  masks: ReadonlyMap<string, MaskIndex>;
+}
+
+// ActorPolicy is constructed once per request/config path. Cache derived lookup structures so
+// every read/write/discovery gate does not rescan raw arrays for instances, tables, and masks.
+const compiledPolicies = new WeakMap<ActorPolicy, CompiledPolicy>();
+
+function compileTableRules(rules: readonly TableRule[] | undefined): CompiledTableRules {
+  const exact = new Set<string>();
+  const patterns: RegExp[] = [];
+  for (const rule of rules ?? []) {
+    if (typeof rule === "string") exact.add(rule);
+    else patterns.push(rule);
+  }
+  return { exact, patterns };
+}
+
+function compilePolicy(policy: ActorPolicy): CompiledPolicy {
+  let compiled = compiledPolicies.get(policy);
+  if (compiled) return compiled;
+  const masks = new Map<string, MaskIndex>();
+  for (const [table, fields] of Object.entries(policy.fieldMasks)) {
+    masks.set(table, { fields: new Set(fields) });
+  }
+  compiled = {
+    allowedInstances: new Set(policy.allowedInstances),
+    deny: compileTableRules(policy.tables.deny),
+    allow: compileTableRules(policy.tables.allow),
+    hasAllowRules: Boolean(policy.tables.allow && policy.tables.allow.length > 0),
+    masks,
+  };
+  compiledPolicies.set(policy, compiled);
+  return compiled;
+}
+
+function matchesTable(rules: CompiledTableRules, table: string): boolean {
+  return rules.exact.has(table) || rules.patterns.some((re) => re.test(table));
+}
+
+export function isTableAllowed(policy: ActorPolicy, table: string): boolean {
+  const compiled = compilePolicy(policy);
+  if (matchesTable(compiled.deny, table)) return false;
+  if (compiled.hasAllowRules) {
+    return matchesTable(compiled.allow, table);
   }
   return true; // no allowlist => allow unless denied
 }
@@ -174,12 +269,13 @@ export function assertActorPolicy(
   policy: ActorPolicy,
   ctx: { instance: string; table: string; mode: Mode },
 ): void {
-  if (!policy.allowedInstances.includes(ctx.instance)) {
+  const compiled = compilePolicy(policy);
+  if (!compiled.allowedInstances.has(ctx.instance)) {
     throw new McpToolError("actor_policy_denied", `Instance "${ctx.instance}" is not allowed for this actor.`, {
       instance: ctx.instance,
     });
   }
-  if (!tableAllowed(policy, ctx.table)) {
+  if (!isTableAllowed(policy, ctx.table)) {
     throw new McpToolError("actor_policy_denied", `Table "${ctx.table}" is not allowed for this actor.`, {
       table: ctx.table,
     });
@@ -199,20 +295,35 @@ export function applyRowFilter(policy: ActorPolicy, table: string, userQuery: st
   return userQuery ? `${mandatory}^${userQuery}` : mandatory;
 }
 
-/** True if a field reference `f` is covered by a mask `m`: exact match OR a dot-walk
+function maskIndex(policy: ActorPolicy, table: string): MaskIndex | undefined {
+  return compilePolicy(policy).masks.get(table);
+}
+
+/** True if a field reference is covered by this actor's masks: exact match OR a dot-walk
  *  descendant (mask `caller_id` also covers `caller_id.value`, `caller_id.name`). */
-function isMaskedBy(field: string, mask: string): boolean {
-  return field === mask || field.startsWith(`${mask}.`);
+export function isFieldMasked(policy: ActorPolicy, table: string, field: string): boolean {
+  return isFieldMaskedByIndex(maskIndex(policy, table), field);
+}
+
+function isFieldMaskedByIndex(masked: MaskIndex | undefined, field: string): boolean {
+  if (!masked) return false;
+  if (masked.fields.has(field)) return true;
+  let dot = field.indexOf(".");
+  while (dot !== -1) {
+    if (masked.fields.has(field.slice(0, dot))) return true;
+    dot = field.indexOf(".", dot + 1);
+  }
+  return false;
 }
 
 /** Strip masked fields from a record (response filtering, §2.12). Dot-aware: a mask on
  *  `caller_id` also strips dot-walked keys like `caller_id.value`. */
 export function maskRow(policy: ActorPolicy, table: string, row: Record<string, unknown>): Record<string, unknown> {
-  const masked = policy.fieldMasks[table];
-  if (!masked || masked.length === 0) return row;
+  const masked = maskIndex(policy, table);
+  if (!masked || masked.fields.size === 0) return row;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(row)) {
-    if (!masked.some((m) => isMaskedBy(k, m))) out[k] = v;
+    if (!isFieldMaskedByIndex(masked, k)) out[k] = v;
   }
   return out;
 }
@@ -221,9 +332,9 @@ export function maskRow(policy: ActorPolicy, table: string, row: Record<string, 
  *  request for `caller_id.name` is denied when `caller_id` is masked. */
 export function assertRequestedFieldsAllowed(policy: ActorPolicy, table: string, fields: string[] | undefined): void {
   if (!fields) return;
-  const masked = policy.fieldMasks[table];
-  if (!masked || masked.length === 0) return;
-  const violating = fields.filter((f) => masked.some((m) => isMaskedBy(f, m)));
+  const masked = maskIndex(policy, table);
+  if (!masked || masked.fields.size === 0) return;
+  const violating = fields.filter((f) => isFieldMaskedByIndex(masked, f));
   if (violating.length > 0) {
     throw new McpToolError("actor_policy_denied", `Fields not permitted for this actor on "${table}": ${violating.join(", ")}.`);
   }
@@ -252,18 +363,18 @@ function leadingFieldToken(clause: string): string {
  *
  * Fail-safe: split on `^` clause boundaries; for each clause extract the field token both raw and
  * after stripping one leading operator keyword (so `^ORsalary>5` and `^ORDERBYsalary` are caught),
- * and deny (`actor_policy_denied`) if either is masked (dot-aware via isMaskedBy). This errs toward
+ * and deny (`actor_policy_denied`) if either is masked (dot-aware via isFieldMasked). This errs toward
  * over-rejection, the correct direction for a confidentiality control. Residual edge: a rare
  * lowercase-operator form (`salarylike5`) is not detected — SN-canonical queries use UPPERCASE
  * operators; this mirrors validate.ts's documented P8 case-sensitivity caveat.
  */
 export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, userQuery: string): void {
-  const masked = policy.fieldMasks[table];
-  if (!masked || masked.length === 0 || !userQuery) return;
+  const masked = maskIndex(policy, table);
+  if (!masked || masked.fields.size === 0 || !userQuery) return;
   for (const clause of userQuery.split("^")) {
     const candidates = [leadingFieldToken(clause), leadingFieldToken(clause.replace(QUERY_OP_PREFIX, ""))];
     for (const f of candidates) {
-      if (f && masked.some((m) => isMaskedBy(f, m))) {
+      if (f && isFieldMaskedByIndex(masked, f)) {
         throw new McpToolError("actor_policy_denied", `Query references a field not permitted for this actor on "${table}": ${f}.`);
       }
     }

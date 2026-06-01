@@ -10,31 +10,15 @@ export { DEFAULT_MODE } from "./authz/effective-mode.js";
 export type Capability =
   | "readTables"
   | "writeTables"
-  | "deleteRecords"
-  | "importSets"
-  | "attachmentsRead"
-  | "attachmentsWrite"
   | "runServerScript";
 
 /** Enforced mode→capability map (plan §3.5). The requested mode is already capped
  *  by §2.0.1 before this is consulted; this gates which RPC methods may run. */
 export const MODE_CAPABILITIES: Readonly<Record<Mode, readonly Capability[]>> = {
-  read_only: ["readTables", "attachmentsRead"],
-  write: ["readTables", "writeTables", "importSets", "attachmentsRead", "attachmentsWrite"],
-  admin_script: [
-    "readTables",
-    "writeTables",
-    "deleteRecords",
-    "importSets",
-    "attachmentsRead",
-    "attachmentsWrite",
-    "runServerScript",
-  ],
+  read_only: ["readTables"],
+  write: ["readTables", "writeTables"],
+  admin_script: ["readTables", "writeTables", "runServerScript"],
 } as const;
-
-export function capabilitiesOf(mode: Mode): readonly Capability[] {
-  return MODE_CAPABILITIES[mode];
-}
 
 export function hasCapability(mode: Mode, cap: Capability): boolean {
   return MODE_CAPABILITIES[mode].includes(cap);
@@ -66,7 +50,6 @@ export const BUDGETS = {
   perRun: {
     rpcCallLimit: 200,
     serviceNowRequestLimit: 200,
-    attachmentBytes: 8 * 1024 * 1024,
     wallClockMs: 30_000,
   },
   daily: {

@@ -15,15 +15,12 @@ export interface ToolTextResult {
 
 /**
  * Handlers are injected so the server is testable without the (ServiceNow-gated) auth
- * stack. index.ts wires real handlers; tests can pass fakes. The `servicenow.*` typed
- * surface (ADR-0001) is injected into the run_code description at wiring time.
+ * stack. index.ts wires real handlers; tests can pass fakes.
  */
 export interface ServerHandlers {
-  runCode: (input: { code: string; mode?: Mode; reason?: string; idempotencyKey?: string }) => Promise<ToolTextResult>;
+  runCode: (input: { code: string; mode?: Mode; reason?: string; idempotencyKey?: string; approvalToken?: string }) => Promise<ToolTextResult>;
   describeTable: (input: { table: string }) => Promise<ToolTextResult>;
   listTables: (input: { filter?: string }) => Promise<ToolTextResult>;
-  /** Typed surface text appended to run_code's description (the `declare const servicenow…`). */
-  surfaceDescription?: string;
 }
 
 const RUN_CODE_BASE_DESC =
@@ -39,12 +36,13 @@ export function createServer(handlers: ServerHandlers): McpServer {
   server.registerTool(
     "run_code",
     {
-      description: handlers.surfaceDescription ? `${RUN_CODE_BASE_DESC}\n\n${handlers.surfaceDescription}` : RUN_CODE_BASE_DESC,
+      description: RUN_CODE_BASE_DESC,
       inputSchema: {
         code: z.string().describe("Async-arrow TypeScript calling servicenow.* (ADR-0001 shape)."),
         mode: z.enum(["read_only", "write", "admin_script"]).optional().describe("Declared intent; only narrows from your scope."),
         reason: z.string().optional().describe("Required for admin_script — why this runs."),
         idempotencyKey: z.string().optional().describe("Dedupe key for mutating/executor calls."),
+        approvalToken: z.string().optional().describe("Tenant-issued second-approval token for admin_script when configured."),
       },
       // openWorldHint: reaches an external system. NOT read-only (can mutate when permitted).
       annotations: { title: "Run ServiceNow code", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },

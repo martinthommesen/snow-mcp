@@ -16,9 +16,9 @@ Plan rule (§0 rule 2): *"If a documented API here no longer matches the install
 | `@cloudflare/workers-oauth-provider` | "(confirm)" | `0.7.0` | pinned |
 | `wrangler` | `4.95.0` | `4.95.0` | match |
 | `alchemy` | `0.87.0` | `0.87.0` | latest is `0.93.9`; pinned to plan value (IaC only, not on the local-verifiable path) |
-| `hono` | `4.12.23` | `4.12.23` | match |
+| `hono` | `4.12.23` | transitive via `@modelcontextprotocol/sdk` | not a direct dependency |
 | `zod` | `4.4.3` | `4.4.3` (server pkg) | see D2 |
-| `ai` | "match codemode peer" | `^6.0.0` (`6.0.193`) | codemode `0.3.8` peers `ai ^6.0.0` |
+| `ai` | "match codemode peer" | peer-only (`6.0.193`), not direct | optional AI-SDK helper surface is unused by the MCP server |
 | `@cloudflare/vitest-pool-workers` | "match wrangler" | `0.16.10` | bundles `[email protected]` + `miniflare 4.20260526.0` |
 | `vitest` | "caret 3.x" | **`^4.1.0`** (`4.1.7`) | **DELTA** — vitest-pool-workers `0.16.10` peers `vitest ^4.1.0`; 3.x is incompatible |
 | `typescript` | "caret 5.x" | `^5.7.0` (`5.9.3`) | match |
@@ -71,19 +71,19 @@ if a direct-RPC path (bypassing codemode) is added.
 
 > **DEPRECATED reference (P7).** The canonical executor is the scoped, role-ACL-gated Fluent app
 > (**D11** + D12), and `executor-install.mjs` now installs **only the global `x_mcp_verify`
-> helper** by default. The un-ACL'd global-REST endpoint below is gated OFF behind
-> `X_MCP_INSTALL_GLOBAL_REST=1` and kept only as a non-SDK reference. Findings observed here
-> (numeric namespace, no custom tables via Table API, cross-engine HMAC) remain accurate.
+> helper** by default. The un-ACL'd global-REST endpoint and its old env escape hatch were
+> removed; the notes below remain only as historical observations about the old REST-based
+> install path.
 
 - **Global-scope Scripted REST APIs get an auto-generated NUMERIC namespace.** The endpoint
   is `/api/1793136/x_mcp/executor/run`, not `/api/x_mcp/...`. The host executor path is now
-  configurable (`SNOW_EXECUTOR_PATH`); the scriptedRest denylist (B2) matches `/executor/` at
-  any depth.
+  configurable (`SNOW_EXECUTOR_PATH`); no generic host `scriptedRest` adapter exists in the
+  Worker runtime.
 - **Custom tables cannot be created via the Table API.** POSTing `sys_db_object` returns 201
   but no physical table forms (`GlideRecord.insert() - invalid table name`). The REST-based
   install therefore uses `syslog` (audit, JSON message) + `sys_user_preference` (nonce). The
-  PRODUCTION scoped app ships the dedicated `x_mcp_audit_log` + `x_mcp_nonce` tables, the
-  `x_mcp.executor` role, and the REST_Endpoint ACL via a **Studio update set** (plan §10).
+  PRODUCTION scoped app ships the dedicated `x_1793136_mcp_audit_log` + `x_1793136_mcp_nonce`
+  tables, the `x_1793136_mcp.executor` role, and the REST_Endpoint ACL via the Fluent app (D11).
 - **B1 cross-engine HMAC confirmed:** `GlideCertificateEncryption.generateMac(key,'HmacSHA256',data)`
   with a base64 key matches host WebCrypto `HMAC-SHA256` over the ASCII-only canonical payload.
 - **Executor governance flag:** the REST install sets `requires_acl_authorization:false`, so
@@ -102,10 +102,10 @@ host+executor redeploy; see D12.) Findings:
 
 - **`new Function` (eval) and `GlideCertificateEncryption` are GLOBAL-only** — neither is
   allowed in a scoped application. So the executor's CORE (verify + eval) must live in global
-  scope; the scoped app is a **role-gated REST wrapper that DELEGATES** to the global
-  `x_mcp_verify.run()` (exactly the plan's §0.13a "global verification Script Include exposed
-  to the scope"). This is the correct production architecture — recorded because the plan's
-  §10 implies a self-contained scoped executor, which ServiceNow does not permit.
+  scope; the scoped app is a **role-gated REST wrapper that calls** global `x_mcp_verify.verify()`,
+  consumes the scoped nonce, then calls `x_mcp_verify.execute()`. This is the correct production
+  architecture — recorded because the plan's §10 implies a self-contained scoped executor, which
+  ServiceNow does not permit.
 - **Cross-scope call:** `new global.x_mcp_verify()` is required at runtime, but the SDK linter
   flags `global` as a Node.js builtin (`no-unsupported-node-builtins`) — suppress with
   `// eslint-disable-next-line no-unsupported-node-builtins`. `gs.include()` alone does not
@@ -117,8 +117,8 @@ host+executor redeploy; see D12.) Findings:
   403 needs a non-admin caller. The ACL + role + `enforce_acl` config is verified instead.
 - `now-sdk` env-var CI auth: `SN_SDK_AUTH_TYPE`, `SN_SDK_USER`, `SN_SDK_USER_PWD`, etc.
 
-The `update-set/x_mcp.xml` scaffold is superseded by the Fluent project (kept as a reference
-for non-SDK environments).
+The old update-set/scripted-REST scaffold is superseded by the Fluent project and removed from
+source to avoid accidental installation of a stale executor path.
 
 ## D12 — Hardening deltas (P0–P7, `harden/code-review-closeout`)
 
@@ -130,7 +130,7 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
   the host `auth/actor.ts` `CANONICAL_KEYS` and to every executor core's `_canonical` (6 keys:
   `email, sys_id, instance, request_id, script_sha256, issued_at, nonce, reason`). `signActor`
   accepts it; `rpc.ts` `runServerScript` signs the **host** tool-level `reason` (validated, not
-  the snippet-supplied body) and the unsigned top-level `body.reason` is dropped — so the audited
+  a snippet-controlled value) and the unsigned top-level `body.reason` is dropped — so the audited
   justification can't be forged independent of the HMAC. Byte-identical canonical output verified
   across the host signer + all 3 executor cores via a Node harness.
 - **Instance claim enforced (executor).** The verifier rejects a payload whose signed
@@ -148,7 +148,7 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
   the CONCURRENT one-200/one-401 case). now-sdk 4.7.1 creates the physical index but omits the
   `sys_index` catalog row — index enforces while `sys_index` reads empty; verify functionally.
 - **`executor-install.mjs` = global verify()/execute()/run() CORE + properties ONLY (no tables,
-  no REST endpoint).** The opt-in global-REST install path (formerly `X_MCP_INSTALL_GLOBAL_REST=1`)
+  no REST endpoint).** The opt-in global-REST install path
   was **REMOVED** in the M-4 remediation (2026-05-31) — it reproduced the incident's un-ACL'd
   global-executor shape. The canonical surface is the scoped, role-ACL-gated Fluent REST at the
   two-segment path **`/api/x_1793136_mcp/x_mcp/executor/run`**.
@@ -173,23 +173,21 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
 - **Host-attested error codes (P2).** `structuredContent.code` derives only from monotonic host
   signals (`budget_exceeded`/`reauth_required`); a forged `[[code]]` in a sandbox throw collapses
   to `run_error`. `truncateUtf8` replaces the UTF-16 `json.slice` (byte-safe output).
-- **Opt-in posture (P4/P5/P6b).** The restrictive ActorPolicy (`ACTOR_POLICY_*`), the
-  second-approval gate (`ADMIN_SCRIPT_*`), and recovery snapshots (`SNAPSHOT_ENABLED_TABLES`) are
-  ALL **opt-in** — with the relevant vars unset, the single-operator behavior is preserved.
-  Mutations, however, now **hard-require** a tool-level `idempotencyKey` (fail-closed, not opt-in).
+- **Opt-in posture (P4/P5/P6b).** The restrictive ActorPolicy (`ACTOR_POLICY_*`) and recovery
+  snapshots (`SNAPSHOT_ENABLED_TABLES`) are opt-in, but the `admin_script` second-approval gate is
+  fail-closed: empty `ADMIN_SCRIPT_*` settings deny `admin_script`. Mutations also hard-require a
+  tool-level `idempotencyKey` (fail-closed, not opt-in).
 
-## D13 — Deferred-but-available (documented, no speculative code)
+## D13 — Deferred Without Speculative Code
 
-Per the plan's "Deferred" section — kept as tested helpers, wired only when the trigger exists:
+Per the plan's "Deferred" section, future-only adapters stay out of source until the trigger exists:
 
-- **B2 `scriptedRest` denylist (`sn/scripted-rest-denylist.ts`).** No generic `scriptedRest`
-  RPC method exists today, so wiring the guard would protect nothing. The tested helper is kept
-  (`url-and-path-guards.test.ts`); wire it when such a method is added. **Available-but-unwired by
-  design** (finding: B2).
-- **B7 keyset `paginate` (`sn/pagination.ts`).** `tableQuery` already returns an honest `partial`
-  flag, so a stall/skip is visible without keyset pagination. Wire only if live P8 testing under
-  the restrictive policy surfaces ACL blank-page stalls; otherwise **available-but-unwired**
-  (finding: B7).
+- **B2 generic `scriptedRest`.** No generic `scriptedRest` RPC method exists today, so a path
+  denylist module would protect nothing. Add the denylist with the adapter if that surface is
+  introduced.
+- **B7 keyset pagination.** `tableQuery` already returns an honest `partial` flag, so a stall/skip
+  is visible without keyset pagination. Add keyset pagination with the production caller if live
+  P8 testing under the restrictive policy surfaces ACL blank-page stalls.
 
 ## Open / deferred
 

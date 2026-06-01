@@ -12,6 +12,7 @@
 
 import { hmacSha256Base64 } from "./actor.js";
 import { deriveKeyBytes } from "./crypto.js";
+import { base64UrlToString, bytesToBase64Url, constantTimeEqualAscii } from "./encoding.js";
 
 /** Domain-separation prefix so this signature can never be confused with another use of the
  *  same host secret (e.g. Alchemy state, OAuthProvider internals). */
@@ -26,17 +27,6 @@ export interface ReauthTicket {
 
 const enc = new TextEncoder();
 
-function b64urlEncode(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]!);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function b64urlDecodeToString(s: string): string {
-  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
-  return atob(b64);
-}
-
 /** The canonical bytes that get HMAC'd: a domain prefix + the base64url JSON payload. */
 function canonical(payloadB64Url: string): string {
   return TICKET_CONTEXT + payloadB64Url;
@@ -49,9 +39,9 @@ function canonical(payloadB64Url: string): string {
  */
 export async function mintTicket(ticket: ReauthTicket, secret: string): Promise<string> {
   const keyBytes = await deriveKeyBytes(secret);
-  const payloadB64Url = b64urlEncode(enc.encode(JSON.stringify(ticket)));
+  const payloadB64Url = bytesToBase64Url(enc.encode(JSON.stringify(ticket)));
   const sig = await hmacSha256Base64(canonical(payloadB64Url), keyBytes);
-  return `${payloadB64Url}.${b64urlEncode(enc.encode(sig))}`;
+  return `${payloadB64Url}.${bytesToBase64Url(enc.encode(sig))}`;
 }
 
 /**
@@ -68,22 +58,20 @@ export async function verifyTicket(token: string, secret: string, now: number): 
   const expectedSig = await hmacSha256Base64(canonical(payloadB64Url), keyBytes);
   let presentedSig: string;
   try {
-    presentedSig = b64urlDecodeToString(sigPart);
+    presentedSig = base64UrlToString(sigPart);
   } catch {
     return null;
   }
   // Constant-time-ish compare of the base64 signatures.
-  if (presentedSig.length !== expectedSig.length) return null;
-  let diff = 0;
-  for (let i = 0; i < expectedSig.length; i++) diff |= presentedSig.charCodeAt(i) ^ expectedSig.charCodeAt(i);
-  if (diff !== 0) return null;
+  if (!constantTimeEqualAscii(presentedSig, expectedSig)) return null;
   let ticket: ReauthTicket;
   try {
-    ticket = JSON.parse(b64urlDecodeToString(payloadB64Url)) as ReauthTicket;
+    ticket = JSON.parse(base64UrlToString(payloadB64Url)) as ReauthTicket;
   } catch {
     return null;
   }
   if (typeof ticket.exp !== "number" || now > ticket.exp) return null;
-  if (typeof ticket.userId !== "string" || typeof ticket.instanceHost !== "string") return null;
+  if (typeof ticket.userId !== "string" || typeof ticket.instanceHost !== "string" || typeof ticket.nonce !== "string") return null;
+  if (!ticket.userId || !ticket.instanceHost || !ticket.nonce) return null;
   return ticket;
 }

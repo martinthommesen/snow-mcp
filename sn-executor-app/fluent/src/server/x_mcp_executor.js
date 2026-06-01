@@ -39,6 +39,7 @@ function utf8Slice(s, maxBytes) {
 ;(function process(request, response) {
     var body = request.body.data || {}
     var code = String(body.script || '')
+    var codeBytes = utf8Len(code)
     var actor = body.actor || {}
     var sig = String(body.actor_sig || '')
 
@@ -52,7 +53,7 @@ function utf8Slice(s, maxBytes) {
     audit.request_id = String(actor.request_id || '')
     audit.actor_verified = false
     audit.code_hash = new GlideDigest().getSHA256Base64(code)
-    audit.code_size = utf8Len(code)
+    audit.code_size = codeBytes
     audit.started_at = start
     audit.status = 'running'
     var auditId = audit.insert()
@@ -81,8 +82,7 @@ function utf8Slice(s, maxBytes) {
     }
 
     var maxB = parseInt(gs.getProperty('x_1793136_mcp.executor.max_bytes', '32768'), 10)
-    var bytes = utf8Len(code)
-    if (bytes === 0 || bytes > maxB) {
+    if (codeBytes === 0 || codeBytes > maxB) {
         audit.status = 'error'
         audit.error_class = 'code_size'
         audit.update()
@@ -106,10 +106,12 @@ function utf8Slice(s, maxBytes) {
     //   verify() (no nonce, no eval) -> INSERT-as-arbiter nonce -> execute().
     // The try/catch around verify() is defense-in-depth (finding 31): if verify ever throws, close
     // the audit row to 'rejected' + 401 instead of leaving it stuck 'running' with a 500.
+    var core
     var v
     try {
         // eslint-disable-next-line no-unsupported-node-builtins
-        v = new global.x_mcp_verify().verify(code, actor, sig)
+        core = new global.x_mcp_verify()
+        v = core.verify(code, actor, sig)
     } catch (re) {
         audit.status = 'rejected'
         audit.error_class = 'verify_failed'
@@ -170,11 +172,11 @@ function utf8Slice(s, maxBytes) {
     // EXECUTE the verified script (eval is global-only). execute() catches internally and never
     // throws, so the audit row always closes below — no 'running'-stuck row on the execute path.
     var out
-    // eslint-disable-next-line no-unsupported-node-builtins
-    out = new global.x_mcp_verify().execute(code)
+    out = core.execute(code)
     var err = out.error
     var status = err ? 'error' : 'ok'
     var serialized = out.serialized
+    var serializedBytes = serialized ? utf8Len(serialized) : 0
     var maxOut = parseInt(gs.getProperty('x_1793136_mcp.executor.max_output_bytes', '65536'), 10)
     function closeAudit(st, ob) {
         audit.status = st
@@ -184,15 +186,15 @@ function utf8Slice(s, maxBytes) {
         audit.update()
     }
 
-    if (serialized && utf8Len(serialized) > maxOut) {
+    if (serialized && serializedBytes > maxOut) {
         if (status === 'ok') status = 'truncated'
-        closeAudit(status, utf8Len(serialized))
+        closeAudit(status, serializedBytes)
         response.setStatus(200)
         // Byte-safe truncation (plan §P7 item 4): never split a UTF-8 sequence on a byte cap.
         response.setBody({ ok: !err, result: null, result_sample: utf8Slice(serialized, maxOut), truncated: true, error: err, audit_id: auditId + '' })
         return
     }
-    closeAudit(status, serialized ? utf8Len(serialized) : 0)
+    closeAudit(status, serializedBytes)
     response.setStatus(err ? 500 : 200)
     response.setBody({ ok: !err, result: err || serialized == null ? null : JSON.parse(serialized), truncated: false, error: err, audit_id: auditId + '' })
 })(request, response)

@@ -34,6 +34,14 @@ const DIMENSIONS: readonly BudgetDimension[] = [
   "bytesReturned",
 ];
 
+function dimensionKey(dimension: BudgetDimension): string {
+  return `dim:${dimension}`;
+}
+
+function requestedDimensions(req: ReserveRequest): BudgetDimension[] {
+  return DIMENSIONS.filter((d) => (req[d] ?? 0) > 0);
+}
+
 export class BudgetDO extends DurableObject {
   /** Daily caps (from config; overridable for tests via the constructor env later). */
   private caps(): Record<BudgetDimension, number> {
@@ -76,8 +84,14 @@ export class BudgetDO extends DurableObject {
 
   private async reserveCritical(req: ReserveRequest, capOverride?: Partial<Record<BudgetDimension, number>>, userId?: string): Promise<ReserveResult> {
     const caps = { ...this.caps(), ...(capOverride ?? {}) };
+    const incremented = requestedDimensions(req);
+    const userKeys = userId ? incremented.map((d) => this.userKey(userId, d)) : [];
+    const stored = await this.ctx.storage.get<number>([
+      ...DIMENSIONS.map(dimensionKey),
+      ...userKeys,
+    ]);
     const current: Record<BudgetDimension, number> = {} as Record<BudgetDimension, number>;
-    for (const d of DIMENSIONS) current[d] = (await this.ctx.storage.get<number>(`dim:${d}`)) ?? 0;
+    for (const d of DIMENSIONS) current[d] = stored.get(dimensionKey(d)) ?? 0;
 
     // Daily ADMISSION check (§P5): these dimensions are accrued POST-run (the reserve loop below
     // skips 0-increment dimensions, so it never sees them). Deny the next run if the day is already
@@ -97,12 +111,17 @@ export class BudgetDO extends DurableObject {
     }
     // Commit — GLOBAL counters, and (when a userId is given) the per-user view, both inside
     // this single input gate (no cross-DO atomicity gap; shared-fate note at top of file).
-    for (const d of DIMENSIONS) {
-      const inc = req[d] ?? 0;
-      if (inc > 0) {
-        await this.ctx.storage.put(`dim:${d}`, current[d] + inc);
-        if (userId) await this.bumpUser(userId, d, inc);
+    const updates: Record<string, number> = {};
+    for (const d of incremented) {
+      const inc = req[d]!;
+      updates[dimensionKey(d)] = current[d] + inc;
+      if (userId) {
+        const key = this.userKey(userId, d);
+        updates[key] = (stored.get(key) ?? 0) + inc;
       }
+    }
+    if (Object.keys(updates).length > 0) {
+      await this.ctx.storage.put(updates);
     }
     return { ok: true };
   }
@@ -110,11 +129,6 @@ export class BudgetDO extends DurableObject {
   /** Per-user counter key (§P5): isolated tally per (userId, dimension). */
   private userKey(userId: string, dimension: string): string {
     return `user:${userId}:${dimension}`;
-  }
-
-  private async bumpUser(userId: string, dimension: string, n: number): Promise<void> {
-    const cur = (await this.ctx.storage.get<number>(this.userKey(userId, dimension))) ?? 0;
-    await this.ctx.storage.put(this.userKey(userId, dimension), cur + n);
   }
 
   /**
@@ -139,17 +153,28 @@ export class BudgetDO extends DurableObject {
   }
 
   private async incrementCritical(req: ReserveRequest, userId?: string): Promise<void> {
-    for (const d of DIMENSIONS) {
-      const inc = req[d] ?? 0;
-      if (inc <= 0) continue;
-      const cur = (await this.ctx.storage.get<number>(`dim:${d}`)) ?? 0;
-      await this.ctx.storage.put(`dim:${d}`, cur + inc);
-      if (userId) await this.bumpUser(userId, d, inc);
+    const incremented = requestedDimensions(req);
+    if (incremented.length === 0) return;
+    const userKeys = userId ? incremented.map((d) => this.userKey(userId, d)) : [];
+    const stored = await this.ctx.storage.get<number>([
+      ...incremented.map(dimensionKey),
+      ...userKeys,
+    ]);
+    const updates: Record<string, number> = {};
+    for (const d of incremented) {
+      const inc = req[d]!;
+      const globalKey = dimensionKey(d);
+      updates[globalKey] = (stored.get(globalKey) ?? 0) + inc;
+      if (userId) {
+        const key = this.userKey(userId, d);
+        updates[key] = (stored.get(key) ?? 0) + inc;
+      }
     }
+    await this.ctx.storage.put(updates);
   }
 
   async get(dimension: BudgetDimension): Promise<number> {
-    return (await this.ctx.storage.get<number>(`dim:${dimension}`)) ?? 0;
+    return (await this.ctx.storage.get<number>(dimensionKey(dimension))) ?? 0;
   }
 
   /** Per-user accrued total for one dimension (isolation/visibility, §P5). */
@@ -158,8 +183,9 @@ export class BudgetDO extends DurableObject {
   }
 
   async snapshot(): Promise<Record<BudgetDimension, number>> {
+    const stored = await this.ctx.storage.get<number>(DIMENSIONS.map(dimensionKey));
     const out: Record<BudgetDimension, number> = {} as Record<BudgetDimension, number>;
-    for (const d of DIMENSIONS) out[d] = (await this.ctx.storage.get<number>(`dim:${d}`)) ?? 0;
+    for (const d of DIMENSIONS) out[d] = stored.get(dimensionKey(d)) ?? 0;
     return out;
   }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveEffectiveMode, DEFAULT_MODE } from "../src/authz/effective-mode.js";
+import { resolveEffectiveMode, DEFAULT_MODE, parseMaxMode } from "../src/authz/effective-mode.js";
 import type { Mode } from "@servicenow-codemode/shared";
 
 // ─── Phase 0.13b — effective-mode proof (hard-stop gate; B3/B4) ───────────────
@@ -101,5 +101,22 @@ describe("Phase P6a — unknown mode fails CLOSED (denied, never widened)", () =
 
   it("still resolves valid admin_script (no regression)", () => {
     expect(resolveEffectiveMode("admin_script", allCeilings)).toEqual({ ok: true, effective: "admin_script" });
+  });
+});
+
+describe("Phase P5 — env mode ceiling parser", () => {
+  it("preserves the unset ceiling as scope-is-the-cap", () => {
+    expect(parseMaxMode(undefined)).toBe("admin_script");
+  });
+
+  it("accepts exact valid modes", () => {
+    expect(parseMaxMode("read_only")).toBe("read_only");
+    expect(parseMaxMode("write")).toBe("write");
+    expect(parseMaxMode("admin_script")).toBe("admin_script");
+  });
+
+  it("fails closed for invalid or prototype-key values", () => {
+    expect(parseMaxMode("read-only")).toBe("read_only");
+    expect(parseMaxMode("constructor")).toBe("read_only");
   });
 });

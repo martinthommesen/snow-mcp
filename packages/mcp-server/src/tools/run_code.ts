@@ -11,6 +11,7 @@ import { createExecutor, executeSnippet } from "../sandbox/executor.js";
 import { serializeResult, utf8Len, capLogs } from "../sandbox/serialize.js";
 import { SIZE_LIMITS } from "../config.js";
 import { McpToolError, toToolResult, parseSandboxError } from "../sn/errors.js";
+import { validateIdempotencyKey, validateReason } from "../sn/validate.js";
 import type { ServiceNowRPC } from "../sn/rpc.js";
 import type { RunContext } from "../sn/mutation-guard.js";
 import { RunBudget } from "../sn/run-budget.js";
@@ -21,6 +22,7 @@ export interface RunCodeInput {
   mode?: Mode;
   reason?: string;
   idempotencyKey?: string;
+  approvalToken?: string;
 }
 
 export interface RunCodeDeps {
@@ -94,6 +96,8 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
     if (effectiveMode === "admin_script" && !input.reason?.trim()) {
       throw new McpToolError("capability_denied", "admin_script requires a non-empty `reason`.");
     }
+    const reason = input.reason !== undefined ? validateReason(input.reason) : undefined;
+    const runKey = input.idempotencyKey !== undefined ? validateIdempotencyKey(input.idempotencyKey) : undefined;
 
     // 2.6) per-user auth preflight (§6b). Must precede the daily reserve + executor so a
     //      per_user_oauth caller with no usable ServiceNow token reauths BEFORE any billable
@@ -128,13 +132,14 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
 
     // 4) execute (ActorPolicy + capability + per-run budget enforced inside the RPC).
     //    The per-run context carries host-authoritative values (a host-minted requestId,
-    //    the tool-level reason, and the tool-level idempotencyKey = the runKey). The
-    //    mutating/executor RPC methods hard-require the runKey (§P4) and ignore any
-    //    snippet-supplied per-call idempotency key for the ledger key.
+    //    the tool-level reason, the tool-level idempotencyKey = the runKey, and any
+    //    host-level approvalToken). The mutating/executor RPC methods hard-require the
+    //    runKey (§P4); snippet calls no longer carry per-call idempotency or reason fields.
     const runContext: RunContext = {
       requestId: crypto.randomUUID(),
-      ...(input.reason !== undefined ? { reason: input.reason } : {}),
-      ...(input.idempotencyKey !== undefined ? { runKey: input.idempotencyKey } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+      ...(runKey !== undefined ? { runKey } : {}),
+      ...(input.approvalToken !== undefined ? { approvalToken: input.approvalToken } : {}),
     };
     runBudget = deps.makeRunBudget?.() ?? new RunBudget();
     const rpc = deps.buildRpc(effectiveMode, runBudget, runContext);

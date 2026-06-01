@@ -1,8 +1,4 @@
-// Shared types used across the host Worker and (eventually) the stdio shim.
-// Kept dependency-free so both runtimes can import it.
-
-/** ServiceNow credential mode (plan §2.0). */
-export type ServiceNowCredentialMode = "integration_user" | "per_user_oauth";
+// Shared types used across the host Worker and tests. Kept dependency-free.
 
 /** run_code execution mode, ordered by risk: read_only < write < admin_script (plan §2.0.1). */
 export type Mode = "read_only" | "write" | "admin_script";

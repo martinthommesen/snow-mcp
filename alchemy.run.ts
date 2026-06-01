@@ -65,23 +65,43 @@ export const worker = await Worker("servicenow-codemode-mcp", {
 
     // Non-sensitive config (plain bindings)
     SNOW_INSTANCE_HOST: reqEnv("SNOW_INSTANCE_HOST"),
+    ...(process.env.ALLOWED_ORIGINS ? { ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS } : {}),
+    ...(process.env.WORKER_PUBLIC_ORIGIN ? { WORKER_PUBLIC_ORIGIN: process.env.WORKER_PUBLIC_ORIGIN } : {}),
     ...(process.env.SNOW_OAUTH_CLIENT_ID ? { SNOW_OAUTH_CLIENT_ID: process.env.SNOW_OAUTH_CLIENT_ID } : {}),
     ...(process.env.SNOW_EXECUTOR_PATH ? { SNOW_EXECUTOR_PATH: process.env.SNOW_EXECUTOR_PATH } : {}),
+    ...(process.env.MCP_OPERATOR_USER_ID ? { MCP_OPERATOR_USER_ID: process.env.MCP_OPERATOR_USER_ID } : {}),
+    ...(process.env.MCP_OPERATOR_EMAIL ? { MCP_OPERATOR_EMAIL: process.env.MCP_OPERATOR_EMAIL } : {}),
+    ...(process.env.MCP_OPERATOR_ACCESS_GROUPS ? { MCP_OPERATOR_ACCESS_GROUPS: process.env.MCP_OPERATOR_ACCESS_GROUPS } : {}),
+    ...(process.env.SNAPSHOT_ENABLED_TABLES ? { SNAPSHOT_ENABLED_TABLES: process.env.SNAPSHOT_ENABLED_TABLES } : {}),
+    ...(process.env.ADMIN_SCRIPT_ALLOWLIST ? { ADMIN_SCRIPT_ALLOWLIST: process.env.ADMIN_SCRIPT_ALLOWLIST } : {}),
+    ...(process.env.ADMIN_SCRIPT_REQUIRED_GROUP ? { ADMIN_SCRIPT_REQUIRED_GROUP: process.env.ADMIN_SCRIPT_REQUIRED_GROUP } : {}),
+    ...(process.env.ACTOR_POLICY_TABLE_ALLOWLIST ? { ACTOR_POLICY_TABLE_ALLOWLIST: process.env.ACTOR_POLICY_TABLE_ALLOWLIST } : {}),
+    ...(process.env.ACTOR_POLICY_FIELD_MASKS ? { ACTOR_POLICY_FIELD_MASKS: process.env.ACTOR_POLICY_FIELD_MASKS } : {}),
+    ...(process.env.ACTOR_POLICY_ROW_FILTERS ? { ACTOR_POLICY_ROW_FILTERS: process.env.ACTOR_POLICY_ROW_FILTERS } : {}),
+    ...(process.env.ACTOR_POLICY_MAX_ROWS_PER_RUN ? { ACTOR_POLICY_MAX_ROWS_PER_RUN: process.env.ACTOR_POLICY_MAX_ROWS_PER_RUN } : {}),
+    ...(process.env.ACTOR_POLICY_MAX_BYTES_PER_RUN ? { ACTOR_POLICY_MAX_BYTES_PER_RUN: process.env.ACTOR_POLICY_MAX_BYTES_PER_RUN } : {}),
+    ...(process.env.ACTOR_POLICY_MAX_MODE ? { ACTOR_POLICY_MAX_MODE: process.env.ACTOR_POLICY_MAX_MODE } : {}),
     // Optional config knobs (P0; consumed in P5/P6). Plain bindings, never required.
     ...(process.env.SERVICENOW_CREDENTIAL_MODE ? { SERVICENOW_CREDENTIAL_MODE: process.env.SERVICENOW_CREDENTIAL_MODE } : {}),
     ...(process.env.ALLOW_LOCALHOST ? { ALLOW_LOCALHOST: process.env.ALLOW_LOCALHOST } : {}),
     ...(process.env.TENANT_MAX_MODE ? { TENANT_MAX_MODE: process.env.TENANT_MAX_MODE } : {}),
     ...(process.env.INSTANCE_MAX_MODE ? { INSTANCE_MAX_MODE: process.env.INSTANCE_MAX_MODE } : {}),
+    ...(process.env.SNOW_DEV_ROPC ? { SNOW_DEV_ROPC: process.env.SNOW_DEV_ROPC } : {}),
 
     // Secrets (encrypted in Alchemy state; uploaded as Worker secrets)
     MCP_OPERATOR_SECRET: alchemy.secret(reqEnv("MCP_OPERATOR_SECRET")),
-    SNOW_DEV_ROPC_USERNAME: alchemy.secret(reqEnv("SNOW_DEV_ROPC_USERNAME")),
-    SNOW_DEV_ROPC_PASSWORD: alchemy.secret(reqEnv("SNOW_DEV_ROPC_PASSWORD")),
+    ...(process.env.SNOW_DEV_ROPC === "1"
+      ? {
+          SNOW_DEV_ROPC_USERNAME: alchemy.secret(reqEnv("SNOW_DEV_ROPC_USERNAME")),
+          SNOW_DEV_ROPC_PASSWORD: alchemy.secret(reqEnv("SNOW_DEV_ROPC_PASSWORD")),
+        }
+      : {}),
     X_MCP_EXECUTOR_HMAC_KEY: alchemy.secret(reqEnv("X_MCP_EXECUTOR_HMAC_KEY")),
     TOKEN_KEK: alchemy.secret(reqEnv("TOKEN_KEK")),
     OAUTH_PROVIDER_SECRET: alchemy.secret(reqEnv("OAUTH_PROVIDER_SECRET")),
     ...(process.env.SNAPSHOT_KEK ? { SNAPSHOT_KEK: alchemy.secret(process.env.SNAPSHOT_KEK) } : {}),
     ...(process.env.SNOW_OAUTH_CLIENT_SECRET ? { SNOW_OAUTH_CLIENT_SECRET: alchemy.secret(process.env.SNOW_OAUTH_CLIENT_SECRET) } : {}),
+    ...(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS ? { ADMIN_SCRIPT_APPROVAL_TOKENS: alchemy.secret(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS) } : {}),
     // Versioned KEK ring (P3). Optional until P3 provisions them; never reqEnv yet so the
     // deploy doesn't break before they exist. P3 flips its own secret to required at its gate.
     ...(process.env.TOKEN_KEK_CURRENT ? { TOKEN_KEK_CURRENT: alchemy.secret(process.env.TOKEN_KEK_CURRENT) } : {}),

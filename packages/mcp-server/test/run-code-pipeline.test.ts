@@ -56,7 +56,7 @@ const SIGNING = {
 
 function deps(opts: {
   scope?: Mode; tenant?: Mode; instance?: Mode; policy?: ActorPolicy; http?: MockHttp;
-  makeRunBudget?: () => RunBudget; signing?: boolean;
+  makeRunBudget?: () => RunBudget; signing?: boolean; mutation?: boolean;
 }): RunCodeDeps {
   const http = opts.http ?? new MockHttp();
   const policy = opts.policy ?? permissivePolicy([INSTANCE]);
@@ -67,10 +67,24 @@ function deps(opts: {
     instanceMaxMode: opts.instance ?? "admin_script",
     timeoutMs: 5000,
     ...(opts.makeRunBudget ? { makeRunBudget: opts.makeRunBudget } : {}),
-    buildRpc: (effectiveMode, runBudget: RunBudget) =>
+    buildRpc: (effectiveMode, runBudget: RunBudget, runContext) =>
       new ServiceNowRPC({
         http, instanceHost: INSTANCE, effectiveMode, actorPolicy: policy, runBudget,
         ...(opts.signing ? { signing: SIGNING, executorPath: "/api/x_mcp/executor/run" } : {}),
+        ...(opts.mutation
+          ? {
+              mutation: {
+                runContext,
+                identity: { mcpActorUserId: SIGNING.claims.mcp_actor_user_id },
+                now: () => 1_700_000_000_000,
+                approval: {
+                  adminScriptAllowlist: [SIGNING.claims.mcp_actor_user_id],
+                  requiredAccessGroup: "mcp-admins",
+                  actorAccessGroups: ["mcp-admins"],
+                },
+              },
+            }
+          : {}),
       }),
   };
 }
@@ -99,7 +113,7 @@ describe("Phase 4 — run_code pipeline", () => {
     const res = await runCode(
       // sys_id is a valid 32-hex id so P1 input validation passes and the run reaches
       // the capability gate (the actual subject of this test).
-      { code: `async () => { await servicenow.tableUpdate({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fields: { state: 2 }, idempotencyKey: "k1" }); return "did-write"; }` },
+      { code: `async () => { await servicenow.tableUpdate({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fields: { state: 2 } }); return "did-write"; }` },
       deps({ scope: "read_only", tenant: "read_only", instance: "read_only" }),
     );
     expect(res.isError).toBe(true);
@@ -179,6 +193,15 @@ describe("Phase 4 — run_code pipeline", () => {
     );
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("capability_denied");
+  });
+
+  it("rejects a malformed tool-level idempotencyKey before sandbox execution", async () => {
+    const res = await runCode(
+      { code: `async () => 1`, mode: "write", idempotencyKey: "bad key with spaces" },
+      deps({ scope: "write", tenant: "write", instance: "write" }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("path_denied");
   });
 
   it("daily budget reserve-before-load blocks BEFORE transpile (no billable Worker)", async () => {
@@ -279,16 +302,21 @@ describe("Phase 4 — run_code pipeline", () => {
     expect(res.structuredContent?.error).toContain("my own problem");
   });
 
-  it("§P4 — threads a host-authoritative runContext (requestId + tool-level reason/idempotencyKey) into buildRpc", async () => {
+  it("§P4 — threads a host-authoritative runContext (requestId + tool-level reason/idempotencyKey/approvalToken) into buildRpc", async () => {
     // The mutating/executor RPC methods need host-seen values, not snippet-supplied ones.
-    let seen: { requestId?: string; reason?: string; runKey?: string } | undefined;
+    let seen: { requestId?: string; reason?: string; runKey?: string; approvalToken?: string } | undefined;
     const base = deps({ scope: "admin_script", tenant: "admin_script", instance: "admin_script" });
     await runCode(
-      { code: `async () => 1`, mode: "admin_script", reason: "do the thing", idempotencyKey: "run-key-1" },
+      { code: `async () => 1`, mode: "admin_script", reason: "do the thing", idempotencyKey: "run-key-1", approvalToken: "approval-1" },
       {
         ...base,
         buildRpc: (effectiveMode, runBudget, runContext) => {
-          seen = { requestId: runContext.requestId, reason: runContext.reason, runKey: runContext.runKey };
+          seen = {
+            requestId: runContext.requestId,
+            reason: runContext.reason,
+            runKey: runContext.runKey,
+            approvalToken: runContext.approvalToken,
+          };
           return base.buildRpc(effectiveMode, runBudget, runContext);
         },
       },
@@ -297,6 +325,7 @@ describe("Phase 4 — run_code pipeline", () => {
     expect(seen?.requestId).not.toBe("run-key-1"); // NOT the tool key
     expect(seen?.reason).toBe("do the thing");
     expect(seen?.runKey).toBe("run-key-1");
+    expect(seen?.approvalToken).toBe("approval-1");
   });
 
   it("§P2 — multi-byte output near the cap stays valid UTF-8 and within maxOutputBytes", async () => {
@@ -444,16 +473,17 @@ describe("Phase 4 — run_code pipeline", () => {
   });
 
   it("§P5 — tableUpdate trips the per-run BYTE cap (host-attested budget_exceeded)", async () => {
-    // The unwired tableUpdate path (write mode, no mutation wiring) returns the PATCH result;
-    // a 1-byte cap trips on the response. This is the NEW byte-metering surface (FIX 4) — the
-    // last snippet-visible return that was previously not metered. Without it the run succeeds.
+    // The wired tableUpdate path returns the guarded PATCH result; a 1-byte cap trips on the
+    // response after the mutation safety layers resolve.
     const res = await runCode(
       {
-        code: `async () => { await servicenow.tableUpdate({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fields: { state: 2 }, idempotencyKey: "k1" }); return "done"; }`,
+        code: `async () => { await servicenow.tableUpdate({ table: "incident", sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fields: { state: 2 } }); return "done"; }`,
         mode: "write", // requested explicitly; default is read_only, which would capability-deny the write.
+        idempotencyKey: "k1",
       },
       deps({
         scope: "write", tenant: "write", instance: "write",
+        mutation: true,
         makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxBytes: 1 }),
       }),
     );
@@ -467,12 +497,14 @@ describe("Phase 4 — run_code pipeline", () => {
     // run reaches the send + byte-metering path; admin_script + tool-level reason are required).
     const res = await runCode(
       {
-        code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')", reason: "rotate", idempotencyKey: "k1" }); return "done"; }`,
+        code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')" }); return "done"; }`,
         mode: "admin_script",
         reason: "rotate keys",
+        idempotencyKey: "k1",
       },
       deps({
         scope: "admin_script", tenant: "admin_script", instance: "admin_script", signing: true,
+        mutation: true,
         makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxBytes: 1 }),
       }),
     );

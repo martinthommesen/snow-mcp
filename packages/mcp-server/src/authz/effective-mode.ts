@@ -8,7 +8,7 @@
 // approve `admin_script`: that additionally needs the allowlist + second-approval
 // gate (§3.5, Phase 7.9), layered on top of a successful resolution here.
 
-import { modeRisk, type Mode } from "@servicenow-codemode/shared";
+import { MODE_RISK, modeRisk, type Mode } from "@servicenow-codemode/shared";
 
 /** Plan §0.9 Decision 1 — default floor. Flip to widen for private/internal demos. */
 export const DEFAULT_MODE: Mode = "read_only";
@@ -34,6 +34,17 @@ export interface ModeCeilings {
   tenantMaxMode: Mode;
   /** Per-instance ceiling. */
   instanceMaxMode: Mode;
+}
+
+/**
+ * Parse an env-supplied mode ceiling (§P5). An UNSET var defaults to `admin_script`
+ * to preserve "scope is the cap" when no tenant/instance ceiling is configured. A
+ * value that IS SET yet is not a valid Mode fails closed to `read_only`; an operator
+ * typo on a security ceiling must never silently grant the widest access.
+ */
+export function parseMaxMode(value: string | undefined): Mode {
+  if (value === undefined) return "admin_script";
+  return Object.prototype.hasOwnProperty.call(MODE_RISK, value) ? (value as Mode) : "read_only";
 }
 
 export type EffectiveModeResult =

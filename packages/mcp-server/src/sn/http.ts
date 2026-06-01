@@ -7,7 +7,7 @@ import { canonicalizeInstanceHost, type InstanceAllowlist } from "./url-allowlis
 
 export interface SnRequest {
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
-  /** Relative `/api/...` path; validated against the denylist before use. */
+  /** Relative `/api/...` path; transport-level validation happens before use. */
   path: string;
   query?: Record<string, string>;
   body?: unknown;
@@ -49,11 +49,10 @@ export class SnFetchClient implements SnHttpClient {
   }
 
   async request(req: SnRequest): Promise<SnResponse> {
-    // Transport-level path safety only (no scheme/userinfo, must be /api/...). NOTE (L-1): the B2
-    // executor-bypass DENYLIST (scripted-rest-denylist.ts) is DEFINED BUT NOT YET WIRED — there is
-    // no generic `scriptedRest` RPC method today, so nothing routes through it. If a generic
-    // scripted-REST tool is ever added it MUST call checkScriptedRestPath(); the sanctioned
-    // runServerScript() path legitimately targets the executor endpoint and passes through here.
+    // Transport-level path safety only (no scheme/userinfo, must be /api/...).
+    // There is no generic scripted-REST RPC method today. If one is added, add its
+    // path-denylist policy with that adapter; runServerScript() legitimately targets
+    // the executor endpoint and passes through here.
     if (!req.path.startsWith("/api/") || req.path.includes("://") || req.path.includes("@")) {
       throw new Error(`unsafe ServiceNow path: ${req.path}`);
     }

@@ -5,6 +5,8 @@
 // The signing here is unit-verified locally; the AUTHORITATIVE verification lives on
 // ServiceNow (Script Include `x_mcp_verify`, Phase 0.13a/5.4a — blocked on a PDI).
 
+import { bytesToBase64, constantTimeEqualAscii } from "./encoding.js";
+
 export interface ActorClaims {
   mcp_actor_user_id: string;
   mcp_actor_email: string;
@@ -77,33 +79,34 @@ export function canonicalize(payload: SignedActorPayload): string {
 
 const enc = new TextEncoder();
 
-function b64(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]!);
-  return btoa(s);
-}
+const hmacKeys = new WeakMap<Uint8Array, Promise<CryptoKey>>();
 
 /** SHA-256(base64) of a string — used for script_sha256 (matches GlideDigest base64). */
 export async function sha256Base64(input: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", enc.encode(input) as BufferSource);
-  return b64(new Uint8Array(digest));
+  return bytesToBase64(new Uint8Array(digest));
 }
 
 async function hmacKey(keyBytes: Uint8Array): Promise<CryptoKey> {
-  return crypto.subtle.importKey(
-    "raw",
-    keyBytes as BufferSource,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"],
-  );
+  let key = hmacKeys.get(keyBytes);
+  if (!key) {
+    key = crypto.subtle.importKey(
+      "raw",
+      keyBytes as BufferSource,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign", "verify"],
+    );
+    hmacKeys.set(keyBytes, key);
+  }
+  return key;
 }
 
 /** Base64 HMAC-SHA256 of `canonical` under `keyBytes`. */
 export async function hmacSha256Base64(canonical: string, keyBytes: Uint8Array): Promise<string> {
   const key = await hmacKey(keyBytes);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(canonical) as BufferSource);
-  return b64(new Uint8Array(sig));
+  return bytesToBase64(new Uint8Array(sig));
 }
 
 export interface SignActorInput {
@@ -132,8 +135,8 @@ export async function signActor(input: SignActorInput): Promise<SignedActor> {
 
 /**
  * Host-side mirror of the executor's verification — used ONLY to unit-test the signing
- * logic and to support the optional stdio path. The AUTHORITATIVE verifier is the
- * in-scope ServiceNow Script Include; do not treat this as the security boundary.
+ * logic. The AUTHORITATIVE verifier is the in-scope ServiceNow Script Include; do not
+ * treat this as the security boundary.
  */
 export async function verifyActorSignatureLocal(
   signed: SignedActor,
@@ -146,8 +149,5 @@ export async function verifyActorSignatureLocal(
   if ((await sha256Base64(script)) !== signed.actor.script_sha256) return false;
   const expected = await hmacSha256Base64(canonicalize(signed.actor), keyBytes);
   // Constant-time-ish compare.
-  if (expected.length !== signed.actor_sig.length) return false;
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ signed.actor_sig.charCodeAt(i);
-  return diff === 0;
+  return constantTimeEqualAscii(expected, signed.actor_sig);
 }

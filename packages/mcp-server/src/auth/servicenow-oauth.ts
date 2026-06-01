@@ -5,6 +5,7 @@
 
 import type { SnTokens, TokenStore } from "./token-store.js";
 import { McpToolError } from "../sn/errors.js";
+import { bytesToBase64Url } from "./encoding.js";
 
 /** Which ServiceNow credential model the bearer is sourced from (P3 corrupt/missing branch). */
 export type CredentialMode = "per_user_oauth" | "integration_user";
@@ -18,6 +19,10 @@ export interface SnOAuthConfig {
   ropcPassword?: string;
   fetchImpl?: typeof fetch;
 }
+
+/** Re-resolve ServiceNow sys_id/roles periodically so cached schema and signed actors do not
+ *  trust role/principal metadata indefinitely after OAuth callback. */
+export const SN_PRINCIPAL_TTL_MS = 5 * 60 * 1000;
 
 interface TokenResponse {
   access_token?: string;
@@ -35,7 +40,11 @@ async function tokenRequest(cfg: SnOAuthConfig, params: Record<string, string>, 
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body: new URLSearchParams({ client_id: cfg.clientId, client_secret: cfg.clientSecret, ...params }).toString(),
+    redirect: "manual",
   });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`servicenow_oauth_failed: refusing to follow ${res.status} redirect from oauth_token.do`);
+  }
   const j = (await res.json().catch(() => ({}))) as TokenResponse;
   if (!j.access_token) throw new Error(`servicenow_oauth_failed: ${j.error ?? res.status} ${j.error_description ?? ""}`.trim());
   const tokens: SnTokens = { access_token: j.access_token };
@@ -46,6 +55,9 @@ async function tokenRequest(cfg: SnOAuthConfig, params: Record<string, string>, 
 
 /** ROPC grant (grant_type=password) — MFA-exempt dev/CI path, integration_user ONLY (§2.8). */
 export function ropcGrant(cfg: SnOAuthConfig, now: number): Promise<SnTokens> {
+  if (!cfg.ropcUsername || !cfg.ropcPassword) {
+    throw reauthRequired("ServiceNow ROPC is disabled or not configured.");
+  }
   return tokenRequest(cfg, { grant_type: "password", username: cfg.ropcUsername ?? "", password: cfg.ropcPassword ?? "" }, now);
 }
 
@@ -75,23 +87,32 @@ export function authorizationCodeGrant(
 
 const enc = new TextEncoder();
 
-function b64url(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]!);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
 /** Generate a PKCE verifier (high-entropy) + its S256 challenge (§6b). */
 export async function generatePkce(): Promise<{ verifier: string; challenge: string }> {
-  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const verifier = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(verifier) as BufferSource));
-  return { verifier, challenge: b64url(digest) };
+  return { verifier, challenge: bytesToBase64Url(digest) };
 }
 
 /** The ServiceNow principal (sys_id + roles) for the authenticated user (§6b). */
 export interface SnPrincipal {
   sys_id: string;
   roles: string[];
+}
+
+function hasFreshPrincipal(tokens: SnTokens | null, now: number): tokens is SnTokens & { sys_id: string } {
+  return Boolean(
+    tokens?.sys_id &&
+      tokens.principal_resolved_at !== undefined &&
+      tokens.principal_resolved_at <= now &&
+      now - tokens.principal_resolved_at <= SN_PRINCIPAL_TTL_MS,
+  );
+}
+
+function stampPrincipal(tokens: SnTokens, principal: SnPrincipal, now: number): void {
+  tokens.sys_id = principal.sys_id;
+  tokens.roles = principal.roles;
+  tokens.principal_resolved_at = now;
 }
 
 /**
@@ -117,15 +138,17 @@ export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string
   try {
     const meRes = await fetchImpl(
       `https://${cfg.instanceHost}/api/now/ui/user/current_user`,
-      { headers: auth },
+      { headers: auth, redirect: "manual" },
     );
+    if (meRes.status >= 300 && meRes.status < 400) return null;
     const me = (await meRes.json().catch(() => ({}))) as { result?: { user_sys_id?: string } };
     const sys_id = me.result?.user_sys_id;
     if (!sys_id) return null;
     const roleRes = await fetchImpl(
       `https://${cfg.instanceHost}/api/now/table/sys_user_has_role?sysparm_query=user=${encodeURIComponent(sys_id)}&sysparm_fields=role.name&sysparm_limit=200`,
-      { headers: auth },
+      { headers: auth, redirect: "manual" },
     );
+    if (roleRes.status >= 300 && roleRes.status < 400) return { sys_id, roles: [] };
     const rolesJson = (await roleRes.json().catch(() => ({}))) as { result?: Record<string, unknown>[] };
     const roles = (rolesJson.result ?? [])
       .map((r) => String(r["role.name"] ?? ""))
@@ -134,6 +157,35 @@ export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string
   } catch {
     return null; // principal resolution is best-effort; token is still usable.
   }
+}
+
+/**
+ * Return the stored per-user principal only while it is fresh; otherwise resolve it live with a
+ * current bearer and merge the sys_id/roles onto the latest stored token bundle. A failed live
+ * resolution returns null so callers can fail closed or bypass ACL-sensitive caches.
+ */
+export async function resolveStoredSnPrincipal(
+  cfg: SnOAuthConfig,
+  store: TokenStore,
+  now: number,
+  opts: { accessToken?: string; authorizeUrl?: string } = {},
+): Promise<SnPrincipal | null> {
+  const existing = await store.get("servicenow").catch(() => null);
+  if (hasFreshPrincipal(existing, now)) {
+    return { sys_id: existing.sys_id, roles: existing.roles ?? [] };
+  }
+
+  const accessToken = opts.accessToken ?? await getServiceNowBearer(cfg, store, now, "per_user_oauth", opts.authorizeUrl);
+  const principal = await resolveSnPrincipal(cfg, accessToken);
+  if (!principal) return null;
+
+  // Re-read before persisting so a concurrent refresh cannot be clobbered by stale token data.
+  const latest = await store.get("servicenow").catch(() => null);
+  if (latest) {
+    stampPrincipal(latest, principal, now);
+    await store.rotate("servicenow", latest);
+  }
+  return principal;
 }
 
 /** Raise `reauth_required`, attaching the host-HMAC ticket URL (P2 detail channel) when one
@@ -190,6 +242,7 @@ export async function getServiceNowBearer(
       if (!refreshed.refresh_token && existing.refresh_token) refreshed.refresh_token = existing.refresh_token;
       if (existing.sys_id) refreshed.sys_id = existing.sys_id;
       if (existing.roles) refreshed.roles = existing.roles;
+      if (existing.principal_resolved_at !== undefined) refreshed.principal_resolved_at = existing.principal_resolved_at;
       await store.rotate("servicenow", refreshed);
       return refreshed.access_token;
     } catch {

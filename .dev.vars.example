@@ -30,11 +30,13 @@ SERVICENOW_CREDENTIAL_MODE=""        # "per_user_oauth" | "integration_user" (de
 TENANT_MAX_MODE=""                   # mode ceiling: read_only | write | admin_script (default admin_script)
 INSTANCE_MAX_MODE=""                 # mode ceiling: read_only | write | admin_script (default admin_script)
 ALLOW_LOCALHOST=""                   # "true" to allow http://localhost Origin (dev only; default false)
+ALLOWED_ORIGINS=""                   # comma-separated allowed Origins for /mcp and auth-surface requests
+WORKER_PUBLIC_ORIGIN=""              # canonical https://<worker> origin; required for per_user_oauth redirect/ticket URLs
 
 # --- Recovery snapshots + second-approval gate (P4) ---
 SNAPSHOT_ENABLED_TABLES=""           # comma-separated tables that get before/after recovery snapshots (empty = none)
-# admin_script second-approval policy (§7.9). Leave ALL empty to preserve single-operator
-# behavior (gate skipped); set ANY to ENFORCE (admin_script without a valid token/group denied).
+# admin_script second-approval policy (§7.9). Empty settings deny admin_script; configure an
+# allowlisted actor plus either a valid approval token or a required access group to permit it.
 ADMIN_SCRIPT_ALLOWLIST=""            # comma-separated actor userIds permitted admin_script
 ADMIN_SCRIPT_APPROVAL_TOKENS=""      # comma-separated valid approval tokens
 ADMIN_SCRIPT_REQUIRED_GROUP=""       # required access-group name (token OR group satisfies the second approval)
@@ -52,11 +54,14 @@ ADMIN_SCRIPT_REQUIRED_GROUP=""       # required access-group name (token OR grou
 # ACTOR_POLICY_MAX_MODE="read_only"                                                 # highest mode this actor may request (read_only | write | admin_script)
 
 # --- Executor actor-signing HMAC (§2.0) ---
-# Mirror this value to the ServiceNow property `x_mcp.executor.hmac_secret` on the instance.
+# Mirror this value to the ServiceNow property `x_1793136_mcp.executor.hmac_secret` on the instance.
 X_MCP_EXECUTOR_HMAC_KEY=""
 
 # Single-operator consent secret for the MCP OAuth flow (§2.4)
 MCP_OPERATOR_SECRET=""
+MCP_OPERATOR_USER_ID=""              # required stable MCP actor subject for consent grants
+MCP_OPERATOR_EMAIL=""                # optional actor email stored in OAuth props / audit identity
+MCP_OPERATOR_ACCESS_GROUPS=""        # optional comma-separated groups for admin_script second approval
 
 # Executor endpoint path (instance-specific; global-scope APIs get a numeric namespace)
 SNOW_EXECUTOR_PATH=""

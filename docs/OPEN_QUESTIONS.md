@@ -51,10 +51,10 @@ in P8 against the hardened build:
 
 ## Also done since: Phase 2 + Phase 7 host-side (wired + locally tested)
 
-- [x] §2.6 user-aware schema cache (S6) — wired into describe/list; content-addressed roleHash
-      cache key (P6b-2), `"*"`-collision fixed (`schema-cache.test.ts`)
-- [x] §2.13 ACL-safe keyset pagination (B7) — honest `partial` flag; available-but-unwired keyset
-      paginate (wire on a live ACL stall — DELTAS D13)
+- [x] §2.6 user-aware schema cache (S6) — wired into describe/list; ServiceNow sys_id +
+      content-addressed roleHash cache key (P6b-2), `"*"`-collision fixed (`schema-cache.test.ts`)
+- [x] §2.13 ACL-safe pagination posture (B7) — `tableQuery` returns an honest `partial` flag;
+      add keyset pagination with its production caller if live ACL testing proves it is needed.
 - [x] §7.2 host-side audit — **wired** on every mutation (`sn/mutation-guard.ts` → AUDIT_KV,
       audit-before-effect, fail-closed; `mutation-wiring.test.ts`)
 - [x] §7.7 encrypted recovery snapshots — **wired** before reversible mutates (SNAPSHOT_KV,
@@ -84,7 +84,7 @@ build):
 ## Also done: Phase 1.3 token store + S18
 
 - [x] §2.7/§1.3 `TokenStore` adapter (TokenStoreDO + AES-GCM): encryption-at-rest, rotate,
-      revoke, S2-auth AAD isolation, KEK rotation window (`token-store.test.ts`)
+      S2-auth AAD isolation, KEK rotation window (`token-store.test.ts`)
 - [x] §7.7/S18 recoverability classifier (reversible/soft-delete/non-recoverable) + delete-gating
 
 Deltas (recorded in DELTAS): global-scope Scripted REST APIs get a **numeric namespace**
@@ -102,8 +102,8 @@ ships the real `x_1793136_mcp_audit_log` / `x_1793136_mcp_nonce` tables + role A
 - [x] **Per-user ServiceNow tokens — wired end-to-end IN SOURCE** (P6b, commits `b2dc973`/`9a02e49`):
       `SERVICENOW_CREDENTIAL_MODE=per_user_oauth` drives ticket → `/servicenow/authorize` → PKCE
       S256 → `/servicenow/callback` → per-user token in `TokenStoreDO`; SN principal resolves the
-      sys_id → signed `snow_effective_user_sys_id` + roleHash cache key. ☐ live authorize/callback
-      dance + SN-principal endpoint shape re-verified in P8.
+      sys_id → signed `snow_effective_user_sys_id` + schema cache key with roleHash. ☐ live
+      authorize/callback dance + SN-principal endpoint shape re-verified in P8.
 - [ ] GA gate (§7): sub-production instance (not a PDI), pre-1.0 dependency exit.
 
 ### Open-pending-live (P8 gates) — VERIFIED LIVE 2026-05-31 on dev374488
@@ -142,7 +142,7 @@ ships the real `x_1793136_mcp_audit_log` / `x_1793136_mcp_nonce` tables + role A
 - [x] **0.8b** import mechanism proven + v1 import policy = disabled
 - [x] **0.11** Origin validation (S12 shape): foreign Origin → 403; loopback/no-Origin allowed
 - [x] **0.12** Durable Object partition proof — TokenStoreDO isolation per (user,instance) +
-      scoped revoke (S7-shape); BudgetDO global counter coordinates through one date-keyed
+      per-user/per-instance isolation (S7-shape); BudgetDO global counter coordinates through one date-keyed
       object; distinct date keys independent. DO classes are **storage skeletons** (no crypto
       / atomic-reserve yet — those are Phases 1.3/4.5).
 - [x] **0.13b** effective-mode capping (B3/B4) — requested mode only narrows

@@ -15,18 +15,17 @@
     "test:watch": "vitest",
     "dev": "wrangler dev --port 8787 --config packages/mcp-server/wrangler.jsonc",
     "cf-types": "wrangler types --config packages/mcp-server/wrangler.jsonc",
-    "live:smoke": "node scripts/live-smoke.mjs",
     "live:verify": "bash scripts/live-rpc-verify.sh",
     "copy-wasm": "node -e \"require('fs').copyFileSync('node_modules/esbuild-wasm/esbuild.wasm','packages/mcp-server/src/sandbox/esbuild.wasm')\"",
+    "check:verifier-sync": "node --check sn-executor-app/script-include/x_mcp_verify.js && node --check sn-executor-app/fluent/src/server/x_mcp_verify.js && node scripts/check-verifier-sync.mjs",
     "predev": "npm run copy-wasm",
-    "pretest": "npm run copy-wasm",
+    "pretest": "npm run copy-wasm && npm run check:verifier-sync",
     "deploy": "npm run copy-wasm && alchemy deploy",
     "deploy:destroy": "alchemy destroy",
     "deploy:e2e": "node scripts/deployed-e2e.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.16.10",
-    "@modelcontextprotocol/inspector": "^0.21.2",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0",
     "wrangler": "4.95.0"

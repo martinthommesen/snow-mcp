@@ -22,6 +22,13 @@ async function api(method, path, body) {
   const r = await fetch(`https://${host}${path}`, { method, headers: { ...h, ...(body ? { "content-type": "application/json" } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
   return { status: r.status, json: await r.json().catch(() => null) };
 }
+async function apiOk(method, path, body) {
+  const res = await api(method, path, body);
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`${method} ${path} failed with HTTP ${res.status}: ${JSON.stringify(res.json)}`);
+  }
+  return res;
+}
 async function signed(script, opts = {}) {
   const actor = {
     mcp_actor_user_id: "u1", mcp_actor_email: "ada@example.com", snow_effective_user_sys_id: "sys1",
@@ -58,12 +65,33 @@ const skip = (n, why) => { skipped++; console.log("  SKIPPED:", n, "—", why, "
 console.log(`Scoped executor verify: ${ENDPOINT}\n`);
 
 // admin user + role sys_ids
-const adminId = (await api("GET", "/api/now/table/sys_user?sysparm_query=user_name=admin&sysparm_limit=1&sysparm_fields=sys_id")).json?.result?.[0]?.sys_id;
-const roleId = (await api("GET", "/api/now/table/sys_user_role?sysparm_query=name=x_1793136_mcp.executor&sysparm_limit=1&sysparm_fields=sys_id")).json?.result?.[0]?.sys_id;
+const adminId = (await apiOk("GET", "/api/now/table/sys_user?sysparm_query=user_name=admin&sysparm_limit=1&sysparm_fields=sys_id")).json?.result?.[0]?.sys_id;
+const roleId = (await apiOk("GET", "/api/now/table/sys_user_role?sysparm_query=name=x_1793136_mcp.executor&sysparm_limit=1&sysparm_fields=sys_id")).json?.result?.[0]?.sys_id;
+if (!adminId) throw new Error("Could not resolve admin user sys_id.");
+if (!roleId) throw new Error("Could not resolve x_1793136_mcp.executor role sys_id.");
 
-// Ensure admin does NOT currently have the role (remove if present) for the S8 test.
-const existing = (await api("GET", `/api/now/table/sys_user_has_role?sysparm_query=user=${adminId}^role=${roleId}&sysparm_fields=sys_id`)).json?.result ?? [];
-for (const e of existing) await api("DELETE", `/api/now/table/sys_user_has_role/${e.sys_id}`);
+async function currentAdminExecutorRoles() {
+  const rows = (await apiOk("GET", `/api/now/table/sys_user_has_role?sysparm_query=user=${adminId}^role=${roleId}&sysparm_fields=sys_id`)).json?.result;
+  if (!Array.isArray(rows)) throw new Error("Role lookup returned no result array.");
+  return rows;
+}
+
+async function removeAdminExecutorRole() {
+  for (const e of await currentAdminExecutorRoles()) await apiOk("DELETE", `/api/now/table/sys_user_has_role/${e.sys_id}`);
+}
+
+async function grantAdminExecutorRole() {
+  await apiOk("POST", "/api/now/table/sys_user_has_role", { user: adminId, role: roleId });
+}
+
+// Ensure admin does NOT currently have the role (remove if present) for the S8 test, but restore
+// the starting state in finally so an interrupted failed verify does not leave prod access changed.
+const existing = await currentAdminExecutorRoles();
+const hadExecutorRole = existing.length > 0;
+let cleanupFailed = false;
+
+try {
+await removeAdminExecutorRole();
 await new Promise((r) => setTimeout(r, 2000));
 
 // S8 (config proof): the REST_Endpoint ACL exists requiring x_1793136_mcp.executor and the
@@ -93,7 +121,7 @@ for (const deadPath of ["/api/1793136/x_mcp/executor/run", "/api/x_mcp/executor/
 }
 
 // Assign the role to admin (so the broad-identity call is also role-authorized), then execute.
-await api("POST", "/api/now/table/sys_user_has_role", { user: adminId, role: roleId });
+await grantAdminExecutorRole();
 await new Promise((r) => setTimeout(r, 3000)); // role-cache propagation
 
 let auditIdSeen = "";
@@ -240,6 +268,18 @@ skip("SIGNED reason persisted in x_1793136_mcp_audit_log.reason column", "scoped
     skip("L-6 — MCP Nonce Purge run_period", `set it in the UI (System Definition > Scheduled Jobs) — now-sdk 4.7.1 serializes it as "${period || "MISSING"}"; replay protection is unaffected (fail-safe), only purge is deferred`);
   }
 }
+
+} finally {
+  try {
+    await removeAdminExecutorRole();
+    if (hadExecutorRole) await grantAdminExecutorRole();
+  } catch (e) {
+    cleanupFailed = true;
+    console.error("FAILED to restore admin executor role:", e instanceof Error ? e.message : String(e));
+  }
+}
+
+if (cleanupFailed) fail++;
 
 console.log(`\n${fail === 0 ? "SCOPED EXECUTOR: ALL PASS" : "SCOPED EXECUTOR: FAILURES"} — ${pass} passed, ${fail} failed, ${skipped} skipped`);
 process.exit(fail === 0 ? 0 : 1);

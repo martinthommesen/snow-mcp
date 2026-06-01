@@ -1,8 +1,7 @@
 // Script Include: x_mcp_verify (GLOBAL scope — the single canonical core, plan §P7).
 //
-// THIS FILE IS THE SOURCE OF TRUTH. The Fluent copy
-// (sn-executor-app/fluent/src/server/x_mcp_verify.js) and the embedded blob in
-// scripts/executor-install.mjs are GENERATED/COPIED from this one and MUST stay
+// THIS FILE IS THE SOURCE OF TRUTH. scripts/executor-install.mjs installs this exact file.
+// The Fluent copy (sn-executor-app/fluent/src/server/x_mcp_verify.js) MUST stay
 // byte-consistent in the class body — do not hand-fork. A divergence in `_canonical`
 // or the ASCII escaper silently breaks every signature (B1).
 //
@@ -24,9 +23,6 @@
 //                                                                claim + freshness. NO nonce
 //                                                                single-use, NO eval.
 //   execute(code)            -> { serialized, error }          — new Function eval + serialize.
-//   run(code, actor, sig)    -> { verified:false } | { verified:true, ok, error, serialized }
-//                                                              — verify-then-execute (NO nonce);
-//                                                                back-compat for direct callers.
 // SINGLE-USE NONCE consumption is now owned by the SCOPED Fluent wrapper (it INSERTs into the
 // scoped x_1793136_mcp_nonce table, which has a DB UNIQUE index — the live, deployable store).
 // The core no longer touches any nonce table (the global x_mcp_nonce table could not be created
@@ -162,15 +158,6 @@ x_mcp_verify.prototype = {
       serialized = null;
     }
     return { serialized: serialized, error: err };
-  },
-
-  // PUBLIC back-compat: verify-then-execute, NO nonce single-use (the wrapper owns that). The
-  // scoped wrapper does NOT call run() — it calls verify() / consume / execute() in order so the
-  // nonce INSERT lands between verify and execute. Kept for any direct caller.
-  run: function (code, actor, sig) {
-    if (!this.verify(code, actor, sig).verified) return { verified: false };
-    var out = this.execute(code);
-    return { verified: true, ok: !out.error, error: out.error, serialized: out.serialized };
   },
 
   type: 'x_mcp_verify',

@@ -20,16 +20,28 @@ export interface AuthCorrelationRecord {
   // I-2: the former `nonce` field was write-only — never read at the callback, so it provided no
   // CSRF protection. CSRF/replay defense is the opaque, single-use `state` (atomic
   // read-then-delete in this DO). Removed to avoid implying a second correlation check exists.
-  /** Optional post-auth return target (unused by the worker today; reserved for the UI). */
-  returnTarget?: string;
   /** epoch ms after which the record is expired (TTL check at the callback). */
+  expiresAt: number;
+}
+
+const CORRELATION_KEY = "corr";
+const TICKET_NONCE_KEY = "ticket_nonce";
+
+interface StoredAuthCorrelationRecord extends AuthCorrelationRecord {
+  state: string;
+}
+
+interface StoredTicketNonce {
+  nonce: string;
   expiresAt: number;
 }
 
 export class AuthCorrelationDO extends DurableObject {
   /** Create the single-use correlation record keyed by the opaque OAuth `state`. */
   async createRecord(state: string, record: AuthCorrelationRecord): Promise<void> {
-    await this.ctx.storage.put(`corr:${state}`, record);
+    await this.cleanupExpired(Date.now());
+    await this.ctx.storage.put(CORRELATION_KEY, { ...record, state } satisfies StoredAuthCorrelationRecord);
+    await this.ctx.storage.setAlarm(record.expiresAt);
   }
 
   /**
@@ -39,9 +51,61 @@ export class AuthCorrelationDO extends DurableObject {
    * record is still consumed/deleted on a late callback); the caller checks `expiresAt`.
    */
   async consumeRecord(state: string): Promise<AuthCorrelationRecord | null> {
-    const record = await this.ctx.storage.get<AuthCorrelationRecord>(`corr:${state}`);
-    if (!record) return null;
-    await this.ctx.storage.delete(`corr:${state}`);
-    return record;
+    const record = await this.ctx.storage.get<StoredAuthCorrelationRecord>(CORRELATION_KEY);
+    if (!record || record.state !== state) return null;
+    await this.ctx.storage.delete(CORRELATION_KEY);
+    await this.ctx.storage.deleteAlarm();
+    return {
+      userId: record.userId,
+      instanceHost: record.instanceHost,
+      pkceVerifier: record.pkceVerifier,
+      expiresAt: record.expiresAt,
+    };
+  }
+
+  /**
+   * ATOMIC one-shot ticket nonce claim for /servicenow/authorize. The ticket is signed and
+   * short-lived, but a leaked authorize URL must not mint multiple OAuth states before expiry.
+   */
+  async consumeTicketNonce(nonce: string, expiresAt: number, now: number = Date.now()): Promise<boolean> {
+    await this.cleanupExpired(now);
+    const existing = await this.ctx.storage.get<StoredTicketNonce>(TICKET_NONCE_KEY);
+    if (existing) return false;
+    await this.ctx.storage.put(TICKET_NONCE_KEY, { nonce, expiresAt } satisfies StoredTicketNonce);
+    await this.ctx.storage.setAlarm(expiresAt);
+    return true;
+  }
+
+  /** Storage-alarm entry point: purge abandoned, expired OAuth states. */
+  override async alarm(): Promise<void> {
+    await this.cleanupExpired(Date.now());
+  }
+
+  /** Deterministic cleanup seam for tests plus the alarm implementation. */
+  async cleanupExpired(now: number = Date.now()): Promise<void> {
+    const [record, ticketNonce] = await Promise.all([
+      this.ctx.storage.get<StoredAuthCorrelationRecord>(CORRELATION_KEY),
+      this.ctx.storage.get<StoredTicketNonce>(TICKET_NONCE_KEY),
+    ]);
+    let nextExpiresAt: number | undefined;
+    if (record) {
+      if (record.expiresAt <= now) {
+        await this.ctx.storage.delete(CORRELATION_KEY);
+      } else {
+        nextExpiresAt = record.expiresAt;
+      }
+    }
+    if (ticketNonce) {
+      if (ticketNonce.expiresAt <= now) {
+        await this.ctx.storage.delete(TICKET_NONCE_KEY);
+      } else {
+        nextExpiresAt = Math.min(nextExpiresAt ?? ticketNonce.expiresAt, ticketNonce.expiresAt);
+      }
+    }
+    if (nextExpiresAt === undefined) {
+      await this.ctx.storage.deleteAlarm();
+    } else {
+      await this.ctx.storage.setAlarm(nextExpiresAt);
+    }
   }
 }

@@ -15,13 +15,13 @@ change** (added `reason`; enforced `actor.instance`) — they are re-verified in
 | 4 | Identity model decided; integration mode signed+verified; ActorPolicy enforced | ✅ host / 🟢-P8 live | actor signing incl. signed `reason` (`auth/actor.ts`, tested); ActorPolicy enforced (`actor-policy.ts`, tested); 🟢-P8 the in-scope HMAC verify match (B1) |
 | 5 | Recoverability honest (S18) | ✅ | recovery snapshots **wired** to SNAPSHOT_KV (fail-closed before mutate) + recoverability classifier; claim narrowed where unsnapshotted (P4) |
 | 6 | run_code default read_only (or documented override) | ✅ | DEFAULT_MODE=read_only; B3/B4 enforced + unknown-mode fail-closed |
-| 7 | No secrets in repo/logs; versioned envelope; refresh/revoke/rotation (S7) | ✅ | AES-GCM envelope; versioned-KEK ring (P3); token-store rotate/revoke; redactor; .dev.vars gitignored |
+| 7 | No secrets in repo/logs; versioned envelope; refresh/rotation/corruption handling (S7) | ✅ | AES-GCM envelope; versioned-KEK ring (P3); token-store rotate; redactor; .dev.vars gitignored |
 | 8 | Exact pins; lockfile; `npm ci` reproducible | ✅ | runtime deps EXACT; package-lock committed |
-| 9 | Pre-1.0 exit (codemode ≥1.0; worker-bundler GA) or signed exemption | ⬜ | codemode 0.3.8 (pre-1.0); worker-bundler unused → exemption candidate |
+| 9 | Pre-1.0 exit (codemode ≥1.0) or signed exemption | ⬜ | codemode 0.3.8 (pre-1.0) → exemption candidate |
 | 10 | Tested against a non-PDI instance | ⬜ | dev374488 is a PDI |
 | 11 | ServiceNow OAuth proven (B9); OAUTH_KV isolated from TokenStoreDO (B8) | ✅ host / 🟢-P8 dance | B9 grant/refresh proven live pre-hardening; per-user OAuth wired in source (P6b), tested; B8; 🟢-P8 the live authorize/callback dance |
-| 12 | Authorization real: effectiveMode=min(...); admin_script gated | ✅ | effectiveMode min + unknown-mode fail-closed; (opt-in) approval gate wired (§7.9, P4) |
-| 13 | SN-side egress controlled; recovery retention/encryption/opt-out | ✅ host / 🟢-P8 executor | host audit/ledger/snapshot/approval wired on `runServerScript` (P4); snapshot store **built**; 🟢-P8 executor kill-switch/egress live |
+| 12 | Authorization real: effectiveMode=min(...); admin_script gated | ✅ | effectiveMode min + unknown-mode fail-closed; approval gate defaults to deny (§7.9, P4) |
+| 13 | SN-side egress controlled; recovery retention/encryption/table enablement | ✅ host / 🟢-P8 executor | host audit/ledger/snapshot/approval wired on `runServerScript` (P4); snapshot store **built**; 🟢-P8 executor kill-switch/egress live |
 
 ## What remains for GA
 
@@ -33,7 +33,7 @@ change** (added `reason`; enforced `actor.instance`) — they are re-verified in
   change).
 - ~~Per-user ServiceNow tokens~~ **WIRED end-to-end in source** (P6b) — ticket → authorize →
   PKCE → callback → per-user `TokenStoreDO`; SN principal → signed `snow_effective_user_sys_id`
-  + roleHash cache key. 🟢-P8 the live authorize/callback dance + SN-principal endpoint shape.
+  + schema cache key with roleHash. 🟢-P8 the live authorize/callback dance + SN-principal endpoint shape.
 - ~~Recovery snapshot store~~ **BUILT + WIRED** — `SNAPSHOT_KV` (30-day KV `expirationTtl`, no
   separate purge job needed — KV auto-expires), sealed under the versioned `SNAPSHOT_KEK` ring,
   fail-closed before mutate (P4; policy in RETENTION.md).

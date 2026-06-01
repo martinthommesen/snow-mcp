@@ -20,6 +20,8 @@
 //   node scripts/executor-install.mjs   # installs the global verify() core + properties only
 import { readFileSync } from "node:fs";
 
+const verifyScript = readFileSync(new URL("../sn-executor-app/script-include/x_mcp_verify.js", import.meta.url), "utf8");
+
 function dv(k) {
   for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
     const t = l.trim();
@@ -61,83 +63,6 @@ async function ensureScriptInclude(name, script) {
   await api("POST", "/api/now/table/sys_script_include", body); return "created";
 }
 
-// --- Script Include: x_mcp_verify (GLOBAL scope) ---
-// This IS the canonical global core (plan §P7) and the LIVE production verifier (D11). The class
-// body MUST stay byte-consistent with sn-executor-app/script-include/x_mcp_verify.js: verify()
-// (HMAC + script-bind + instance-claim + freshness; NO nonce, NO eval), execute() (new Function
-// eval), run() (verify-then-execute back-compat). SINGLE-USE NONCE consumption is NOT here — the
-// scoped wrapper owns it (INSERT-as-arbiter into the scoped x_1793136_mcp_nonce table). The nonce
-// STAYS in the signed canonical (the HMAC still covers it); only its single-use INSERT moved.
-// Properties are read from the scoped-aligned x_1793136_mcp.executor.* namespace (set below).
-const verifyScript = `var x_mcp_verify = Class.create();
-x_mcp_verify.prototype = {
-  FRESHNESS_MS: 120000,
-  initialize: function() {},
-  _asciiJsonString: function(s) {
-    var out = '"';
-    for (var i = 0; i < s.length; i++) {
-      var c = s.charCodeAt(i);
-      if (c === 0x22) out += '\\\\"';
-      else if (c === 0x5c) out += '\\\\\\\\';
-      else if (c < 0x20 || c >= 0x7f) { var h = c.toString(16); while (h.length < 4) h = '0' + h; out += '\\\\u' + h; }
-      else out += s.charAt(i);
-    }
-    return out + '"';
-  },
-  _canonical: function(a) {
-    var keys = ['mcp_actor_user_id','mcp_actor_email','snow_effective_user_sys_id','instance','request_id','script_sha256','issued_at','nonce','reason'];
-    var parts = [];
-    for (var i = 0; i < keys.length; i++) {
-      var k = keys[i], v = a[k];
-      var vs = (k === 'issued_at') ? String(v) : this._asciiJsonString(String(v == null ? '' : v));
-      parts.push(this._asciiJsonString(k) + ':' + vs);
-    }
-    return '{' + parts.join(',') + '}';
-  },
-  _hmacBase64: function(key, message) { var mac = new GlideCertificateEncryption(); return mac.generateMac(key, 'HmacSHA256', message); },
-  _constantTimeEquals: function(a, b) { if (a == null || b == null) return false; if (a.length !== b.length) return false; var d = 0; for (var i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i); return d === 0; },
-  _thisInstance: function() { return gs.getProperty('instance_name', ''); },
-  _instanceMatches: function(claimed) { var name = String(this._thisInstance() || ''); if (!name) return false; var c = String(claimed || ''); if (!c) return false; return c === name || c.indexOf(name + '.') === 0; },
-  // verify(): HMAC + script-bind + instance-claim + freshness. NO nonce single-use, NO eval —
-  // the caller consumes the nonce (INSERT-as-arbiter on the scoped x_1793136_mcp_nonce table)
-  // between verify() and execute(). The nonce STAYS in the signed canonical (HMAC covers it).
-  verify: function(script, actor, sig) {
-    if (!sig) return { verified: false };
-    var expHash = new GlideDigest().getSHA256Base64(String(script || ''));
-    if (expHash !== String(actor.script_sha256 || '')) return { verified: false };
-    if (!this._instanceMatches(actor.instance)) return { verified: false };
-    var now = new GlideDateTime().getNumericValue();
-    var issued = parseInt(actor.issued_at, 10);
-    if (isNaN(issued) || Math.abs(now - issued) > this.FRESHNESS_MS) return { verified: false };
-    var canon = this._canonical(actor);
-    var keyCur = gs.getProperty('x_1793136_mcp.executor.hmac_secret', '');
-    var keyPrev = gs.getProperty('x_1793136_mcp.executor.hmac_secret_prev', '');
-    var ok = keyCur && this._constantTimeEquals(this._hmacBase64(keyCur, canon), sig);
-    if (!ok && keyPrev) ok = this._constantTimeEquals(this._hmacBase64(keyPrev, canon), sig);
-    if (!ok) return { verified: false };
-    return { verified: true };
-  },
-  // execute(): eval the verified script (new Function is global-only). Caller MUST verify +
-  // consume the nonce first. Returns { serialized, error }; never throws (catches internally).
-  execute: function(code) {
-    var result, err = null;
-    try { var fn = new Function('gs','GlideRecord','GlideRecordSecure','GlideAggregate','"use strict";\\n' + code); result = fn(gs, GlideRecord, GlideRecordSecure, GlideAggregate); }
-    catch (e) { err = String(e); }
-    var serialized = null;
-    try { serialized = JSON.stringify(result === undefined ? null : result); }
-    catch (se) { err = err || ('unserializable: ' + String(se)); serialized = null; }
-    return { serialized: serialized, error: err };
-  },
-  // run(): verify-then-execute back-compat, NO nonce single-use. The scoped wrapper does NOT use
-  // run() — it calls verify()/consume/execute() so the nonce INSERT lands between the two.
-  run: function(code, actor, sig) {
-    if (!this.verify(code, actor, sig).verified) return { verified: false };
-    var out = this.execute(code);
-    return { verified: true, ok: !out.error, error: out.error, serialized: out.serialized };
-  },
-  type: 'x_mcp_verify'
-};`;
-
 console.log(`Installing x_mcp executor on ${host}\n`);
 
 // 1) Properties (scoped-aligned namespace x_1793136_mcp.executor.*, plan §P7 item 5)
@@ -153,7 +78,7 @@ log("max_output_bytes:", await setProperty("x_1793136_mcp.executor.max_output_by
 // (now-sdk install deploys them — see sn-executor-app/fluent/src/fluent/x_mcp.now.ts). The scoped
 // wrapper consumes the nonce in-scope; this global core no longer touches any nonce table.
 
-// 3) Script Include (the global verify()/execute()/run() core for scoped delegation).
+// 3) Script Include (the global verify()/execute() core for scoped delegation).
 log("x_mcp_verify script include:", await ensureScriptInclude("x_mcp_verify", verifyScript));
 
 console.log(

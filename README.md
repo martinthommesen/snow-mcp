@@ -57,8 +57,8 @@ request path, each with failing-first tests asserting the new secure behavior:
 - **P6a** auth-surface origin guard, env-gated localhost, redacted SN errors, signed consent
   state — `auth-surface.test.ts`
 - **P6b** per-user ServiceNow OAuth wired end-to-end **in source** (ticket → authorize → callback
-  → token store; SN principal → signed `snow_effective_user_sys_id` + `roleHash` cache key) +
-  restrictive opt-in ActorPolicy — `servicenow-ticket.test.ts`, `servicenow-callback.test.ts`,
+  → token store; SN principal sys_id → signed `snow_effective_user_sys_id` + schema cache key
+  with `roleHash`) + restrictive opt-in ActorPolicy — `servicenow-ticket.test.ts`, `servicenow-callback.test.ts`,
   `servicenow-reauth-tools.test.ts`, `schema-cache.test.ts`
 - **P7** executor + Fluent hardening — **source-complete; live-verified in P8** (see below)
 
@@ -73,7 +73,7 @@ request path, each with failing-first tests asserting the new secure behavior:
 | Effective-mode cap (read-only default) | §2.0.1, **0.13b**, **B3/B4** | `effective-mode.test.ts` |
 | OAUTH_KV present + isolated | §2.4, **0.13d**, **B8** | `oauth-kv.test.ts` |
 | DO partition (token isolation, global budget) | §2.10, **0.12** | `do-partition.test.ts` |
-| URL/SSRF allowlist · scriptedRest denylist | §2.4/3.2, **S15/B2** | `url-and-path-guards.test.ts` |
+| URL/SSRF allowlist | §2.4, **S15** | `url-and-path-guards.test.ts` |
 | AES-GCM token envelope (AAD + KEK rotation) | §2.7 | `crypto.test.ts` |
 | Actor signing + ActorPolicy (B5) + capability gate | §2.0/2.12/3.5, **B1-shape/B5** | `actor-and-policy.test.ts` |
 | **run_code pipeline** (mode-cap, capability, ActorPolicy, masking, budget, code_size, transpile_error) | §3.1/4.6 | `run-code-pipeline.test.ts` |
@@ -83,14 +83,14 @@ request path, each with failing-first tests asserting the new secure behavior:
 | **MutationLedgerDO** leveled idempotency (S17) | §7.3 | `do-partition.test.ts` |
 | admin_script approval gate (§7.9) + redaction (§7.1) | §7 | `approval-redact.test.ts` |
 
-Plus docs: `ROLE_MATRIX` (Phase 6), `THREAT_MODEL`, `SNOW_EGRESS`, `RECOVERY`, `RETENTION` (Phase 7);
-a Node **stdio shim** (`bin/stdio.ts`, Phase 8). All three tools are implemented; `describe_table`/
-`list_tables` returned real schema pre-hardening (`describe_table(incident)` → 92 fields incl.
-inherited on `dev374488`) and are re-verified live in P8.
+Plus docs: `ROLE_MATRIX` (Phase 6), `THREAT_MODEL`, `SNOW_EGRESS`, `RECOVERY`, `RETENTION` (Phase 7).
+All three tools are implemented; `describe_table`/`list_tables` returned real schema
+pre-hardening (`describe_table(incident)` → 92 fields incl. inherited on `dev374488`) and are
+re-verified live in P8.
 
 Implemented host-side modules (`src/`): `authz/{effective-mode,actor-policy,approval}` ·
 `auth/{crypto,actor,oauth-kv,token-store,servicenow-oauth,servicenow-ticket,servicenow-callback-handler}` ·
-`sn/{errors,url-allowlist,scripted-rest-denylist,http,rpc,run-budget,validate,mutation-guard,pagination,discovery}` ·
+`sn/{errors,url-allowlist,http,rpc,run-budget,validate,mutation-guard,discovery}` ·
 `observability/{audit,redact,origin}` · `recovery/{snapshots,policy}` · `cache/schema` ·
 `sandbox/{transpile,executor,serialize}` · `tools/{run_code,handlers}` · `config` ·
 `do/{auth-correlation,token-store,budget,mutation-ledger}`. The DOs carry real logic (P4/P5/P6b):
@@ -145,14 +145,14 @@ build. The default posture preserves the single-operator deployment; the new saf
 
 - **Mutations now REQUIRE a tool-level `idempotencyKey` (fail-closed).** The first mutating RPC
   (`tableUpdate`/`runServerScript`) in a `run_code` run with no tool-level `idempotencyKey` is
-  denied with `capability_denied` (audited). Snippet-supplied per-call keys are ignored. There
-  is no host-generated fallback — this is the exactly-once anchor (P4).
-- **The second-approval gate, recovery snapshots, and the restrictive ActorPolicy are OPT-IN.**
-  With **none** of the relevant env vars set, behavior is unchanged (single-operator default):
-  the approval gate is skipped, no tables are snapshotted, and the policy is the permissive
-  single-operator policy. Setting `ADMIN_SCRIPT_ALLOWLIST`/`_APPROVAL_TOKENS`/`_REQUIRED_GROUP`
-  enforces the gate; `SNAPSHOT_ENABLED_TABLES` enables snapshots; any `ACTOR_POLICY_*` var
-  builds a restrictive policy (table allowlist + field masks + row filters + per-run ceilings).
+  denied with `capability_denied` (audited). Snippet calls no longer carry per-call keys. There is
+  no host-generated fallback — this is the exactly-once anchor (P4).
+- **The second-approval gate is fail-closed for `admin_script`.** Empty
+  `ADMIN_SCRIPT_ALLOWLIST`/`_APPROVAL_TOKENS`/`_REQUIRED_GROUP` settings deny
+  `admin_script`; operators must explicitly allowlist an actor and configure either an approval
+  token or required access group. Recovery snapshots and the restrictive ActorPolicy remain
+  opt-in: `SNAPSHOT_ENABLED_TABLES` enables snapshots; any `ACTOR_POLICY_*` var builds a
+  restrictive policy (table allowlist + field masks + row filters + per-run ceilings).
 - **Raw ServiceNow error messages are now redacted.** `mapServiceNowError` returns a generic
   per-status client message (the typed `code` + structured `detail` survive); the raw SN message
   is logged server-side only (redacted) (P6a, finding 22).
@@ -191,14 +191,13 @@ packages/
   mcp-server/
     src/
       index.ts                   # entry: /health, Origin-gated /mcp, per-request server
-      server.ts                  # createServer(): tools (hello today; 3 real tools later)
+      server.ts                  # createServer(): run_code, describe_table, list_tables
       observability/origin.ts    # Origin validation (S12)
       sandbox/transpile.ts       # esbuild-wasm TS->JS string (ADR-0001)
       sandbox/executor.ts        # DynamicWorkerExecutor factory (globalOutbound:null)
       authz/effective-mode.ts    # min(requested, scope, tenant, instance) (§2.0.1)
       auth/oauth-kv.ts           # OAUTH_KV guard + isolation (B8)
       sn/url-allowlist.ts        # SSRF allowlist (S15)
-      sn/scripted-rest-denylist.ts # executor-bypass denylist (B2)
     wrangler.jsonc               # LOADER + SCHEMA_KV + OAUTH_KV, compat 2026-05-13
 docs/ ADR/0001 · DELTAS · OPEN_QUESTIONS
 ```

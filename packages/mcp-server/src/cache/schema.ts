@@ -1,21 +1,27 @@
 // User-aware schema cache (plan §2.6, S6). Discoverability ONLY — record operations
-// still rely on ServiceNow ACL enforcement. The key includes the user sys_id + a role
-// hash, because ACL-filtered field visibility is per user: caching by role alone could
-// leak a field that user A can see but user B (same role, failing a field/scripted ACL)
-// cannot. ~24h TTL; explicit invalidation supported.
+// still rely on ServiceNow ACL enforcement. The key includes the ServiceNow principal sys_id
+// + a role hash, because ACL-filtered field visibility is per user: caching by role alone
+// could leak a field that user A can see but user B (same role, failing a field/scripted ACL)
+// cannot. ~24h TTL.
 
 import type { FieldInfo, TableInfo } from "../sn/discovery.js";
 
 export const SCHEMA_VERSION = "v1";
 export const DEFAULT_SCHEMA_TTL_SEC = 24 * 60 * 60;
 
-export interface SchemaCacheIdentity {
-  instanceHost: string;
-  userId: string;
+const inFlightMisses = new Map<string, Promise<unknown>>();
+
+export interface SchemaCachePrincipalIdentity {
+  /** ServiceNow sys_id in per_user_oauth; authenticated MCP actor in integration_user. */
+  principalId: string;
   /** Hash of the user's roles (so a role change busts the cache). */
   roleHash: string;
   domainId?: string;
   scope?: string;
+}
+
+export interface SchemaCacheIdentity extends SchemaCachePrincipalIdentity {
+  instanceHost: string;
 }
 
 export class SchemaCache {
@@ -26,8 +32,24 @@ export class SchemaCache {
   ) {}
 
   private key(kind: "table" | "list", suffix: string): string {
-    const { instanceHost, userId, roleHash, domainId, scope } = this.id;
-    return `schema:${SCHEMA_VERSION}:${instanceHost}:${userId}:${roleHash}:${domainId ?? ""}:${scope ?? ""}:${kind}:${suffix}`;
+    const { instanceHost, principalId, roleHash, domainId, scope } = this.id;
+    return `schema:${SCHEMA_VERSION}:${instanceHost}:${principalId}:${roleHash}:${domainId ?? ""}:${scope ?? ""}:${kind}:${suffix}`;
+  }
+
+  private async fillMiss<T>(key: string, fetcher: () => Promise<T>, write: (value: T) => Promise<void>): Promise<T> {
+    const existing = inFlightMisses.get(key) as Promise<T> | undefined;
+    if (existing) return existing;
+    const pending = (async () => {
+      const value = await fetcher();
+      await write(value);
+      return value;
+    })();
+    inFlightMisses.set(key, pending);
+    try {
+      return await pending;
+    } finally {
+      if (inFlightMisses.get(key) === pending) inFlightMisses.delete(key);
+    }
   }
 
   /** Cache-through for a table's field schema (user-aware). */
@@ -35,8 +57,7 @@ export class SchemaCache {
     const k = this.key("table", table);
     const hit = await this.kv.get<FieldInfo[]>(k, "json");
     if (hit) return { fields: hit, cached: true };
-    const fields = await fetcher();
-    await this.kv.put(k, JSON.stringify(fields), { expirationTtl: this.ttlSec });
+    const fields = await this.fillMiss(k, fetcher, (value) => this.kv.put(k, JSON.stringify(value), { expirationTtl: this.ttlSec }));
     return { fields, cached: false };
   }
 
@@ -49,13 +70,8 @@ export class SchemaCache {
     const k = this.key("list", filter === undefined ? "0" : `1:${filter}`);
     const hit = await this.kv.get<TableInfo[]>(k, "json");
     if (hit) return { tables: hit, cached: true };
-    const tables = await fetcher();
-    await this.kv.put(k, JSON.stringify(tables), { expirationTtl: this.ttlSec });
+    const tables = await this.fillMiss(k, fetcher, (value) => this.kv.put(k, JSON.stringify(value), { expirationTtl: this.ttlSec }));
     return { tables, cached: false };
-  }
-
-  async invalidateTable(table: string): Promise<void> {
-    await this.kv.delete(this.key("table", table));
   }
 }
 

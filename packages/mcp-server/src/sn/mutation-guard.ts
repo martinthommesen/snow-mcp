@@ -93,6 +93,8 @@ export interface RunContext {
   runKey?: string;
   /** Tool-level reason (admin_script mandatory; audited + hashed into requestHash). */
   reason?: string;
+  /** Tool-level second-approval token, never snippet-supplied. */
+  approvalToken?: string;
 }
 
 /** Audit attribution carried from the signed/authenticated actor (no secrets). */
@@ -103,15 +105,17 @@ export interface AuditIdentity {
 }
 
 /**
- * The capabilities ServiceNowRPC needs to guard a mutation. All optional at the type
- * level so unit tests can omit durable infra; but a mutation with no `runKey` is always
- * denied (the tool-level idempotencyKey is mandatory — no host-generated fallback).
+ * The capabilities ServiceNowRPC needs to guard a mutation. Durable layers are optional
+ * for focused unit contexts; live handler wiring sets `durabilityRequired` so missing
+ * ledger/audit bindings fail closed before any ServiceNow effect.
  */
 export interface MutationGuard {
   run: RunContext;
   instance: string;
   identity: AuditIdentity;
   now: () => number;
+  /** Live mutating/executor paths require both ledger and durable audit. */
+  durabilityRequired?: boolean;
   /** Build the ledger handle for this run+ordinal. Absent => no durable ledger (tests). */
   ledger?: (ordinal: number) => LedgerHandle;
   /** Durable audit sink (AUDIT_KV-backed). Absent => no durable audit (tests). */
@@ -151,7 +155,8 @@ export function auditKey(utcDateKey: string, requestId: string, ordinal: number)
 
 /**
  * Orchestrate one guarded mutation. Order is a security property:
- *   1. ledger.begin (idempotency) — replay returns stored result; blocked throws.
+ *   1. ledger.begin (idempotency) — replay first re-checks the current preflight, then returns
+ *      stored result; blocked throws.
  *   2. preflight gate (approval) — throw => fail() (pre-send) + denial audit.
  *   3. snapshot persist — throw => fail() (pre-send) + denial audit + DENY (fail closed).
  *   4. AUDIT-BEFORE-EFFECT: write the intent row (status "intent"); if the audit WRITE
@@ -167,6 +172,13 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
   // intent + outcome share an AUDIT_KV key even if the effect straddles UTC midnight (deriving the
   // date from each row's own write-time `ts` would leave the day-D intent row orphaned/unresolved).
   const auditDateKey = new Date(guard.now()).toISOString().slice(0, 10);
+  if (guard.durabilityRequired && (!guard.ledger || !guard.audit)) {
+    throw new McpToolError(
+      "internal_error",
+      "mutation durability is not fully configured — refusing to mutate (fail closed).",
+      { ledger: Boolean(guard.ledger), audit: Boolean(guard.audit) },
+    );
+  }
   // The tool-level idempotencyKey is mandatory for any mutation (no host-generated
   // fallback). A missing key is itself a DENIAL and is audited as such.
   if (!guard.run.runKey) {
@@ -179,7 +191,15 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
   // 1) Idempotency claim.
   if (ledger) {
     const claim = await ledger.begin(eff.requestHash);
-    if (claim.state === "replay") return claim.result as T;
+    if (claim.state === "replay") {
+      try {
+        await eff.preflight?.();
+      } catch (e) {
+        await emitDenial(guard, eff, e);
+        throw e;
+      }
+      return claim.result as T;
+    }
     if (claim.state === "blocked") {
       const err = new McpToolError("capability_denied", `Idempotency conflict (${claim.status}) — retry blocked.`, {
         idempotencyKey: guard.run.runKey,

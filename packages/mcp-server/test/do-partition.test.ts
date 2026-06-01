@@ -18,7 +18,7 @@ function tokenStub(userId: string, instanceHost: string) {
 }
 
 describe("Phase 0.12 — TokenStoreDO isolation per (user, instance)", () => {
-  it("does not leak tokens across users or instances, and revoke is scoped", async () => {
+  it("does not leak tokens across users or instances", async () => {
     const a1 = tokenStub("userA", "inst1.service-now.com");
     const b1 = tokenStub("userB", "inst1.service-now.com");
     const a2 = tokenStub("userA", "inst2.service-now.com");
@@ -31,9 +31,6 @@ describe("Phase 0.12 — TokenStoreDO isolation per (user, instance)", () => {
     expect(await b1.getToken("refresh")).toBe("B1-token");
     expect(await a2.getToken("refresh")).toBe("A2-token");
 
-    // Revoking userA@inst1 must not affect userB@inst1 or userA@inst2 (plan §2.7 S7).
-    await a1.revokeAll();
-    expect(await tokenStub("userA", "inst1.service-now.com").getToken("refresh")).toBeUndefined();
     expect(await b1.getToken("refresh")).toBe("B1-token");
     expect(await a2.getToken("refresh")).toBe("A2-token");
   });
@@ -138,6 +135,20 @@ describe("Phase P5 — BudgetDO per-user isolation (global = sum of users)", () 
     expect(await obj.getUser("userC", "uniqueWorkers")).toBe(1);
     expect(await obj.getUser("userC", "serviceNowRequests")).toBe(1);
     expect(await obj.get("uniqueWorkers")).toBe(1);
+  });
+
+  it("snapshot returns the batched global counter view", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-08"));
+    await obj.increment({ uniqueWorkers: 2, rowsReturned: 30 }, "userA");
+    await obj.reserve({ serviceNowRequests: 3 }, undefined, "userB");
+    expect(await obj.snapshot()).toMatchObject({
+      uniqueWorkers: 2,
+      serviceNowRequests: 3,
+      rowsReturned: 30,
+      bytesReturned: 0,
+      sandboxRpcCalls: 0,
+    });
   });
 });
 

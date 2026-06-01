@@ -42,4 +42,10 @@ describe("Phase 0.11 — Origin validation predicate (S12)", () => {
     expect(isOriginAllowed(new Request("http://localhost/mcp", { headers: { Origin: "https://app.example.com" } }), cfg)).toBe(true);
     expect(isOriginAllowed(new Request("http://localhost/mcp"), cfg)).toBe(true);
   });
+  it("does not treat a matching host with a different scheme as same-origin", () => {
+    const req = new Request("https://worker.example/mcp", {
+      headers: { Origin: "http://worker.example" },
+    });
+    expect(isOriginAllowed(req, { allowedOrigins: [], allowLocalhost: false })).toBe(false);
+  });
 });

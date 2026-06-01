@@ -30,17 +30,18 @@ import {
 import { TokenStore } from "./token-store.js";
 import { buildKekRing } from "./crypto.js";
 import { redactString } from "../observability/redact.js";
+import { canonicalPublicOrigin } from "./public-origin.js";
 import type { AuthCorrelationRecord } from "../do/auth-correlation.js";
 
 /** Minimal DO surface the routes need (test-injectable; real DOs satisfy these structurally). */
 interface AuthCorrelationStub {
   createRecord(state: string, record: AuthCorrelationRecord): Promise<void>;
   consumeRecord(state: string): Promise<AuthCorrelationRecord | null>;
+  consumeTicketNonce(nonce: string, expiresAt: number, now?: number): Promise<boolean>;
 }
 interface TokenStoreStub {
   putToken(tokenType: string, opaque: string): Promise<void>;
   getToken(tokenType: string): Promise<string | undefined>;
-  revokeAll(): Promise<void>;
 }
 interface AuthCorrelationNamespace {
   idFromName(name: string): DurableObjectId;
@@ -57,9 +58,8 @@ interface TokenStoreNamespace {
 export interface CallbackHandlerEnv {
   AUTH_DO: AuthCorrelationNamespace;
   TOKEN_DO: TokenStoreNamespace;
-  // I-1: configured public origin for the OAuth redirect_uri. Optional — when unset, the
-  // request-derived origin is used (unchanged behavior). When set, the redirect_uri no longer
-  // depends on the spoofable request Host.
+  // I-1: configured public origin for the OAuth redirect_uri. Required for per_user_oauth so the
+  // redirect_uri never depends on the request Host.
   WORKER_PUBLIC_ORIGIN?: string;
   SNOW_INSTANCE_HOST?: string;
   SNOW_OAUTH_CLIENT_ID?: string;
@@ -93,11 +93,13 @@ function oauthConfig(env: CallbackHandlerEnv, instanceHost: string): SnOAuthConf
 /** Is the per-user OAuth path fully configured? A missing piece fails closed (400). */
 function configured(env: CallbackHandlerEnv): boolean {
   return Boolean(
-    env.SNOW_INSTANCE_HOST &&
+    env.SERVICENOW_CREDENTIAL_MODE === "per_user_oauth" &&
+      env.SNOW_INSTANCE_HOST &&
       env.SNOW_OAUTH_CLIENT_ID &&
       env.SNOW_OAUTH_CLIENT_SECRET &&
       env.OAUTH_PROVIDER_SECRET &&
-      (env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK),
+      (env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK) &&
+      canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN),
   );
 }
 
@@ -107,17 +109,24 @@ function redirectUri(origin: string): string {
 
 async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promise<Response> {
   if (!configured(env)) return new Response("ServiceNow OAuth is not configured.", { status: 400 });
+  const now = Date.now();
   const url = new URL(request.url);
   const ticketStr = url.searchParams.get("ticket") ?? "";
   // The host-HMAC ticket is the ONLY identity authority here — verify it (signature + exp).
-  const ticket = await verifyTicket(ticketStr, env.OAUTH_PROVIDER_SECRET!, Date.now());
+  const ticket = await verifyTicket(ticketStr, env.OAUTH_PROVIDER_SECRET!, now);
   if (!ticket) return new Response("Invalid or expired authorization ticket.", { status: 401 });
 
   const instanceHost = canonicalHost(env);
+  const publicOrigin = canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN)!;
   // The ticket's instanceHost must match this worker's configured instance — a ticket minted
   // for another instance must not start a flow against this one.
   if (ticket.instanceHost !== instanceHost) {
     return new Response("Ticket instance mismatch.", { status: 400 });
+  }
+  const ns = env.AUTH_DO;
+  const nonceClaimed = await ns.get(ns.idFromName(`ticket:${ticket.nonce}`)).consumeTicketNonce(ticket.nonce, ticket.exp, now);
+  if (!nonceClaimed) {
+    return new Response("Authorization ticket already used.", { status: 401 });
   }
 
   const { verifier, challenge } = await generatePkce();
@@ -128,15 +137,14 @@ async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promi
     userId: ticket.userId,
     instanceHost,
     pkceVerifier: verifier,
-    expiresAt: Date.now() + CORRELATION_TTL_MS,
+    expiresAt: now + CORRELATION_TTL_MS,
   };
-  const ns = env.AUTH_DO;
   await ns.get(ns.idFromName(`state:${state}`)).createRecord(state, record);
 
   const authorize = new URL(`https://${instanceHost}/oauth_auth.do`);
   authorize.searchParams.set("response_type", "code");
   authorize.searchParams.set("client_id", env.SNOW_OAUTH_CLIENT_ID!);
-  authorize.searchParams.set("redirect_uri", redirectUri(env.WORKER_PUBLIC_ORIGIN ?? url.origin));
+  authorize.searchParams.set("redirect_uri", redirectUri(publicOrigin));
   authorize.searchParams.set("scope", SCOPE);
   authorize.searchParams.set("state", state);
   authorize.searchParams.set("code_challenge", challenge);
@@ -164,21 +172,25 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
   if (record.instanceHost !== instanceHost) return new Response("Authorization instance mismatch.", { status: 400 });
 
   const cfg = oauthConfig(env, instanceHost);
+  const publicOrigin = canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN)!;
+  const now = Date.now();
   let tokens;
   try {
-    tokens = await authorizationCodeGrant(cfg, code, record.pkceVerifier, redirectUri(env.WORKER_PUBLIC_ORIGIN ?? url.origin), Date.now());
+    tokens = await authorizationCodeGrant(cfg, code, record.pkceVerifier, redirectUri(publicOrigin), now);
   } catch (e) {
     console.error("servicenow callback: code exchange failed:", redactString(e instanceof Error ? e.message : String(e)));
     return new Response("ServiceNow token exchange failed.", { status: 400 });
   }
 
-  // Resolve + persist the SN principal alongside the token (best-effort; a null principal still
-  // stores a usable token — admin_script then falls back to the empty effective sys_id).
+  // Resolve + persist the SN principal alongside the token. Fail closed: a per-user token without
+  // a resolved ServiceNow sys_id cannot provide trustworthy admin_script attribution.
   const principal = await resolveSnPrincipal(cfg, tokens.access_token);
-  if (principal) {
-    tokens.sys_id = principal.sys_id;
-    tokens.roles = principal.roles;
+  if (!principal) {
+    return new Response("ServiceNow principal resolution failed.", { status: 400 });
   }
+  tokens.sys_id = principal.sys_id;
+  tokens.roles = principal.roles;
+  tokens.principal_resolved_at = now;
 
   const ring = await buildKekRing((env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK)!, env.TOKEN_KEK_PREV);
   const tokStub = env.TOKEN_DO.get(env.TOKEN_DO.idFromName(`${record.userId}|${instanceHost}`));

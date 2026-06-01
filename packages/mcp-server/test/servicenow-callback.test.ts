@@ -23,7 +23,7 @@ const KEK = "token-kek-passphrase";
 const ORIGIN = "https://mcp.example.workers.dev";
 
 /** Mock upstream SN: oauth_token.do (code exchange) + the current_user / role principal fetches. */
-function mockSn(opts: { token?: Record<string, unknown>; failExchange?: boolean } = {}) {
+function mockSn(opts: { token?: Record<string, unknown>; failExchange?: boolean; failPrincipal?: boolean } = {}) {
   const calls: { url: string; grant?: string }[] = [];
   const fetchImpl = (async (url: string, init?: RequestInit) => {
     if (url.includes("/oauth_token.do")) {
@@ -34,6 +34,9 @@ function mockSn(opts: { token?: Record<string, unknown>; failExchange?: boolean 
     }
     if (url.includes("/api/now/ui/user/current_user")) {
       calls.push({ url });
+      if (opts.failPrincipal) {
+        return new Response(JSON.stringify({ result: {} }), { headers: { "content-type": "application/json" } });
+      }
       return new Response(JSON.stringify({ result: { user_sys_id: "EFF_SYS_ID", user_name: "alice" } }), { headers: { "content-type": "application/json" } });
     }
     if (url.includes("/api/now/table/sys_user_has_role")) {
@@ -55,15 +58,16 @@ function handlerEnv(fetchImpl: typeof fetch): CallbackHandlerEnv {
     SNOW_OAUTH_CLIENT_SECRET: "client-secret",
     TOKEN_KEK_CURRENT: KEK,
     OAUTH_PROVIDER_SECRET: SECRET,
+    WORKER_PUBLIC_ORIGIN: ORIGIN,
     SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
     fetchImpl,
   };
 }
 
-async function authorize(userId: string, hEnv: CallbackHandlerEnv, instanceHost = HOST): Promise<string> {
-  const ticket = await mintTicket({ userId, instanceHost, nonce: "n", exp: Date.now() + 60_000 }, SECRET);
+async function authorize(userId: string, hEnv: CallbackHandlerEnv, instanceHost = HOST, requestOrigin = ORIGIN): Promise<string> {
+  const ticket = await mintTicket({ userId, instanceHost, nonce: crypto.randomUUID(), exp: Date.now() + 60_000 }, SECRET);
   const res = await serviceNowCallbackHandler(
-    new Request(`${ORIGIN}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
+    new Request(`${requestOrigin}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
     hEnv,
   );
   expect(res!.status).toBe(302);
@@ -102,10 +106,51 @@ describe("§6b authorize → callback stores a per-user token", () => {
     expect(tok?.access_token).toBe("AT");
     expect(tok?.sys_id).toBe("EFF_SYS_ID"); // principal persisted alongside the token
     expect(tok?.roles).toEqual(["itil"]);
+    expect(tok?.principal_resolved_at).toEqual(expect.any(Number));
+  });
+
+  it("pins redirect_uri to WORKER_PUBLIC_ORIGIN instead of the request host", async () => {
+    const { fetchImpl } = mockSn();
+    await authorize("userPinnedOrigin", handlerEnv(fetchImpl), HOST, "https://spoofed.example");
+  });
+
+  it("consumes each reauth ticket once before creating OAuth state", async () => {
+    const { fetchImpl } = mockSn();
+    const ticket = await mintTicket(
+      { userId: "userTicketReplay", instanceHost: HOST, nonce: crypto.randomUUID(), exp: Date.now() + 60_000 },
+      SECRET,
+    );
+    const first = await serviceNowCallbackHandler(
+      new Request(`${ORIGIN}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
+      handlerEnv(fetchImpl),
+    );
+    expect(first!.status).toBe(302);
+    const second = await serviceNowCallbackHandler(
+      new Request(`${ORIGIN}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
+      handlerEnv(fetchImpl),
+    );
+    expect(second!.status).toBe(401);
   });
 });
 
 describe("§6b callback fails closed", () => {
+  it("requires explicit per_user_oauth mode and a configured public origin", async () => {
+    const { fetchImpl } = mockSn();
+    const ticket = await mintTicket({ userId: "userNoOrigin", instanceHost: HOST, nonce: "n", exp: Date.now() + 60_000 }, SECRET);
+
+    const missingOrigin = await serviceNowCallbackHandler(
+      new Request(`${ORIGIN}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
+      { ...handlerEnv(fetchImpl), WORKER_PUBLIC_ORIGIN: undefined },
+    );
+    expect(missingOrigin!.status).toBe(400);
+
+    const inactiveMode = await serviceNowCallbackHandler(
+      new Request(`${ORIGIN}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
+      { ...handlerEnv(fetchImpl), SERVICENOW_CREDENTIAL_MODE: "integration_user" },
+    );
+    expect(inactiveMode!.status).toBe(400);
+  });
+
   it("REPLAYED/consumed state → rejected (consume-once), and stores no second token", async () => {
     const { fetchImpl } = mockSn();
     const hEnv = handlerEnv(fetchImpl);
@@ -147,6 +192,15 @@ describe("§6b callback fails closed", () => {
     expect(await storedTokenFor("userExchangeFail")).toBeNull();
   });
 
+  it("a failed principal resolution issues no token (fail closed)", async () => {
+    const { fetchImpl } = mockSn({ failPrincipal: true });
+    const hEnv = handlerEnv(fetchImpl);
+    const state = await authorize("userPrincipalFail", hEnv);
+    const res = await callback(state, hEnv);
+    expect(res!.status).toBe(400);
+    expect(await storedTokenFor("userPrincipalFail")).toBeNull();
+  });
+
   it("/servicenow/authorize with an invalid ticket → 401, no flow started", async () => {
     const { fetchImpl } = mockSn();
     const res = await serviceNowCallbackHandler(
@@ -154,6 +208,44 @@ describe("§6b callback fails closed", () => {
       handlerEnv(fetchImpl),
     );
     expect(res!.status).toBe(401);
+  });
+});
+
+describe("§6b AuthCorrelationDO expiry cleanup", () => {
+  it("purges abandoned expired states without consuming a callback", async () => {
+    const state = `expired-${crypto.randomUUID()}`;
+    const stub = E.AUTH_DO.get(E.AUTH_DO.idFromName(`state:${state}`));
+    await stub.createRecord(state, {
+      userId: "abandonedUser",
+      instanceHost: HOST,
+      pkceVerifier: "verifier",
+      expiresAt: Date.now() - 1,
+    });
+
+    await stub.cleanupExpired(Date.now());
+    expect(await stub.consumeRecord(state)).toBeNull();
+  });
+
+  it("keeps unexpired states while cleaning older records", async () => {
+    const state = `future-${crypto.randomUUID()}`;
+    const stub = E.AUTH_DO.get(E.AUTH_DO.idFromName(`state:${state}`));
+    const record = {
+      userId: "futureUser",
+      instanceHost: HOST,
+      pkceVerifier: "verifier",
+      expiresAt: Date.now() + 60_000,
+    };
+    await stub.createRecord(state, record);
+
+    await stub.cleanupExpired(Date.now());
+    expect(await stub.consumeRecord(state)).toEqual(record);
+  });
+
+  it("expires consumed ticket nonces so a future same nonce can be claimed after expiry", async () => {
+    const nonce = `nonce-${crypto.randomUUID()}`;
+    const stub = E.AUTH_DO.get(E.AUTH_DO.idFromName(`ticket:${nonce}`));
+    expect(await stub.consumeTicketNonce(nonce, Date.now() - 1, Date.now() - 2)).toBe(true);
+    expect(await stub.consumeTicketNonce(nonce, Date.now() + 60_000, Date.now())).toBe(true);
   });
 });
 

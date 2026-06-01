@@ -43,10 +43,10 @@ The two **High** findings (`actor-authz-1` and `XCUT-auth-bypass-1`) are the **s
 **Impact.** In `integration_user` credential mode (the documented default per `handlers.ts:149`), ServiceNow ACLs do not bound the shared integration identity, so `ActorPolicy.maxMode` is the host-side per-actor cap (`actor-policy.ts:1–6`). An operator who sets `ACTOR_POLICY_MAX_MODE=write` intends "this actor may read and write tables but **never** run arbitrary server-side scripts." That intent holds for every table read/write — but **not** for `runServerScript`, which executes arbitrary GlideScript at the executor app's privilege (ACL-bypassing). The least-privileged operations are blocked while the most-privileged one fails open.
 
 **Evidence.**
-- `runServerScript` (`rpc.ts:377–502`) authorizes only via `requireCapability(this.deps.effectiveMode, "runServerScript")` at `rpc.ts:386`, plus an *optional* approval preflight (`rpc.ts:463–471`) that exists only when `ADMIN_SCRIPT_*` env is configured (absent by default).
+- `runServerScript` now has a fail-closed approval preflight even when `ADMIN_SCRIPT_*` env is empty; the historical gap here was the missing per-actor mode ceiling, not the current approval default.
 - `policy.maxMode` is enforced in exactly one place — `assertActorPolicy` at `actor-policy.ts:190` (`modeRisk(ctx.mode) > modeRisk(policy.maxMode)`). `runServerScript` never calls it.
 - `policy.maxMode` is **not** threaded into `resolveEffectiveMode` (`effective-mode.ts:47–61`), which caps only by `min(scopeMaxMode, tenantMaxMode, instanceMaxMode)`. `handlers.ts:391–398` wires only those three; the policy is passed separately as `actorPolicy` and consulted only inside `assertActorPolicy`.
-- Exploit precondition is reachable: `parseMaxMode(undefined)` returns `admin_script` (`handlers.ts:103`), so unset `TENANT_MAX_MODE`/`INSTANCE_MAX_MODE` impose no ceiling; with an OAuth scope granting `servicenow:admin_script`, `effectiveMode = min(admin_script, admin_script, admin_script) = admin_script`, `requireCapability` passes, and with no approval gate configured there is no second check.
+- Exploit precondition formerly required an unconfigured approval gate; after the approval default was hardened, empty `ADMIN_SCRIPT_*` settings deny `admin_script` before the executor POST.
 - The class-level invariant at `rpc.ts:5` ("Every method — reads included — enforces, IN ORDER: ActorPolicy → effective-mode capability → per-run budget") is violated by the file's own most-dangerous method.
 - Test gap: `actor-and-policy.test.ts:106–107` asserts `assertActorPolicy` denies `admin_script` under `maxMode:"write"` **in isolation**, but no test drives the `runServerScript` RPC against a restrictive `policy.maxMode`. This is exactly the "enforcement verified in isolation, not wired at the dangerous call site" incident class.
 
@@ -59,7 +59,7 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 
 (import `modeRisk` from `@servicenow-codemode/shared`). Alternatively, thread `policy.maxMode` into `resolveEffectiveMode` as a fourth ceiling so the cap is applied uniformly. Add a unit test: `ACTOR_POLICY_MAX_MODE=write` + `effectiveMode` resolving to `admin_script` must make `runServerScript` throw `actor_policy_denied`, mirroring the existing `tableUpdate`/`tableQuery` denial.
 
-**Mitigations that bound severity (why high, not critical).** Triggering requires *all* of: the executor wired, the OAuth scope legitimately granting `admin_script`, tenant/instance ceilings unset (or `admin_script`), and the approval gate unconfigured (the default). The scope/tenant/instance ceilings are redundant correct controls that *do* cap this path — an operator who sets `TENANT_MAX_MODE=write` is safe. What keeps it high: the documented *per-actor* knob silently fails to apply to the single most dangerous operation, in the exact credential mode where it is supposed to be the bound.
+**Mitigations that bound severity (why high, not critical).** Triggering now requires the executor wired, OAuth scope legitimately granting `admin_script`, tenant/instance ceilings unset (or `admin_script`), and a valid second-approval path. The scope/tenant/instance ceilings are redundant correct controls that *do* cap this path — an operator who sets `TENANT_MAX_MODE=write` is safe. What keeps it high: the documented *per-actor* knob silently fails to apply to the single most dangerous operation, in the exact credential mode where it is supposed to be the bound.
 
 **Verdict:** confirmed (3/3 on `actor-authz-1`; 3/3 on `XCUT-auth-bypass-1`).
 
@@ -96,12 +96,11 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 
 #### M-4 — Opt-in global REST endpoint is HMAC-only with no role ACL
 
-- **File:** `scripts/executor-install.mjs:211–226`
+- **File:** `scripts/executor-install.mjs` (historical deleted path)
 - **Category:** missing-authorization
-- **Impact.** When `X_MCP_INSTALL_GLOBAL_REST=1`, the installer creates a global Scripted REST op with `requires_acl_authorization:"false"` (line 224) — gated solely by HMAC, the same no-role-ACL shape as the incident endpoint, fronting an arbitrary server-script eval surface. It is **default-OFF** and its reject guard is live (fail-closed), unlike the incident's dead guard. Residual risk: if opted in on production, any authenticated user reaching the endpoint is gated only by the shared HMAC secret, with no executor-role backstop (the scoped wrapper additionally requires the executor role).
-- **Evidence.** Line 224 `requires_authentication:"true", requires_acl_authorization:"false"`, `relative_path "/executor/run"`, no role ACL; the embedded script runs `new x_mcp_verify().execute(code)`. Default-off gate at lines 22/215; live `if (!v.verified)` boolean guard at line 175.
-- **Recommended fix.** Keep default-OFF as reference only; if it must exist, attach a role ACL mirroring the scoped executor ACL gate.
-- **Verdict:** confirmed (1/1). *(See also L-3, which is the same surface from the auth-bypass lens — merged conceptually.)*
+- **Impact.** Resolved. The global Scripted REST install path was removed; `executor-install.mjs` now installs only the global verifier core/properties, while the executable endpoint is the scoped Fluent REST resource with a REST_Endpoint ACL.
+- **Evidence.** The scoped runtime lives in `sn-executor-app/fluent/src/server/x_mcp_executor.js`; verifier-body sync is enforced by `npm run check:verifier-sync`.
+- **Verdict:** resolved by deleting the opt-in global REST endpoint path.
 
 #### M-5 — Install self-test can leave the executor kill-switch disabled on mid-test failure
 
@@ -116,7 +115,7 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 
 - **File:** `packages/mcp-server/src/sn/rpc.ts:178–208, 231–252`; `packages/mcp-server/src/authz/actor-policy.ts:196–230`; `validate.ts:128–135` *(note: actor-policy lives at `src/authz/`, not `src/sn/`)*
 - **Category:** injection / confidentiality
-- **Impact.** `ActorPolicy.fieldMasks` is documented (§2.12) to strip forbidden fields from request **and** response. It is enforced on the requested `fields` and stripped from returned rows (`maskRow`), but **nothing inspects the caller-supplied `sysparm_query` predicate** for masked-field references. `validateUserQuery` only checks structural operators (and only when a mandatory `rowFilter` is present); `applyRowFilter` only AND-composes. So a snippet can filter *on* a masked column without requesting it: `tableQuery({table:'sys_user', query:'salary>500000', fields:['name']})` returns exactly the rows whose masked salary exceeds the threshold (binary-search reconstructs the value); `aggregate({table, query:'ssn=...', groupBy:['dept']})` is a single-query equality oracle. `aggregate`'s `groupBy`/`countField` *are* mask-checked, but its `query` is not. In `integration_user` mode the mask is the sole field-level confidentiality barrier, and it is bypassed for read selection.
+- **Impact.** `ActorPolicy.fieldMasks` is documented (§2.12) to strip forbidden fields from request **and** response. It is enforced on the requested `fields` and stripped from returned rows (`maskRow`), but **nothing inspects the caller-supplied `sysparm_query` predicate** for masked-field references. `validateUserQuery` only checks structural operators (and only when a mandatory `rowFilter` is present); `applyRowFilter` only AND-composes. So a snippet can filter *on* a masked column without requesting it: `tableQuery({table:'sys_user', query:'salary>500000', fields:['name']})` returns exactly the rows whose masked salary exceeds the threshold (binary-search reconstructs the value); `aggregate({table, query:'ssn=...', groupBy:['dept']})` is a single-query equality oracle. `aggregate`'s `groupBy` is mask-checked, but its `query` is not. In `integration_user` mode the mask is the sole field-level confidentiality barrier, and it is bypassed for read selection.
 - **Evidence.** `userQuery` passed to ServiceNow verbatim after only structural-op + rowFilter checks; `assertRequestedFieldsAllowed`/`maskRow` operate on `fields` and response rows only; `applyRowFilter` does `userQuery ? \`${mandatory}^${userQuery}\` : mandatory` with no predicate inspection.
 - **Recommended fix.** Parse the caller query's field references (token before each operator in each `^`-separated clause, plus `ORDERBY`/`GROUPBY` targets) and reject any matching a `fieldMask` (reuse the dot-aware `isMaskedBy` logic), in `validateUserQuery`/`applyRowFilter`. Apply identically to `tableQuery` and `aggregate`. Fail with `actor_policy_denied`.
 - **Verdict:** confirmed (1/1). Deployment-gated (requires a restrictive policy with `fieldMasks` configured) and an inference channel for an already-authenticated sandbox actor, but within that posture the only confidentiality barrier is fully defeated.
@@ -145,13 +144,12 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 
 #### L-1 — Scripted-REST denylist is dead code; comments overstate it as a live, wired guard
 
-- **File:** `packages/mcp-server/src/sn/scripted-rest-denylist.ts:1–66`; `http.ts:52–55`; `rpc.ts` (no caller)
+- **File:** `packages/mcp-server/src/sn/rpc.ts`; `packages/mcp-server/src/sn/http.ts`
 - **Category:** fail-open / documentation drift
 - **Found by:** two lenses (`sn-rpc-egress-1` at low, `XCUT-egress-injection-3` at info) — **same issue, merged**; reported at the more conservative of the two non-trivial severities.
-- **Impact.** `checkScriptedRestPath()`/`DENY_PATTERNS` (blocking `/executor`, `sys_properties`, `x_mcp_audit_log`, `oauth_*.do`, `login.do`) have **zero production callers**; there is no `scriptedRest` method in `ServiceNowRPC.fns()` (only tableQuery/tableGet/aggregate/tableUpdate/runServerScript). Yet `http.ts:52–55` states the denylist "is enforced by the generic `scriptedRest` RPC method (§3.2), NOT here," and the module header frames itself as the live guard. Not exploitable today (no generic-path surface exists), but it is the exact recent-incident class — a guard asserted active in comments but not on any live path. A Phase-5.6 author adding a `scriptedRest` tool could trust the comment and not wire the denylist in.
-- **Evidence.** `grep` finds `checkScriptedRestPath` only in its module and tests; `fns()` (`rpc.ts:526–534`) exposes no `scriptedRest`; the `http.ts` comment claims an enforcing method that does not exist.
-- **Recommended fix.** Reword the `http.ts`/denylist comments to "defined but not yet wired," or remove the module until the tool exists; add a lint/test guard that any future `scriptedRest` path goes through `checkScriptedRestPath()`.
-- **Verdict:** confirmed (1/1 each lens).
+- **Impact.** Resolved. The generic scripted REST adapter and its unwired denylist were removed; the Worker exposes only table/query/aggregate/update plus `runServerScript`, and the executor path is pinned to the configured scoped endpoint.
+- **Evidence.** No `scriptedRest` method is exposed from `ServiceNowRPC.fns()`, and the old denylist module/test are deleted.
+- **Verdict:** resolved by deleting the unwired denylist surface and its tests.
 
 #### L-2 — Audit intent→outcome supersede breaks across UTC midnight, orphaning an `intent` row
 
@@ -169,13 +167,12 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 - **Recommended fix.** Consider dropping the global-REST install path entirely now that the scoped Fluent wrapper is canonical, or add a loud install-time warning; ensure scoped-verify S8b also asserts the scope-name form `/api/x_mcp/executor/run` is absent, not just the numeric form.
 - **Verdict:** confirmed (1/1).
 
-#### L-4 — No runtime assertion couples `AUDIT_KV`/`LEDGER_DO` presence to mutating mode; `HandlerEnv` re-declares `LEDGER_DO` optional
+#### L-4 — RESOLVED: live mutations require both `AUDIT_KV` and `LEDGER_DO`
 
-- **File:** `packages/mcp-server/src/tools/handlers.ts:41–49, 304–324, 372–381`
+- **File:** `packages/mcp-server/src/tools/handlers.ts`, `packages/mcp-server/src/sn/mutation-guard.ts`
 - **Category:** reliability / hygiene
-- **Impact.** `guardMutation` treats the idempotency ledger and durable audit sink as optional; both are attached only when their bindings are truthy. If either is absent at runtime, mutations still proceed with replay/dedup silently disabled and/or audit-before-effect never armed. `HandlerEnv.LEDGER_DO` is optional (`handlers.ts:45`) while the worker `Env.LEDGER_DO` is required (`index.ts:27`) — a type divergence. The mandatory `runKey` gate still fires independently, so this never bypasses the idempotencyKey requirement; it only soft-degrades the replay/audit layers under a non-standard config (the committed `wrangler.jsonc` binds both, so a standard deploy is unaffected). Reported as a hygiene gap, not a live fail-open.
-- **Recommended fix.** Add a mode-time assertion: when a mutation runs in write/admin_script mode, require `guard.ledger` and `guard.audit` (or assert the bindings at handler-build time for non-read-only deployments) and fail closed otherwise. Align `HandlerEnv.LEDGER_DO` with the required worker `Env`.
-- **Verdict:** confirmed (1/1).
+- **Resolution.** `buildHandlers` now marks live mutation wiring as `durabilityRequired`, and `guardMutation` refuses to execute a table update or executor POST unless both the idempotency ledger and durable audit sink are attached. Focused tests cover missing-ledger and missing-audit cases for both `tableUpdate` and `runServerScript`, asserting zero outbound mutation calls.
+- **Verdict:** resolved.
 
 #### L-5 — Discovery read paths count rows but not bytes (per-run + daily byte accounting gap)
 
@@ -221,13 +218,12 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 - **Recommended fix.** `const scopeMaxMode = isValidMode(props.maxMode) ? props.maxMode : "read_only";`
 - **Verdict:** confirmed (1/1).
 
-#### I-4 — `userId` defaults to `"operator"` in SchemaCache key — safe under the single-operator grant model
+#### I-4 — RESOLVED: authenticated runtime requires a real `userId`
 
-- **File:** `packages/mcp-server/src/index.ts:104, 424`
+- **File:** `packages/mcp-server/src/index.ts`, `packages/mcp-server/src/tools/handlers.ts`, `packages/mcp-server/src/auth/servicenow-auth-handler.ts`
 - **Category:** correctness / latent landmine
-- **Impact.** `userId = (props.userId as string) ?? "operator"` threads into the SchemaCache identity. The cache exists to prevent ACL-filtered field visibility leaking across users. It cannot collapse two users today: the only OAuth grant site hardcodes `userId:"operator"` in both credential modes; per-user SN identity rides the reauth ticket, not the MCP grant props. The `??` default (and the fact `??` does not catch `""`) is a latent landmine **only** if a future change emits per-user `userId` props.
-- **Recommended fix.** No change required now. If per-user MCP grants are introduced, reject empty/missing `userId` at the SchemaCache boundary (treat `""`/undefined as a hard error, not a shared default).
-- **Verdict:** confirmed (1/1).
+- **Resolution.** `/mcp` auth props now require a non-empty string `userId` before handler construction. `buildHandlers` consumes that validated identity for token-store keys, schema-cache keys, audit attribution, budget keys, and executor signing. Consent issuance now requires `MCP_OPERATOR_USER_ID`, so new grants cannot silently mint as a shared `"operator"` subject.
+- **Verdict:** resolved.
 
 #### I-5 — Top-level / apiHandler catch blocks log `e.message` without redaction
 
@@ -247,11 +243,11 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 
 #### I-7 — Deprecated standalone scripted-rest reference still contains the literal incident bug (dead `!object` reject = full signature bypass) if ever installed
 
-- **File:** `sn-executor-app/scripted-rest/x_mcp.executor.run.js:55–58`
+- **File:** historical deleted standalone scripted-rest reference
 - **Category:** fail-open / latent landmine
-- **Impact.** This reference executor calls `if (!new x_mcp.x_mcp_verify().verify(code, actor, sig)) { ...401... }`. The unified `verify()` now returns an **object** `{verified:boolean}` (`x_mcp_verify.js:115–145`), and `!{}` is always false — the reject branch is **dead code**, so every request (forged/unsigned/stale/replayed) falls through to `new Function(... code)` at server privilege. The precise twin of the recent incident. Mitigated today purely by process: the file header says "do NOT install this," it is not in the default install path, the opt-in global endpoint uses the correct object-aware check, the production Fluent wrapper does `if (!v.verified)` correctly, and the host-side denylist would block executor-shaped paths. No live impact — but a copy-pasteable full-bypass landmine of exactly the class that caused the incident.
-- **Recommended fix.** Delete the deprecated file outright (safest given incident history), or change its guard to `if (!new x_mcp.x_mcp_verify().run(code, actor, sig).verified)`.
-- **Verdict:** confirmed (1/1).
+- **Impact.** Resolved. The deprecated standalone scripted-rest reference was deleted, removing the copy-pasteable full-bypass landmine caused by treating the verifier result object as a boolean.
+- **Recommended fix.** Delete the deprecated file outright (safest given incident history).
+- **Verdict:** resolved by deleting the deprecated scripted-rest/update-set artifacts and removing the no-nonce `x_mcp_verify.run()` compatibility API.
 
 #### I-8 — Executor HMAC key encoding contract is unverified (host decodes base64 vs verifier passes string) — Phase 0.13a seam
 
@@ -267,7 +263,7 @@ if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode))
 
 **T-1: Fail-open on a degraded or absent control.** The most consistent pattern. Distinct instances:
 - **Dead ceilings:** the daily `sandboxRpcCalls` cap is configured but never reaches a comparison (M-1); discovery bytes are never metered (L-5). A ceiling that exists in config but not in the enforcement path reads as "protected" while protecting nothing.
-- **Dependency-failure degradation:** persistent `BUDGET_DO` accrual failure silently disables the daily rows/bytes ceiling (M-2); absent `AUDIT_KV`/`LEDGER_DO` bindings soft-degrade replay/audit (L-4). The asymmetry in M-2 (pre-run reserve fails *closed*, post-run accrue fails *open*) is the subtle, latent hazard.
+- **Dependency-failure degradation:** persistent `BUDGET_DO` accrual failure silently disables the daily rows/bytes ceiling (M-2). Missing `AUDIT_KV`/`LEDGER_DO` no longer soft-degrades live mutations; L-4 now fails closed before any mutation effect.
 - **Guard-described-but-not-wired:** the scripted-REST denylist is dead code while comments assert it is the live guard (L-1). This is the *exact* shape of the recent incident — a guard claimed active in comments/config but absent from the live path.
 
 **Recommendation:** adopt a rule that every configured ceiling has a test proving it can *deny*, and every "enforced by X" comment is backed by a wiring test. M-1, M-2, and L-1 would all have been caught by such tests.

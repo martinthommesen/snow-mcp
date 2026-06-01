@@ -5,15 +5,15 @@
 
 > **This document is the single source of truth, and it is self-contained.** Everything needed to build the project is here: overview and rationale (Overview), settled decisions (§1), verified APIs and facts (§2), architecture (§3), the phased build with a definition of done per unit of work (§6), the GA gate (§7), the threat model (§11), the role matrix (§12), per-API prerequisites (§13), and the corrected executor reference implementation (§10). No external report is required to build from this plan. **If an installed package's API no longer matches what is documented here, trust the installed package and official docs, and record the delta in `docs/DELTAS.md`.**
 
-**Revision note (v4 — "authorization-hardened").** This pass resolves a fourth review that approved Phase 0 but blocked Phase 1/4/5 implementation. The core finding: several properties were *claimed* ("signed", "enforced", "recoverable") but the implementation did not yet make them true. The material changes: (1) the executor now **verifies** the host-signed actor payload (HMAC + freshness + nonce replay, fail-closed) instead of trusting `body.actor` — without this, any `x_mcp.executor` caller could forge attribution (§2.0, §10, B1); (2) **`mode` is bounded by authorization, not requested freely** — `effectiveMode = min(requested, OAuth-scope, tenant, instance)`, and `admin_script` needs a tenant allowlist plus second approval (§2.0.1, §3.5, B3/B4); (3) **`integration_user` is a read-confidentiality risk in multi-user deployments** — an `ActorPolicy` layer now gates every RPC (instances/tables/fields/rows/bytes/mode), and `per_user_oauth` is the default unless ActorPolicy is implemented (§2.12, B5); (4) the executor **serializes safely** — it never `JSON.parse`es a truncated string and catches `JSON.stringify` failures (§10, B6); (5) a **concrete ACL-filtered pagination strategy** replaces the deferred one (§2.13, S5/B7); (6) generic `scriptedRest` is **explicitly denylisted** from the executor and sensitive paths so it cannot bypass `runServerScript()` (§3.2, B2); (7) budgets are **multi-dimensional** (unique Workers + RPC calls + ServiceNow requests + rows/bytes, per-run and daily) since Dynamic Workers also bill requests and CPU (§2.5); (8) ServiceNow OAuth is configured as a **confidential client** and refresh-token behavior is a proof gate (§2.8, B9); (9) **`OAUTH_KV` is a first-class binding** from day one (§2.4, §2.11, B8); (10) the TS-pipeline proof is **split** into no-import and allowed-import (bundle vs `modules`) and the type-check consequence is made actionable (§Phase 0.8a/0.8b). Also added: a ServiceNow-side **egress** threat for `runServerScript`, explicit **snapshot retention/encryption** policy, audit-table **role hardening**, and a **bypass-test** group (B1–B9). New hard-stop proofs are in Phase 0.13; full mapping in the changelog (§15).
+**Revision note (v4 — "authorization-hardened").** This pass resolves a fourth review that approved Phase 0 but blocked Phase 1/4/5 implementation. The core finding: several properties were *claimed* ("signed", "enforced", "recoverable") but the implementation did not yet make them true. The material changes: (1) the executor now **verifies** the host-signed actor payload (HMAC + freshness + nonce replay, fail-closed) instead of trusting `body.actor` — without this, any `x_mcp.executor` caller could forge attribution (§2.0, §10, B1); (2) **`mode` is bounded by authorization, not requested freely** — `effectiveMode = min(requested, OAuth-scope, tenant, instance)`, and `admin_script` needs a tenant allowlist plus second approval (§2.0.1, §3.5, B3/B4); (3) **`integration_user` is a read-confidentiality risk in multi-user deployments** — an `ActorPolicy` layer now gates every RPC (instances/tables/fields/rows/bytes/mode), and `per_user_oauth` is the default unless ActorPolicy is implemented (§2.12, B5); (4) the executor **serializes safely** — it never `JSON.parse`es a truncated string and catches `JSON.stringify` failures (§10, B6); (5) a **concrete ACL-filtered pagination strategy** replaces the deferred one (§2.13, S5/B7); (6) generic `scriptedRest` is not exposed, so it cannot bypass `runServerScript()` (§3.2, B2); (7) budgets are **multi-dimensional** (unique Workers + RPC calls + ServiceNow requests + rows/bytes, per-run and daily) since Dynamic Workers also bill requests and CPU (§2.5); (8) ServiceNow OAuth is configured as a **confidential client** and refresh-token behavior is a proof gate (§2.8, B9); (9) **`OAUTH_KV` is a first-class binding** from day one (§2.4, §2.11, B8); (10) the TS-pipeline proof is **split** into no-import and allowed-import (bundle vs `modules`) and the type-check consequence is made actionable (§Phase 0.8a/0.8b). Also added: a ServiceNow-side **egress** threat for `runServerScript`, explicit **snapshot retention/encryption** policy, audit-table **role hardening**, and a **bypass-test** group (B1–B9). New hard-stop proofs are in Phase 0.13; full mapping in the changelog (§15).
 
-**Revision note (v3 — "execution-safe").** This pass resolves the blockers from the third review. The material changes: (1) an explicit **ServiceNow credential mode** (`integration_user` vs `per_user_oauth`) replaces the previous ambiguity, with host-signed **actor attribution** required in integration mode; (2) `run_code` now **defaults to read-only**, with an **enforceable** (not advisory) mode→capability map — this reverses v2's permissive default (see §0.9, and confirm or override); (3) the TypeScript pipeline is corrected — with `DynamicWorkerExecutor` the right tool is an **esbuild-wasm transform to a JS string**, not `@cloudflare/worker-bundler`'s module map (§2.2, §3.4); (4) Durable Object storage is **split** into purpose-specific objects so global budgets and token isolation are actually enforceable (§2.10); (5) budget enforcement is an **atomic reserve-before-load** transaction (§2.5, Phase 4); (6) the executor's denied-attempt audit expectation is **corrected** (ACL-denied calls cannot write the app audit table) (§Phase 1.8, S8); (7) `allow_unsafe` is **removed** from v1 unless proven on the target family; (8) **idempotency is leveled** (host-mediated vs `runServerScript` vs internal) and a **recovery model** for destructive ops is added (§7.3, §7.7); (9) MCP **Origin validation** and a full **OAuth-negative** test suite are added; (10) compatibility date and local port are **unified**. Full mapping in the changelog (§14).
+**Revision note (v3 — "execution-safe").** This pass resolves the blockers from the third review. The material changes: (1) an explicit **ServiceNow credential mode** (`integration_user` vs `per_user_oauth`) replaces the previous ambiguity, with host-signed **actor attribution** required in integration mode; (2) `run_code` now **defaults to read-only**, with an **enforceable** (not advisory) mode→capability map — this reverses v2's permissive default (see §0.9, and confirm or override); (3) the TypeScript pipeline is corrected — with `DynamicWorkerExecutor` the right tool is an **esbuild-wasm transform to a JS string** (§2.2, §3.4); (4) Durable Object storage is **split** into purpose-specific objects so global budgets and token isolation are actually enforceable (§2.10); (5) budget enforcement is an **atomic reserve-before-load** transaction (§2.5, Phase 4); (6) the executor's denied-attempt audit expectation is **corrected** (ACL-denied calls cannot write the app audit table) (§Phase 1.8, S8); (7) `allow_unsafe` is **removed** from v1 unless proven on the target family; (8) **idempotency is leveled** (host-mediated vs `runServerScript` vs internal) and a **recovery model** for destructive ops is added (§7.3, §7.7); (9) MCP **Origin validation** and a full **OAuth-negative** test suite are added; (10) compatibility date and local port are **unified**. Full mapping in the changelog (§14).
 
 ---
 
 ## Overview — what this builds and why
 
-**What.** A Code Mode MCP server for ServiceNow, deployed as a stateless Cloudflare Worker (`createMcpHandler`) that exposes exactly three MCP tools — `run_code`, `describe_table`, `list_tables`. The LLM authors **TypeScript** against a typed `codemode.servicenow.*` surface; the host transpiles it (esbuild-wasm) and runs it in a **per-call Worker Loader sandbox** with no network (`globalOutbound: null`) and no credentials. The sandbox reaches ServiceNow only through a typed RPC binding (`ServiceNowRPC`) that the host holds — the OAuth header is injected host-side, never inside the sandbox. Two discovery tools (`describe_table`, `list_tables`) feed the model the schema it needs to write code.
+**What.** A Code Mode MCP server for ServiceNow, deployed as a stateless Cloudflare Worker (`createMcpHandler`) that exposes exactly three MCP tools — `run_code`, `describe_table`, `list_tables`. The LLM authors **TypeScript** against a typed `servicenow.*` surface; the host transpiles it (esbuild-wasm) and runs it in a **per-call Worker Loader sandbox** with no network (`globalOutbound: null`) and no credentials. The sandbox reaches ServiceNow only through a typed RPC binding (`ServiceNowRPC`) that the host holds — the OAuth header is injected host-side, never inside the sandbox. Two discovery tools (`describe_table`, `list_tables`) feed the model the schema it needs to write code.
 
 **Why this design (the safety thesis — the spine of the whole plan).** The connected identity is meant to reach **any table, any REST API, any record, and to run arbitrary server-side code** in ServiceNow. Safety does **not** come from removing capabilities; it comes from making that reach **recoverable, attributable, auditable, individually gateable, and revocable**. Concretely: credentials never enter the sandbox (only a typed RPC binding does); the arbitrary-script "executor" is a first-class capability but lives in a dedicated **scoped application (`x_mcp`)** with a custom role, a REST_Endpoint ACL, per-request audit logging (code hash + actor attribution, no script body), and a system-property **kill switch**; every mutating call carries host-signed actor metadata; destructive intent is declared per call via an enforced `mode` argument. "Maximum access, achieved safely" means the ceiling stays high while every use of it is named, logged, and reversible.
 
@@ -27,7 +27,7 @@
 - **Schema cache keys are user-aware**, not merely role-aware — ACL-filtered field visibility is per user (§2.6).
 - **The scoped-app executor is synchronous**, writes an audit row first (audit-first), then **verifies the signed actor**, checks the kill switch, enforces a UTF-8 **byte** cap, **serializes safely** (never parses a truncated result), and ships **no `allow_unsafe`** knob (§10, Phase 5).
 - **`runServerScript` is a ServiceNow-side egress channel.** `globalOutbound: null` only sandboxes the Cloudflare side; a server-side script can still call ServiceNow outbound APIs, so it carries its own tenant toggle, approval, and egress controls (§11, §13), and is labeled non-recoverable.
-- **The TypeScript path is `esbuild-wasm` transform → JS string → `DynamicWorkerExecutor.execute(...)`** (worker-bundler is a fallback only); esbuild **strips types, it does not type-check** — broken-type handling is decided in ADR-0001 (§2.2, §Phase 0.8).
+- **The TypeScript path is `esbuild-wasm` transform → JS string → `DynamicWorkerExecutor.execute(...)`**; esbuild **strips types, it does not type-check** — broken-type handling is decided in ADR-0001 (§2.2, §Phase 0.8).
 - **The MCP-client OAuth provider requires an `OAUTH_KV` binding** (separate from ServiceNow token storage; ServiceNow tokens never live in OAuth token props) (§2.4, §2.11).
 - **Table API `sysparm_limit` defaults to 10000** (we impose a host-side safety cap of 1000), and the limit is applied **before ACL evaluation** — so pages can be empty after filtering; the cursor strategy accounts for this (§2.13).
 - **Local MCP dev port is 8787** everywhere.
@@ -60,7 +60,7 @@ The **mechanisms** below are built regardless. Two **defaults** are policy choic
 
 **Decision 2 — ServiceNow credential mode (v4 default depends on audience).** See §2.0. `integration_user` delivers "maximum access" via a broad service identity and is the right default for a **single trusted operator** (e.g., a private engineering agent). But for any **multi-user / shared** deployment it creates a read-confidentiality problem: every authenticated MCP user would read *through* the broad identity, and audit does not prevent disclosure. So for shared deployments the default is **`per_user_oauth`**, OR `integration_user` **with the `ActorPolicy` layer (§2.12) implemented and enforced before every RPC** — pick one before Phase 1. `per_user_oauth` is the stronger-attribution / ACL-bounded alternative either way. This choice affects authorization, audit semantics, customer risk, and onboarding — decide it explicitly per deployment.
 
-**Two runtime targets.** Remote on Cloudflare Workers (Streamable HTTP) and local under `wrangler dev --port 8787` (Miniflare emulates the Worker Loader binding). No separate Node build of the server; a thin Node/stdio shim is an optional convenience (Phase 8).
+**Runtime target.** Cloudflare Workers Streamable HTTP, remote or local under `wrangler dev --port 8787` (Miniflare emulates the Worker Loader binding). There is no separate Node build of the server.
 
 ---
 
@@ -79,8 +79,8 @@ Settled. If evidence contradicts one, stop and record it in `docs/DELTAS.md` bef
 | MCP-client OAuth storage | `@cloudflare/workers-oauth-provider` with a dedicated **`OAUTH_KV`** binding | Provider requires it; ServiceNow tokens never live in OAuth props (§2.4, §2.11) |
 | Sandbox | Worker Loader (`env.LOADER`), one-shot `load()` per call (via the executor), `globalOutbound: null` | Isolation at the runtime level; cost handled by budgets (§2.5) |
 | Code Mode SDK | `@cloudflare/codemode` — `DynamicWorkerExecutor` + type-gen; thin MCP wrapper we own | Official RPC dispatch/normalization/log/timeout |
-| TS in sandbox | **esbuild-wasm `transform` → JS string**, passed to `execute(code: string, fns)`; worker-bundler only if 0.8 forces hand-rolled `load()` (§2.2) | The executor takes a string, not a module map |
-| Transport | Streamable HTTP (remote), stdio (optional local); SSE deprecated; **Origin validation required** | MCP 2025-11-25 transport spec |
+| TS in sandbox | **esbuild-wasm `transform` → JS string**, passed to `execute(code: string, fns)` (§2.2) | The executor takes a string, not a module map |
+| Transport | Streamable HTTP (remote and local); SSE deprecated; **Origin validation required** | MCP 2025-11-25 transport spec |
 | MCP spec target | `2025-11-25` family | Current stable revision |
 | IaC / deploy | Alchemy (`alchemy.run.ts`), `WorkerLoader` binding | One config for local + deploy |
 | Schema cache | Workers KV, ~24h TTL, **user-aware** keys; discoverability only; never cache records | ACL visibility is user-dependent (§2.6) |
@@ -154,16 +154,14 @@ The MCP-client token carries explicit scopes — `servicenow:read`, `servicenow:
 
 ### 2.2 Code Mode SDK + the corrected TypeScript pipeline
 
-`@cloudflare/codemode` exports `DynamicWorkerExecutor`, `ToolDispatcher`, `generateTypesFromJsonSchema`, `normalizeCode`, `sanitizeToolName`; `@cloudflare/codemode/ai` adds `generateTypes` (and `createCodeTool`, which we do not use — §3.4).
+`@cloudflare/codemode` exports `DynamicWorkerExecutor`, `ToolDispatcher`, `generateTypesFromJsonSchema`, `normalizeCode`, and `sanitizeToolName`. The optional AI-SDK helper surface is not used by this MCP server, and `ai` is not a direct runtime dependency.
 
-The executor interface is **`execute(code: string, fns: Record<string, Function>): Promise<ExecuteResult>`**. The `code` is a single JS source string (an async arrow the SDK normalizes); the executor builds the sandbox Worker internally and wires `codemode.*` to `fns` over Workers RPC. `DynamicWorkerExecutor` options: `loader` (required), `timeout` (default 30000ms), `globalOutbound` (`Fetcher|null`, default `null`), `modules` (`Record<string,string>` extra ES modules importable in the sandbox).
+The executor interface is **`execute(code: string, providers): Promise<ExecuteResult>`**. The `code` is a single JS source string (an async arrow the SDK normalizes); the executor builds the sandbox Worker internally and wires named provider globals to their functions over Workers RPC. `DynamicWorkerExecutor` options: `loader` (required), `timeout` (default 30000ms), `globalOutbound` (`Fetcher|null`, default `null`), `modules` (`Record<string,string>` extra ES modules importable in the sandbox).
 
-**Pipeline correction (this is a real v2 fix).** Because `execute()` takes a **string**, the TypeScript step is a **transform** (strip types, lower async/await) producing one JS string — runnable in the host Worker via **`esbuild-wasm`'s `transform`**. `@cloudflare/worker-bundler`'s `createWorker()` returns a **module map** (`mainModule`+`modules`) shaped for `env.LOADER.load()`, which is the **hand-rolled** path §3.4 rejects. So:
+**Pipeline correction (this is a real v2 fix).** Because `execute()` takes a **string**, the TypeScript step is a **transform** (strip types, lower async/await) producing one JS string — runnable in the host Worker via **`esbuild-wasm`'s `transform`**. The Worker Loader module-map fallback was not taken and is superseded by ADR-0001. So:
 
 - **Primary path (with the executor):** `esbuild-wasm.transform(userTs, { loader: "ts", format: "esm" })` → JS string → `executor.execute(jsString, fns)`. If the snippet needs npm imports (e.g. `zod`), either bundle to a single string with esbuild's stdin→stdout bundling, or inject allowed modules via the executor's `modules` option.
-- **Fallback (only if Phase 0.8 shows `execute()` cannot accept our transformed string and we must hand-roll `env.LOADER.load()`):** use `@cloudflare/worker-bundler` to produce the module map and call `load()` directly, re-implementing dispatch — explicitly the less-preferred path.
-
-**Phase 0.8 decides empirically and records the exact shape in ADR-0001.** Both `esbuild-wasm` and `@cloudflare/worker-bundler` run inside workerd (not plain Node), so tests use `@cloudflare/vitest-pool-workers`.
+**Phase 0.8 decides empirically and records the exact shape in ADR-0001.** `esbuild-wasm` runs inside workerd (not plain Node), so tests use `@cloudflare/vitest-pool-workers`.
 
 ### 2.3 `createMcpHandler` (from `agents/mcp`) + the CVE guard
 
@@ -238,13 +236,13 @@ Per `(user_id, instance_host, token_type)` row in `TokenStoreDO`:
   "iv": "...", "aad": "user_id|instance_host|token_type", "ciphertext": "...", "tag": "..." }
 ```
 
-Encrypt before store (WebCrypto AES-GCM, DEK from `env.TOKEN_KEK`); **fail closed on AAD mismatch**; rotate refresh tokens on every refresh; decrypt under current **and** previous KEK during a rotation window; revoking one instance's token must not affect another instance for the same user (S7).
+Encrypt before store (WebCrypto AES-GCM, DEK from `env.TOKEN_KEK`); **fail closed on AAD mismatch**; rotate refresh tokens on every refresh; decrypt under current **and** previous KEK during a rotation window; one instance's token state must not affect another instance for the same user (S7).
 
 ### 2.8 ServiceNow OAuth
 
-Inbound OAuth 2.0 via Application Registry; authorize `oauth_auth.do`, token `oauth_token.do`, revoke `oauth_revoke_token.do`. Authorization Code + PKCE (`S256`, KB1645540) for human/remote. MFA applies to U2M OAuth, **not** to ROPC — so the CI service identity uses ROPC/client-credentials; humans use PKCE.
+Inbound OAuth 2.0 via Application Registry; authorize `oauth_auth.do`, token `oauth_token.do`. Authorization Code + PKCE (`S256`, KB1645540) for human/remote. MFA applies to U2M OAuth, **not** to ROPC — so the CI service identity uses ROPC/client-credentials; humans use PKCE.
 
-**Confidential client + refresh-token proof (Phase 0.13e / Phase 1).** The Worker is server-side, so the ServiceNow OAuth app is registered as a **confidential client** (Authorization Code + PKCE **+ client secret**) when refresh tokens are required — ServiceNow's refresh-token behavior is tied to client type, and a public-client assumption can silently yield no usable refresh token. Do not assume; **prove** before building token lifecycle: does the chosen app type **return** a `refresh_token`? Is it **rotated** on refresh? Does `oauth_revoke_token.do` **invalidate** the expected credential? What happens under **MFA** and **session timeout**? This is gate **B9**, distinct from the general token-lifecycle tests (S7), which assume the refresh token exists and behaves as configured.
+**Confidential client + refresh-token proof (Phase 0.13e / Phase 1).** The Worker is server-side, so the ServiceNow OAuth app is registered as a **confidential client** (Authorization Code + PKCE **+ client secret**) when refresh tokens are required — ServiceNow's refresh-token behavior is tied to client type, and a public-client assumption can silently yield no usable refresh token. Do not assume; **prove** before building token lifecycle: does the chosen app type **return** a `refresh_token`? Is it **rotated** on refresh? What happens under **MFA** and **session timeout**? This is gate **B9**, distinct from the general token-lifecycle tests (S7), which assume the refresh token exists and behaves as configured.
 
 ### 2.9 Compatibility date — unified
 
@@ -312,7 +310,7 @@ S5 exercises the empty-page-after-ACL case explicitly (B7); the choice is record
 ### 3.1 Request/data flow
 
 ```
-MCP client ──Streamable HTTP (Origin-validated) / stdio──▶
+MCP client ──Streamable HTTP (Origin-validated)──▶
 OAuthProvider (workers-oauth-provider)            ← client↔Worker OAuth 2.1
   ├─ /authorize /token /register  → consent (CSRF/state/nonce) + upstream ServiceNow PKCE
   └─ apiRoute /mcp → apiHandler → createMcpHandler(createServer()) [per request]
@@ -323,7 +321,7 @@ OAuthProvider (workers-oauth-provider)            ← client↔Worker OAuth 2.1
         └─ ServiceNowRPC (RpcTarget; HOLDS the ServiceNow credential per §2.0 mode)
               │ run_code:  esbuild-wasm transform(TS→JS string)
               ▼            → executor.execute(jsString, fns)  [globalOutbound:null]
-           Dynamic Worker (per call) — sees ONLY codemode.servicenow.* (no env/token/fetch)
+           Dynamic Worker (per call) — sees ONLY servicenow.* (no env/token/fetch)
               ▼ Workers RPC
            ServiceNowRPC → ServiceNow REST (OAuth header host-side)
                            └─ runServerScript → x_mcp executor (role-gated, signed+verified actor, audited, kill-switchable)
@@ -336,7 +334,7 @@ size check
 → auth-context check (valid MCP token; audience/issuer/scope)
 → effective-mode resolution (§2.0.1: min(requested, scope, tenant, instance))
 → ActorPolicy check (§2.12: instance/table/mode/field/row)
-→ scriptedRest path-denylist check (§3.2)
+→ typed RPC path guards (§3.2)
 → budget reserve (§2.5: daily atomic, per-run init)
 → transpile/bundle (§2.2)
 → execute (sandbox; per-call actor signing for mutations/executor)
@@ -349,11 +347,11 @@ Authorization happens **before** transpile/execute, and budget reserve happens *
 
 ### 3.2 The three tools + scriptedRest path policy
 
-- **`run_code`** — `{ code: string (TS), mode?: "read_only"|"write"|"admin_script", reason?, idempotencyKey? }`. Default `read_only`. The model writes TS against `codemode.servicenow.*`.
+- **`run_code`** — `{ code: string (TS), mode?: "read_only"|"write"|"admin_script", reason?, idempotencyKey? }`. Default `read_only`. The model writes TS against `servicenow.*`.
 - **`describe_table`** — `{ table }`, read-only, user-aware KV cache.
 - **`list_tables`** — `{ filter? }`, read-only, paginated.
 
-`scriptedRest` (inside `ServiceNowRPC`) is a generic ServiceNow REST caller and must **not** become a bypass around `runServerScript()`'s mode gate, ledger, actor signing, and executor audit. Its **path policy** rejects absolute URLs, userinfo, and path traversal; permits only `/api/...`; and applies an explicit **denylist** that no generic call may reach:
+There is currently **no generic `scriptedRest` tool**. If one is introduced later, it must not become a bypass around `runServerScript()`'s mode gate, ledger, actor signing, and executor audit. Its **path policy** must reject absolute URLs, userinfo, and path traversal; permit only `/api/...`; and deny sensitive executor/config/audit/OAuth paths:
 
 ```
 /api/x_mcp/executor/*        # the executor — reachable ONLY via runServerScript()
@@ -364,7 +362,7 @@ Authorization happens **before** transpile/execute, and budget reserve happens *
 /login.do                    # login/UI
 ```
 
-**Only `runServerScript()` may call the executor endpoint**, and only after the effective-mode gate (§2.0.1), `ActorPolicy` (§2.12), ledger reservation (§7.3), actor signing (§2.0), and budget reserve (§2.5). Generic `scriptedRest` hitting any denylisted path returns typed `path_denied` (B2). Anything beyond `/api/...` stays off unless explicitly enabled per tenant.
+**Only `runServerScript()` may call the executor endpoint**, and only after the effective-mode gate (§2.0.1), `ActorPolicy` (§2.12), ledger reservation (§7.3), actor signing (§2.0), and budget reserve (§2.5). B2 is currently proven by the absence of a generic scripted-REST RPC surface; any future generic adapter must reintroduce the deny policy with tests.
 
 ### 3.3 The `ServiceNowRPC` binding (the security boundary)
 
@@ -372,7 +370,7 @@ Authorization happens **before** transpile/execute, and budget reserve happens *
 
 ### 3.4 "Official SDK vs hand-rolled" (decision)
 
-Use `DynamicWorkerExecutor` + codemode type-gen; own a thin MCP `run_code` wrapper. `createCodeTool` returns an AI-SDK `Tool` for `streamText` (we are an MCP server, so we don't consume it). We do **not** hand-roll `env.LOADER.load()` (discards the executor's dispatch/normalization/log/timeout). The wrapper only: transforms TS→JS string (§2.2), calls `executor.execute(jsString, fns)`, serializes for MCP. **Phase 0.8 proves the exact `execute()` contract and the TS pipeline before this is built.** ADR-0001 records: the exact user-authored code shape; the exact wrapper generated around user code; the exact string passed to `execute()`; the exact `fns` shape; how imports are allowed/blocked; whether `export default` is accepted or rejected. **Every sample in the plan then conforms to that one shape.**
+Use `DynamicWorkerExecutor` + codemode type-gen; own a thin MCP `run_code` wrapper. We do not use the optional AI-SDK `createCodeTool` helper because this package serves MCP tools directly. We do **not** hand-roll `env.LOADER.load()` (discards the executor's dispatch/normalization/log/timeout). The wrapper only: transforms TS→JS string (§2.2), calls `executor.execute(jsString, fns)`, serializes for MCP. **Phase 0.8 proves the exact `execute()` contract and the TS pipeline before this is built.** ADR-0001 records: the exact user-authored code shape; the exact wrapper generated around user code; the exact string passed to `execute()`; the exact `fns` shape; how imports are allowed/blocked; whether `export default` is accepted or rejected. **Every sample in the plan then conforms to that one shape.**
 
 ### 3.5 Capability/mode layer — enforced from day one
 
@@ -381,16 +379,17 @@ Advisory enforcement is a false sense of safety, so the mode is **enforced**:
 ```ts
 export const DEFAULT_MODE = "read_only"; // Decision 1 (§0.9); flip for private demos
 export const MODE_CAPABILITIES = {
-  read_only:   ["readTables", "attachmentsRead"],
-  write:       ["readTables", "writeTables", "importSets", "attachmentsRead", "attachmentsWrite"],
-  admin_script:["readTables", "writeTables", "deleteRecords", "importSets",
-                "attachmentsRead", "attachmentsWrite", "runServerScript"],
+  read_only:   ["readTables"],
+  write:       ["readTables", "writeTables"],
+  admin_script:["readTables", "writeTables", "runServerScript"],
 } as const;
 ```
 
 For a given `run_code` invocation the **effective** mode (§2.0.1: `min(requested, OAuth-scope, tenant, instance)`) constrains which `ServiceNowRPC` methods the sandbox may call; out-of-mode calls throw a typed `capability_denied` recorded in the audit/ledger. The requested `mode` can only narrow — it never grants — so the read-only default cannot be bypassed by asking for `admin_script`. (Permissive override: set `DEFAULT_MODE` and widen `read_only`'s capabilities; document as a private-deployment posture. The override changes the *floor*, not the scope/tenant/instance *ceiling*.)
 
-**Human approval for destructive operations.** A declared `mode:"admin_script"` is **not** the same as approval. `deleteRecords`, `runServerScript`, broad `importSet`s, and attachment writes additionally require one of: MCP **elicitation/confirmation** (stateful variant only, §10.1), Cloudflare **Access-group** membership, a tenant-configured **approval token**, or **dry-run → explicit approve → execute**. Because the stateless `createMcpHandler` shape cannot elicit, stateless deployments use the Access-group/approval-token/dry-run paths; elicitation is available only in the stateful variant. The current design is safe enough for a trusted autonomous engineering agent; a broad user population should require approval here. (Tracked in Phase 7; `reason` is mandatory for `admin_script`.)
+Only implemented RPC sinks appear in the live map. Future `deleteRecords`, `importSet`, catalog, or attachment methods must add their own capability names, audit/ledger wiring, and tests when they are implemented.
+
+**Human approval for destructive operations.** A declared `mode:"admin_script"` is **not** the same as approval. `runServerScript` additionally requires one of: Cloudflare **Access-group** membership or a tenant-configured **approval token** (MCP elicitation/confirmation remains available only in a future stateful variant, §10.1). Future `deleteRecords`, broad `importSet`s, and attachment writes must require `reason` + approval before being exposed. Because the stateless `createMcpHandler` shape cannot elicit, stateless deployments use the Access-group/approval-token paths. The current design is safe enough for a trusted autonomous engineering agent; a broad user population should require approval here. (Tracked in Phase 7; `reason` is mandatory for `admin_script`.)
 
 ---
 
@@ -409,7 +408,7 @@ servicenow-codemode-mcp/
 │  │  │  │  ├─ mcp-oauth.ts                # OAuthProvider config; client-token issue/validate; storage binding
 │  │  │  │  ├─ servicenow-auth-handler.ts  # consent (CSRF) + upstream ServiceNow PKCE
 │  │  │  │  ├─ pkce.ts                     # verifier/state/nonce → AuthCorrelationDO
-│  │  │  │  ├─ oauth.ts                    # ServiceNow exchange/refresh/revoke
+│  │  │  │  ├─ servicenow-oauth.ts         # ServiceNow exchange/refresh helpers
 │  │  │  │  ├─ actor.ts                    # canonicalize + HMAC-sign actor metadata (§2.0); executor verifies
 │  │  │  │  ├─ token-store.ts              # TokenStoreDO adapter, versioned envelope
 │  │  │  │  └─ crypto.ts                   # AES-GCM envelope, KEK versioning
@@ -420,11 +419,10 @@ servicenow-codemode-mcp/
 │  │  │  ├─ tools/ run_code.ts · describe_table.ts · list_tables.ts
 │  │  │  ├─ sandbox/
 │  │  │  │  ├─ transpile.ts                # esbuild-wasm transform (TS→JS string)  [primary]
-│  │  │  │  ├─ bundler-fallback.ts         # worker-bundler module map  [only if 0.8 forces load()]
 │  │  │  │  ├─ executor.ts                 # DynamicWorkerExecutor factory + serialize()
+│  │  │  │  ├─ serialize.ts                # safe executor envelope serialization
 │  │  │  │  └─ types.ts                    # codemode type-gen for the ServiceNow surface
-│  │  │  ├─ sn/ rpc.ts · client.ts · table.ts · aggregate.ts · attachment.ts · import-set.ts
-│  │  │  │     · cmdb.ts · knowledge.ts · catalog.ts · scripted-rest.ts · executor-client.ts · errors.ts
+│  │  │  ├─ sn/ rpc.ts · http.ts · discovery.ts · mutation-guard.ts · run-budget.ts · errors.ts
 │  │  │  ├─ cache/ schema.ts
 │  │  │  ├─ do/ auth-correlation.ts · token-store.ts · budget.ts · mutation-ledger.ts
 │  │  │  ├─ recovery/ snapshots.ts         # before/after snapshots for configured tables (§7.7)
@@ -433,15 +431,15 @@ servicenow-codemode-mcp/
 │  │  │                                    #   + ActorPolicy defaults + multi-dim budgets + compat date
 │  │  ├─ wrangler.jsonc / worker-configuration.d.ts   # incl. OAUTH_KV binding
 │  └─ shared/src/types.ts
-├─ sn-executor-app/                         # scoped app x_mcp (update-set source)
-│  ├─ README.md / update-set/x_mcp.xml
+├─ sn-executor-app/                         # scoped app x_mcp (Fluent source)
+│  ├─ README.md / fluent/
 │  ├─ tables/x_mcp_audit_log.xml            # records snow user + mcp actor + actor_verified
 │  ├─ tables/x_mcp_nonce.xml                # actor-replay nonce store (TTL-pruned) (§2.0, §10)
 │  ├─ roles/x_mcp.executor.xml · roles/x_mcp.admin.xml
 │  ├─ acl/x_mcp_executor_endpoint.xml       # REST_Endpoint ACL → x_mcp.executor
 │  ├─ acl/x_mcp_audit_log_*.xml             # read/write → x_mcp.admin only (executor cannot read/alter)
 │  ├─ script-include/x_mcp_verify.js        # HMAC verify (current+prev key) + nonce replay (§2.0)
-│  ├─ scripted-rest/x_mcp.executor.run.js   # synchronous; audit-first; verify signed actor; byte cap; SAFE serialize
+│  ├─ fluent/src/server/x_mcp_executor.js   # synchronous; audit-first; verify signed actor; byte cap; SAFE serialize
 │  └─ properties/ enabled · max_bytes · max_output_bytes · timeout_ms
 │                · run_server_script_enabled · hmac_secret · hmac_secret_prev
 ├─ tests/ unit/ · integration/ · bypass/      # B1–B9 (§6 Phase 9)
@@ -459,19 +457,14 @@ Pin **EXACT** for every runtime-critical package; carets only for pure dev tooli
 |---|---|---|---|
 | `@cloudflare/codemode` | EXACT | `0.3.8` | executor + type-gen |
 | `esbuild-wasm` | EXACT | (latest, confirm) | **primary** TS→JS transform inside workerd |
-| `@cloudflare/worker-bundler` | EXACT | `0.1.3` (closed beta) | **fallback** module-map bundling (only if 0.8 forces `load()`) |
 | `agents` | EXACT | `0.13.3` | `createMcpHandler`, `getMcpAuthContext`, `WorkerTransport`, `Agent` |
 | `@modelcontextprotocol/sdk` | EXACT | `1.29.0` (min 1.26.0) | `McpServer`, transports, schemas |
 | `@cloudflare/workers-oauth-provider` | EXACT | (confirm) | MCP-client OAuth 2.1 provider |
 | `wrangler` | EXACT | `4.95.0` | dev runtime + `wrangler types` |
 | `alchemy` | EXACT | `0.87.0` | IaC; WorkerLoader binding (min 0.71.0) |
-| `hono` | EXACT | `4.12.23` | routing |
 | `zod` | EXACT | `4.4.3` | tool input schemas |
-| `ai` | EXACT | (match codemode peer) | peer of `@cloudflare/codemode/ai` type-gen |
 | `@cloudflare/vitest-pool-workers` | EXACT | (match wrangler) | **required** to test transpile + loader inside workerd |
-| `vitest` / `@modelcontextprotocol/inspector` / `typescript` | caret (dev) | 3.x / `0.21.2` / 5.x | runner / E2E client / language |
-
-Note: depending on Phase 0.8, `@cloudflare/worker-bundler` may be **unused**; keep it only if the fallback path is taken.
+| `vitest` / `typescript` | caret (dev) | 4.x / 5.x | runner / language |
 
 ---
 
@@ -482,8 +475,8 @@ Note: depending on Phase 0.8, `@cloudflare/worker-bundler` may be **unused**; ke
 **Goal:** a workspace that builds and deploys a trivial Worker, every version/API confirmed, and the high-risk contracts proven.
 
 - **0.1 Version/API reconciliation** → `docs/DELTAS.md`.
-- **0.2–0.7** workspace, deps, Alchemy skeleton (four DOs + LOADER + KV + secrets, unified compat date), hello MCP server (per-request), Vitest workers pool, `/health`.
-- **0.8a Code Mode execution-contract + no-import transform proof (REQUIRED before Phase 4).** Take a **no-import** TS snippet calling `codemode.servicenow.tableQuery(...)` against a **mock** RPC. Transform TS→JS with **esbuild-wasm** (`transform`, not bundle); call `DynamicWorkerExecutor.execute(jsString, fns)`. Assert: (a) the snippet can call `codemode.*`; (b) global `fetch` unavailable under `globalOutbound:null`; (c) `console.log/warn/error` captured; (d) thrown TS/runtime errors map to a typed MCP error; (e) timeout observable; (f) **`execute()` accepts the transformed string** (if not, switch to the worker-bundler+`load()` fallback and document why).
+- **0.2–0.7** workspace, deps, Alchemy skeleton (four DOs + LOADER + KV + secrets, unified compat date), three-tool MCP server (per-request), Vitest workers pool, `/health`.
+- **0.8a Code Mode execution-contract + no-import transform proof (REQUIRED before Phase 4).** Take a **no-import** TS snippet calling `servicenow.tableQuery(...)` against a **mock** RPC. Transform TS→JS with **esbuild-wasm** (`transform`, not bundle); call `DynamicWorkerExecutor.execute(jsString, fns)`. Assert: (a) the snippet can call `servicenow.*`; (b) global `fetch` unavailable under `globalOutbound:null`; (c) `console.log/warn/error` captured; (d) thrown TS/runtime errors map to a typed MCP error; (e) timeout observable; (f) **`execute()` accepts the transformed string**.
 - **0.8b Allowed-import proof.** `esbuild-wasm transform` only strips types — it does **not** bundle imports. Prove how an allowed import (e.g. `zod`) reaches the sandbox: either **bundle to one JS string** (esbuild stdin→stdout bundling) or **inject the module** via the executor's `modules` option. Record which, and the allow/deny policy for imports. **Also decide broken-type handling and make it actionable:** `transform` catches **syntax** errors only, not type errors; choose (i) accept runtime-only typing, (ii) run `tsc --noEmit` on the snippet for real type-checking (cost/latency tradeoff), or (iii) a lint subset. **Write ADR-0001** with the exact code shape, wrapper, `execute()` string, `fns` shape, import strategy, type-check decision, and `export default` accept/reject. **Then conform every sample in the plan to that shape.**
 - **0.9 Pricing/cost-shape proof** (§2.5) → runbook note; stub the **multi-dimensional** `BudgetDO` interface (atomic reserve for workers + RPC + SN-requests + rows/bytes; per-run counters).
 - **0.10 OAuthProvider storage/config proof.** Confirm `@cloudflare/workers-oauth-provider` persists clients/grants/tokens in the **`OAUTH_KV`** binding (declare it now); prove a minimal authorize→token→/mcp round-trip with a mock upstream; confirm scopes (`servicenow:read|write|admin_script`) land in `auth.props`.
@@ -494,9 +487,9 @@ Note: depending on Phase 0.8, `@cloudflare/worker-bundler` may be **unused**; ke
   - **0.13b Effective-mode proof.** `requestedMode` is capped by OAuth scope ∩ tenant ∩ instance; asking for `admin_script` without scope is denied. → B3/B4.
   - **0.13c Integration-user read-policy proof.** An actor cannot read a table/field outside `ActorPolicy` even though `integration_user` can. → B5.
   - **0.13d OAuth storage proof.** `OAUTH_KV` exists and provider data is isolated from `TokenStoreDO`; missing `OAUTH_KV` fails. → B8.
-  - **0.13e ServiceNow OAuth refresh proof.** The chosen (confidential) app type returns / rotates / revokes refresh tokens as assumed, incl. MFA/timeout behavior. → B9.
+  - **0.13e ServiceNow OAuth refresh proof.** The chosen (confidential) app type returns and rotates refresh tokens as assumed, incl. MFA/timeout behavior. → B9.
 
-**DoD:** trivial Worker deploys/runs; Inspector lists `hello`; **0.8a/0.8b pass and ADR-0001 is written**; 0.10–0.13 pass (the 0.13 hard-stops gate Phase 1/4/5); `DELTAS.md` populated; one compat date used everywhere; `OAUTH_KV` + `X_MCP_EXECUTOR_HMAC_KEY` declared.
+**DoD:** trivial Worker deploys/runs; HTTP client lists `run_code`, `describe_table`, and `list_tables`; **0.8a/0.8b pass and ADR-0001 is written**; 0.10–0.13 pass (the 0.13 hard-stops gate Phase 1/4/5); `DELTAS.md` populated; one compat date used everywhere; `OAUTH_KV` + `X_MCP_EXECUTOR_HMAC_KEY` declared.
 
 ### Phase 1 — Auth (both layers), credential mode, client, discovery, scoped-app spike (≈5–6 days; may split)
 
@@ -533,7 +526,7 @@ Note: depending on Phase 0.8, `@cloudflare/worker-bundler` may be **unused**; ke
 - **3.2 Aggregate** (counts without paging rows).
 - **3.3 Attachment reads** — `attachmentList` (metadata); `attachmentGet` with a **concrete memory cap and response shape** (stream; return base64 only under cap, else a reference + `truncated` — base64 in MCP balloons fast).
 - **3.4 CMDB/Knowledge/Catalog reads.**
-- **3.5 Type surface** → `generateTypes` (snapshot test).
+- **3.5 Type surface** → generated from the ServiceNow RPC schemas (snapshot test).
 - **3.6 Mutating methods (defined, gated, attributed).** `tableCreate/Update/Delete`, `importSet`, attachment writes, catalog add/submit, `runServerScript` — each takes an idempotency key, routes through the **enforced** effective-mode gate (§2.0.1/§3.5) and the mutation ledger (§7.3), and (integration mode) attaches the **signed** actor metadata that the executor **verifies** (§2.0). Destructive ops (`tableDelete`, `runServerScript`, broad `importSet`, attachment writes) additionally require the approval gate (§3.5) and a mandatory `reason`.
 
 **DoD:** read methods unit-tested vs PDI (happy + ≥1 typed error), **with `ActorPolicy` and per-run budget enforced on reads**; type-surface snapshot stable; mutating methods present and gated (exercised in 4/5).
@@ -541,10 +534,10 @@ Note: depending on Phase 0.8, `@cloudflare/worker-bundler` may be **unused**; ke
 ### Phase 4 — `run_code` with the (corrected) TS pipeline + atomic budgets (≈3 days)
 
 - **4.1 `config.ts`** limits + `DEFAULT_MODE`/`MODE_CAPABILITIES` + OAuth-scope→mode map + `ActorPolicy` defaults + **multi-dimensional budgets** (per-run + daily, §2.5) + the single compat date.
-- **4.2 `sandbox/transpile.ts`** — **esbuild-wasm `transform`** (TS→JS string) per ADR-0001; structured bundler/type errors (file+line), never raw into the host. (`bundler-fallback.ts` only if 0.8 took the fallback.)
+- **4.2 `sandbox/transpile.ts`** — **esbuild-wasm `transform`** (TS→JS string) per ADR-0001; structured transform/type errors (file+line), never raw into the host.
 - **4.3 `sandbox/types.ts`** — inject the `declare const codemode: { servicenow: {…} }` surface into the tool description.
 - **4.4 `sandbox/executor.ts`** — `DynamicWorkerExecutor({ loader, globalOutbound:null, timeout })`; `serialize(result, cap)` (truncate to `{truncated:true,total:N,sample}`; capture logs; map thrown errors).
-- **4.5 `observability/budget.ts` + `BudgetDO`** — **multi-dimensional atomic reserve-before-load** (§2.5). The full enforced order (§3.1) is: **size → auth-context → effective-mode (§2.0.1) → ActorPolicy (§2.12) → scriptedRest denylist (§3.2) → budget reserve → transpile/bundle → execute → RPC-call accounting → SN-request accounting → audit/ledger finalize.** Authorization precedes transpile; reserve precedes `load()` (an unauthorized or exhausted caller never creates a billable Worker). Per-run counters trip mid-snippet; daily hard breaker → typed `budget_exceeded`; emit each dimension as a logged metric.
+- **4.5 `observability/budget.ts` + `BudgetDO`** — **multi-dimensional atomic reserve-before-load** (§2.5). The full enforced order (§3.1) is: **size → auth-context → effective-mode (§2.0.1) → ActorPolicy (§2.12) → typed RPC path guards (§3.2) → budget reserve → transpile → execute → RPC-call accounting → SN-request accounting → audit/ledger finalize.** Authorization precedes transpile; reserve precedes execution (an unauthorized or exhausted caller never creates a billable Worker). Per-run counters trip mid-snippet; daily hard breaker → typed `budget_exceeded`; emit each dimension as a logged metric.
 - **4.6 `tools/run_code.ts`** — `{ code, mode?, reason?, idempotencyKey? }`; default `read_only`; `reason` mandatory for `admin_script`; pipeline per the §3.1 order → `{ content:[{type:"text",text}], isError, mutations? }`. Reject oversize code pre-transpile; reject `mode_not_permitted` pre-transpile.
 - **4.7 Wire into `server.ts`.** Introduce a **minimal redactor now** (logs may appear in dev) and expand in Phase 7.
 
@@ -584,7 +577,7 @@ Write `docs/ROLE_MATRIX.md`. **If `integration_user`:** the broad role set appli
   - **Level 2 — `runServerScript` invocation:** dedupe by **script-hash + idempotency key before execution only**; ledger state `started|completed|failed|indeterminate`; **a retry after `indeterminate` must not silently re-execute.**
   - **Level 3 — internal ServiceNow mutations inside arbitrary script:** **not individually idempotent** unless the script implements its own keys. Documented as a limitation, not a guarantee.
 - **7.4 Origin validation** (`observability/origin.ts`): remote rejects invalid `Origin` (403); local binds to localhost (documented dev exception). → S12.
-- **7.5 Token lifecycle** refresh-rotation (audited), revoke on logout (`oauth_revoke_token.do` + delete row + invalidate the MCP-client session mapping), corrupt/AAD-mismatch → `reauth_required`.
+- **7.5 Token lifecycle** refresh-rotation (audited), corrupt/AAD-mismatch → `reauth_required`. There is no logout/revocation route in the current product surface; add one with explicit tests before reintroducing host token-delete plumbing.
 - **7.6 `/health`** → `{ instance: "online"|"hibernating", ok }`.
 - **7.7 Recovery model (`recovery/snapshots.ts`, `docs/RECOVERY.md`).** "Recoverable" needs more than hashes:
   - **`tableUpdate`:** store encrypted before/after field snapshots for **configured** tables, or rely on `sys_audit` where sufficient.
@@ -592,15 +585,15 @@ Write `docs/ROLE_MATRIX.md`. **If `integration_user`:** the broad role set appli
   - **`runServerScript`:** **no general rollback guarantee** — labeled high-risk `admin_script`.
   - **`importSet`/catalog:** idempotency plus created-record references for cleanup.
   - If raw snapshots are too sensitive for a tenant, **say so and narrow the recovery claim** for that tenant rather than implying full reversibility.
-  - **Snapshot store policy (`docs/RETENTION.md`) — a snapshot store is itself sensitive data.** Specify: **retention period** (default e.g. 30 days, then purge), **encryption key + version** (dedicated `SNAPSHOT_KEK`, rotated), **who can decrypt** (admin role + key holder), a **deletion workflow** (scheduled purge), **PII classification** (snapshots may contain PII), and **tenant opt-out** (recovery claim narrowed when off). "Recoverable" must not silently become "we built a second sensitive database."
+  - **Snapshot store policy (`docs/RETENTION.md`) — a snapshot store is itself sensitive data.** Specify: **retention period** (default e.g. 30 days via KV auto-expiry), **encryption key + version** (dedicated `SNAPSHOT_KEK`, rotated), **who can decrypt** (admin role + key holder), a **deletion workflow** (KV TTL), **PII classification** (snapshots may contain PII), and explicit table enablement via `SNAPSHOT_ENABLED_TABLES` (recovery claim narrowed when empty). "Recoverable" must not silently become "we built a second sensitive database."
 - **7.8 Deploy-path protection** Cloudflare Access / IP allow-list on `/admin/*`; production `/mcp` requires a valid MCP-client token (enforced by the provider) **with audience/issuer/scope checked before tool invocation** (→ O8).
-- **7.9 Destructive-op approval (§3.5).** Implement `authz/approval.ts`: `admin_script` requires a tenant allowlist + a second approval (Access-group / approval-token / dry-run→approve→execute; elicitation only in the stateful variant §10.1). `deleteRecords` is `admin_script`-only and soft-delete-preferred; `runServerScript`/broad `importSet`/attachment writes require `reason` + approval. → B3/B4.
+- **7.9 Destructive-op approval (§3.5).** Implement `authz/approval.ts`: `admin_script` requires a tenant allowlist + a second approval (Access-group / approval-token; elicitation only in the stateful variant §10.1). `runServerScript` requires `reason` + approval. Future `deleteRecords`/broad `importSet`/attachment write surfaces must add their own capability names and approval wiring when implemented. → B3/B4.
 
-**DoD:** redaction tested; writes/deletes/script audited with both identities; **Level-1 replay returns the original result; Level-2 `indeterminate` retry does not re-execute**; Origin validation (S12) passes; refresh/revoke/corruption per spec; `/health` reports hibernation; recovery evidence exists (S18).
+**DoD:** redaction tested; writes/deletes/script audited with both identities; **Level-1 replay returns the original result; Level-2 `indeterminate` retry does not re-execute**; Origin validation (S12) passes; refresh/corruption per spec; `/health` reports hibernation; recovery evidence exists (S18).
 
-### Phase 8 — Local stdio shim (optional, ≈0.5 day)
+### Phase 8 — Local Worker smoke (≈0.5 day)
 
-`bin/stdio.ts` shares `createServer()` and connects `StdioServerTransport`. `run_code` proxies to a local **`wrangler dev --port 8787`** (Worker Loader needs workerd) or returns a clear "use the HTTP endpoint" message. Document the choice in `DELTAS.md`.
+Run local verification through **`wrangler dev --port 8787`** so the Worker Loader, OAuthProvider, DOs, and `/mcp` transport match the deployed runtime. A separate Node stdio shim was removed because it could not execute `run_code` and created a second partial runtime story.
 
 ### Phase 9 — Full test plan (≈3 days; written alongside earlier phases)
 
@@ -612,9 +605,9 @@ Vitest + `@cloudflare/vitest-pool-workers`. **CI matrix:**
 
 Named tests (specs as docstrings):
 
-- **S1** network isolation; **S2** credential non-leakage; **S2-auth** MCP-auth user/instance isolation; **S3** TS transpile (valid/zod-import/broken→file+line); **S4** run_code guardrails (oversize/timeout/truncation/thrown/console); **S5** Table API resilience + pagination edge cases (compose/encode/inject-reject/insert/delete/ACL-hidden/ACL-empty-page-advance per §2.13 → B7); **S6** user-aware schema cache + negative case (B with same role but failing a field/scripted ACL must not get A's field); **S7** token lifecycle (refresh/revoke/corrupt/AAD/KEK-window/per-instance/clock-skew); **S8** executor governance (**ACL-denied observed via platform/gateway log, not app audit**; **forged/missing/stale/replayed actor rejected → B1**; allowed writes both-user audit row with `actor_verified`; `audit_id` returned); **S9** kill switch (503 + `status="killed"`, audit-first; resumes without redeploy); **S10** E2E via Inspector at `http://localhost:8787/mcp` then remote with MCP-client OAuth; **S11** budget breaker (distinct snippets trip the daily counter before `load()`; metric logged).
+- **S1** network isolation; **S2** credential non-leakage; **S2-auth** MCP-auth user/instance isolation; **S3** TS transpile (valid/zod-import/broken→file+line); **S4** run_code guardrails (oversize/timeout/truncation/thrown/console); **S5** Table API resilience + pagination edge cases (compose/encode/inject-reject/insert/delete/ACL-hidden/ACL-empty-page-advance per §2.13 → B7); **S6** user-aware schema cache + negative case (B with same role but failing a field/scripted ACL must not get A's field); **S7** token lifecycle (refresh/corrupt/AAD/KEK-window/per-instance/clock-skew); **S8** executor governance (**ACL-denied observed via platform/gateway log, not app audit**; **forged/missing/stale/replayed actor rejected → B1**; allowed writes both-user audit row with `actor_verified`; `audit_id` returned); **S9** kill switch (503 + `status="killed"`, audit-first; resumes without redeploy); **S10** E2E via HTTP client at `http://localhost:8787/mcp` then remote with MCP-client OAuth; **S11** budget breaker (distinct snippets trip the daily counter before `load()`; metric logged).
 - **S12 — Origin validation / DNS rebinding.** Invalid Origin → 403 remote; local binds localhost; valid clients work.
-- **S13 — OAuth negative.** O1 redirect_uri exact (not prefix) match; O2 missing/invalid state; O3 stale/replayed state; O4 wrong PKCE verifier; O5 unknown client_id; O6 registration metadata sanitized; O7 consent cannot be skipped via cached upstream auth; O8 MCP token audience/issuer/scope checked before tool invocation; O9 instanceHost cannot be swapped during callback; O10 logout/revoke invalidates **both** the MCP-client session and the ServiceNow credential mapping.
+- **S13 — OAuth negative.** O1 redirect_uri exact (not prefix) match; O2 missing/invalid state; O3 stale/replayed state; O4 wrong PKCE verifier; O5 unknown client_id; O6 registration metadata sanitized; O7 consent cannot be skipped via cached upstream auth; O8 MCP token audience/issuer/scope checked before tool invocation; O9 instanceHost cannot be swapped during callback.
 - **S14 — Budget concurrency.** Parallel distinct snippets cannot exceed the **global** cap (atomic reserve across the single global-keyed object).
 - **S15 — URL allowlist canonicalization / SSRF.** Per Phase 2.4.
 - **S16 — ServiceNow scoped-app cross-scope reach.** Per Phase 1.8/5, on a clean instance.
@@ -624,14 +617,14 @@ Named tests (specs as docstrings):
 **Bypass group (B1–B9) — the v4 "is the claim actually true?" tests.** Each targets a property the plan asserts:
 
 - **B1 — Forged actor metadata rejected.** A request with a tampered `mcp_actor_email`/`mcp_actor_user_id`, a missing signature, a stale `issued_at`, or a replayed `nonce` is rejected by the executor (401, `status="rejected"`); only a valid signature yields `actor_verified=true` (§2.0, §10).
-- **B2 — Generic `scriptedRest` cannot reach the executor.** `scriptedRest("/api/x_mcp/executor/run", ...)` (and the other denylisted paths) returns `path_denied`; the executor is reachable only via `runServerScript()` (§3.2).
+- **B2 — Generic `scriptedRest` cannot reach the executor.** No generic scripted-REST RPC exists; the executor is reachable only via `runServerScript()` (§3.2). If a generic adapter is introduced, it must deny executor/config/audit/OAuth paths with tests.
 - **B3 — `admin_script` denied without the OAuth scope.** A client without `servicenow:admin_script` requesting `mode:"admin_script"` is denied `mode_not_permitted`, even with a tenant allowlist (§2.0.1).
 - **B4 — Read-only cannot self-escalate.** A `read_only`-scoped client cannot reach `write`/`admin_script` by passing `mode` in the tool input alone (§2.0.1/§3.5).
 - **B5 — `integration_user` honors `ActorPolicy` on reads.** An actor cannot read a table/field outside its `ActorPolicy` even though `mcp_integration_user` can; returns `actor_policy_denied` (§2.12).
 - **B6 — Truncated executor output is a valid envelope.** A large/over-cap or non-serializable result returns `{ result:null, result_sample, truncated:true }` (or a typed serialize error) — never a thrown `JSON.parse` after the audit row was written (§10).
 - **B7 — Empty page after ACL filtering does not stall.** Per the §2.13 strategy, a keyset page blanked by ACL filtering still advances (or returns `partial:true`); no infinite loop, no skipped visible rows (extends S5).
 - **B8 — Missing `OAUTH_KV` fails.** Deploy/tests fail closed when the `OAUTH_KV` binding is absent (§2.4/§2.11).
-- **B9 — ServiceNow refresh-token behavior proven.** The confidential-client PKCE flow returns, rotates, and revokes refresh tokens as assumed (§2.8); distinct from S7.
+- **B9 — ServiceNow refresh-token behavior proven.** The confidential-client PKCE flow returns and rotates refresh tokens as assumed (§2.8); distinct from S7.
 
 **DoD:** always-blocking green; S1, S2, S2-auth, S8, S9, S11, S12, S13, S14, S15 **and B1–B6, B8** are non-negotiable gates; the sub-production suite (incl. S16–S18, B7, B9) green before GA.
 
@@ -648,18 +641,18 @@ Named tests (specs as docstrings):
 ## 7. Definition of "production ready" (GA gate)
 
 1. **Phases 0–9 complete**; always-blocking suite green; **sub-production integration suite** green (PDI smoke is not the GA evidence base).
-2. **Security invariants proven:** sandbox isolation (S1), credential non-leakage (S2), MCP-auth isolation (S2-auth), executor governance (S8) and kill switch (S9), Origin validation (S12), OAuth-negative (S13), budget concurrency (S14), SSRF resistance (S15), **signed-actor verification (B1), executor-bypass denylist (B2), mode-escalation prevention (B3/B4), `ActorPolicy` reads (B5), safe serialization (B6), ACL-pagination (B7), `OAUTH_KV` required (B8)**.
+2. **Security invariants proven:** sandbox isolation (S1), credential non-leakage (S2), MCP-auth isolation (S2-auth), executor governance (S8) and kill switch (S9), Origin validation (S12), OAuth-negative (S13), budget concurrency (S14), SSRF resistance (S15), **signed-actor verification (B1), no generic executor-bypass RPC (B2), mode-escalation prevention (B3/B4), `ActorPolicy` reads (B5), safe serialization (B6), ACL-pagination (B7), `OAUTH_KV` required (B8)**.
 3. **Cost bounded:** **multi-dimensional** atomic budget breaker — unique Workers + RPC + SN requests + rows/bytes, per-run + daily (S11/S14); every dimension's metric logged; runbook cost note.
 4. **Identity model decided and recorded** (§2.0); in integration mode, actor attribution is **signed and verified** in every mutating/executor audit row (`actor_verified=true`), and **`ActorPolicy` is enforced before every RPC in any multi-user deployment** (or `per_user_oauth` is used).
 5. **Recoverability is honest** (S18): the recovery model is implemented for configured operations and the claim is narrowed where snapshots are not stored.
 6. **`run_code` default is `read_only`** (or an explicit, documented override is recorded per §0.9 Decision 1).
-7. **No secrets in repo/logs;** versioned token envelope; refresh/revoke/rotation correct (S7).
+7. **No secrets in repo/logs;** versioned token envelope; refresh/rotation/corruption handling correct (S7).
 8. **Exact pins for all runtime-critical packages;** lockfile; `npm ci` reproducible.
-9. **Pre-1.0 exit:** `@cloudflare/codemode` ≥ 1.0 and `@cloudflare/worker-bundler` out of closed beta (if used), or a signed exemption in `DELTAS.md`.
+9. **Pre-1.0 exit:** `@cloudflare/codemode` ≥ 1.0 or a signed exemption in `DELTAS.md`.
 10. **Tested against a non-PDI instance.**
-11. **ServiceNow OAuth proven** (B9): confidential client returns/rotates/revokes refresh tokens as assumed; `OAUTH_KV` isolated from `TokenStoreDO` (B8).
+11. **ServiceNow OAuth proven** (B9): confidential client returns/rotates refresh tokens as assumed; `OAUTH_KV` isolated from `TokenStoreDO` (B8).
 12. **Authorization is real, not nominal:** `effectiveMode = min(requested, scope, tenant, instance)`; `admin_script` gated by allowlist + approval; the requested `mode` can never grant (B3/B4).
-13. **ServiceNow-side egress acknowledged and controlled** (`SNOW_EGRESS.md`; `run_server_script_enabled`; approval), and **recovery snapshots have a retention/encryption/PII/opt-out policy** (`RETENTION.md`, S18) — "recoverable" is not a second unmanaged sensitive store.
+13. **ServiceNow-side egress acknowledged and controlled** (`SNOW_EGRESS.md`; `run_server_script_enabled`; approval), and **recovery snapshots have a retention/encryption/PII/table-enablement policy** (`RETENTION.md`, S18) — "recoverable" is not a second unmanaged sensitive store.
 
 ---
 
@@ -667,7 +660,7 @@ Named tests (specs as docstrings):
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| `execute()` contract / TS-pipeline differs from assumption | High | **Phase 0.8 proves it (esbuild-wasm transform → string); ADR-0001 records the shape; worker-bundler fallback documented** |
+| `execute()` contract / TS-pipeline differs from assumption | High | **Phase 0.8 proves it (esbuild-wasm transform → string); ADR-0001 records the shape** |
 | Dynamic Workers cost is live; runaway unique-Worker creation | High | **Atomic reserve-before-load in `BudgetDO`** (S11/S14); logged metric; `get(id)` lever (10.2) |
 | Identity model ambiguity → wrong audit/authorization | High (addressed) | **Explicit credential mode (§2.0); signed actor attribution in integration mode** |
 | Global budget unenforceable in a session DO | High (addressed) | **Split DOs; global counter in a single date-keyed object (§2.10)**; S14 |
@@ -675,23 +668,23 @@ Named tests (specs as docstrings):
 | Scoped-app cross-scope limits block "maximum reach" | Medium | **Phase 1.8/5 cross-scope tests on a clean instance (S16)** |
 | `runServerScript` partial-failure duplication | Medium | **Leveled idempotency; `indeterminate` retry blocked (S17)** |
 | "Recoverable" over-claimed | Medium (addressed) | **Recovery model + narrowed claim where snapshots absent (S18)** |
-| codemode/worker-bundler/oauth-provider breaking changes | High (pre-1.0/beta) | Exact pins; `DELTAS.md`; Phase 0; confine to `sandbox/*` and `auth/*` |
+| codemode/oauth-provider breaking changes | High (pre-1.0/beta) | Exact pins; `DELTAS.md`; Phase 0; confine to `sandbox/*` and `auth/*` |
 | Missing Origin validation → DNS rebinding | Medium (addressed) | **S12; Phase 7.4** |
 | OAuth flaws (redirect/state/PKCE/consent) | Medium (addressed) | **S13 (O1–O10)** |
-| `worker-bundler`/`esbuild-wasm` workerd-only | High if missed | Mandate `@cloudflare/vitest-pool-workers` |
+| `esbuild-wasm` workerd-only | High if missed | Mandate `@cloudflare/vitest-pool-workers` |
 | ServiceNow MFA blocks CI OAuth | Medium | CI uses ROPC/client-credentials (MFA-exempt) |
 | Scoped-app install rejected by a customer | Low (PDI)/Medium (prod) | Phase 1.8 validates acceptance early; REST-only mode works without the executor |
 | PDI hibernation/reclamation interrupts CI | Medium | `/health` gate; PDI non-blocking; GA on sub-prod |
 | **Forged actor metadata** (claimed `body.actor`) defeats attribution | High (addressed) | **Host HMAC-signs; executor verifies (freshness + nonce, fail-closed); B1; Phase 0.13a** |
 | **Requested `mode` escalates** without authorization | High (addressed) | **`effectiveMode = min(requested, scope, tenant, instance)`; `admin_script` allowlist + approval; B3/B4** |
 | **`integration_user` over-reads** in multi-user (audit ≠ access) | High (addressed) | **`ActorPolicy` before every RPC, or `per_user_oauth` default; B5; §2.12** |
-| `scriptedRest` bypasses `runServerScript()` gates | Medium (addressed) | **Explicit path denylist; executor reachable only via `runServerScript()`; B2** |
+| `scriptedRest` bypasses `runServerScript()` gates | Medium (addressed) | **No generic scripted-REST RPC exists; executor reachable only via `runServerScript()`; B2** |
 | Executor crash on truncated / non-serializable output | Medium (addressed) | **Safe serialize: never `JSON.parse` truncated; `stringify` try/catch; `result_sample`; B6** |
 | **ServiceNow-side egress** via `runServerScript` (`globalOutbound` doesn't cover it) | Medium | **Tenant toggle + approval + denylist scan + non-recoverable labeling (`SNOW_EGRESS.md`)** |
 | Cost beyond unique Workers (requests/CPU); one cheap Worker, many calls | High (addressed) | **Multi-dimensional per-run + daily budgets (S11/S14)** |
 | `OAUTH_KV` missing or conflated with ServiceNow tokens | Medium (addressed) | **`OAUTH_KV` first-class + isolated from `TokenStoreDO`; fail closed if absent (B8)** |
 | ServiceNow refresh-token behavior differs from assumption | Medium | **Confidential client; refresh proof gate B9 (§2.8)** |
-| Recovery snapshots become a second sensitive store | Medium (addressed) | **Retention + encryption + PII class + opt-out (`RETENTION.md`, S18)** |
+| Recovery snapshots become a second sensitive store | Medium (addressed) | **Retention + encryption + PII class + explicit table enablement (`RETENTION.md`, S18)** |
 | esbuild `transform` ≠ bundle (imports); type errors uncaught | Medium | **Phase 0.8a/0.8b split (bundle-or-`modules`); type-check decision in ADR-0001** |
 
 ---
@@ -701,16 +694,13 @@ Named tests (specs as docstrings):
 ```bash
 npm init -y                                    # → workspaces
 npm i -E @cloudflare/codemode@<v> esbuild-wasm@<v> agents@<v> alchemy@<v> \
-        @modelcontextprotocol/sdk@<v> @cloudflare/workers-oauth-provider@<v> hono@<v> zod@<v> ai@<v>
-# add @cloudflare/worker-bundler@<v> ONLY if Phase 0.8 takes the fallback path
-npm i -D wrangler@<v> vitest @cloudflare/vitest-pool-workers@<match-wrangler> \
-        @modelcontextprotocol/inspector typescript
+        @modelcontextprotocol/sdk@<v> @cloudflare/workers-oauth-provider@<v> zod@<v>
+npm i -D wrangler@<v> vitest @cloudflare/vitest-pool-workers@<match-wrangler> typescript
 cp .dev.vars.example .dev.vars                 # SNOW_*, OAUTH_PROVIDER_SECRET, TOKEN_KEK,
                                                #   X_MCP_EXECUTOR_HMAC_KEY, SNAPSHOT_KEK
 # bindings (alchemy.run.ts / wrangler.jsonc): LOADER, SCHEMA_KV, OAUTH_KV (required), 4 DOs
 npx wrangler types
 npx wrangler dev --port 8787                   # /mcp via Miniflare (incl. LOADER) — 8787 everywhere
-npx @modelcontextprotocol/inspector            # connect to http://localhost:8787/mcp
 npx alchemy deploy
 ```
 
@@ -718,129 +708,31 @@ Generate `TOKEN_KEK`, `OAUTH_PROVIDER_SECRET`, `X_MCP_EXECUTOR_HMAC_KEY` (actor 
 
 ---
 
-## 10. ServiceNow executor reference implementation (corrected)
+## 10. ServiceNow executor implementation reference
 
-This is the build reference for the `x_mcp` scoped-app executor — spiked in Phase 1.8, hardened in Phase 5. Build it in a PDI and export it as an update set into `sn-executor-app/`. The arbitrary-server-side-script capability is preserved as a first-class tool, but it lives in a **scoped application** with its own custom role and a REST_Endpoint ACL. The boundary is the **role + REST_Endpoint ACL + audit log + kill switch**, not a lowered capability ceiling.
+The executor implementation is source-controlled under `sn-executor-app/`; do not copy an
+inline Scripted REST sample from this plan. Keeping executable prose here already drifted once
+from the real `{ verified: boolean }` verifier contract, so the code files are the build
+reference.
 
-**Scoped app `x_mcp` ships:**
+**Authoritative files:**
 
-| Artifact | Purpose |
+| File | Purpose |
 |---|---|
-| Role `x_mcp.executor` | The only role allowed to hit the executor endpoint. **May create (and close) its own audit row; cannot read/alter other rows, change properties, or grant roles.** |
-| Scripted REST resource `x_mcp/executor/run` (POST) | The sole entrypoint for arbitrary scripts; reachable **only** via `runServerScript()` (§3.2). |
-| ACL of type `REST_Endpoint` on that resource | Replaces `Scripted REST External Default`; requires `x_mcp.executor`. |
-| Table ACLs on `x_mcp_audit_log` | read/write → `x_mcp.admin` only; the executor user cannot read or alter rows via Table API. |
-| Script Include `x_mcp_verify` | HMAC-verifies the signed actor (current + previous key) + freshness + nonce (§2.0). |
-| Audit table `x_mcp_audit_log` | Per request: **MCP actor + ServiceNow effective user + `actor_verified` + `request_id`**, code SHA-256, byte length, `started_at`, duration, status, output size, error class. **No script body, no raw output.** |
-| Table `x_mcp_nonce` | Actor-replay defense: seen nonces within the freshness window; TTL-pruned by a scheduled job. |
-| Role `x_mcp.admin` | Manages `x_mcp_audit_log`, the kill switch, role assignments (separation of duty). **Not the integration user.** |
-| Property `x_mcp.executor.enabled` (bool) | Kill switch. 503 when false. |
-| Property `x_mcp.executor.run_server_script_enabled` (bool) | Tenant **egress** toggle for the executor specifically (§11). |
-| Property `x_mcp.executor.max_bytes` (int) | **UTF-8 byte** cap on the script, enforced before evaluation. |
-| Property `x_mcp.executor.max_output_bytes` (int) | Output cap; over-cap returns a `result_sample`, never a parsed truncation. |
-| Property `x_mcp.executor.timeout_ms` (int) | A client-visible budget, **not** a hard abort. |
-| Properties `x_mcp.executor.hmac_secret` / `…_prev` | Actor-signature keys (current + previous, for rotation). |
+| `sn-executor-app/fluent/src/server/x_mcp_executor.js` | Scoped app REST resource wrapper at `/api/x_1793136_mcp/x_mcp/executor/run`: role-gated, audit-first, kill-switch and egress-toggle aware, byte-capped, safe-serializing, and nonce-consuming. |
+| `sn-executor-app/script-include/x_mcp_verify.js` | Global verifier core: HMAC + script hash + instance claim + freshness, then `execute()` for global-only `new Function` eval. |
+| `sn-executor-app/fluent/src/server/x_mcp_verify.js` | Fluent copy of the verifier core. `npm run check:verifier-sync` syntax-checks both files and fails if their prototype bodies drift. |
+| `sn-executor-app/fluent/src/fluent/x_mcp.now.ts` | Fluent metadata for the scoped app tables, roles, properties, ACLs, and scripted REST resource. |
+
+**Required execution order in the scoped wrapper:**
+
+1. Create the audit row before effect and fail closed if the audit insert fails.
+2. Enforce the kill switch, tenant egress toggle, and UTF-8 byte input cap before verification burns any nonce.
+3. Call the global verifier and check `if (!v.verified)`; never treat the verifier result object as a boolean.
+4. Consume the signed nonce with INSERT-as-arbiter into `x_1793136_mcp_nonce` before executing.
+5. Execute through the global core, safe-serialize output, byte-safe truncate samples, and close the audit row.
 
 There is deliberately **no `allow_unsafe` property** in v1 (§Phase 5.3): a knob that may not actually prevent global `GlideRecord` access is worse than no knob. Reintroduce only if Phase 1.8 proves on the target family that it genuinely constrains the environment.
-
-**The corrected resource script** — synchronous; audit-first **and fail-closed**; **verifies** the signed actor; UTF-8 byte cap; **safe** serialization:
-
-```javascript
-// x_mcp/executor/run  (Scripted REST resource, scoped app x_mcp, role-gated by REST_Endpoint ACL)
-// v4: SYNCHRONOUS; audit-FIRST + fail-closed; VERIFIES the signed actor; UTF-8 byte cap; SAFE serialize.
-
-// Correct UTF-8 byte length (incl. surrogate pairs) — 'max_bytes' must mean bytes, not code units.
-function utf8Len(s){ var n=0; for (var i=0;i<s.length;i++){ var c=s.charCodeAt(i);
-  if (c<0x80) n+=1; else if (c<0x800) n+=2;
-  else if (c>=0xD800 && c<=0xDBFF){ n+=4; i++; } else n+=3; } return n; }
-
-(function process(req, res) {
-  var body  = req.body.data || {};
-  var code  = String(body.script || '');
-  var actor = body.actor || {};          // CLAIMED until verified: {mcp_actor_user_id,mcp_actor_email,instance,request_id,issued_at,nonce}
-  var sig   = String(body.actor_sig || '');
-
-  // 1) AUDIT-FIRST + FAIL-CLOSED. Record server-known facts and the *claimed* actor as unverified.
-  //    (Audit writes touch only THIS request's row; the executor role cannot read/alter other rows.)
-  var start = new GlideDateTime();
-  var audit = new GlideRecord('x_mcp_audit_log');
-  audit.initialize();
-  audit.snow_user = gs.getUserID();
-  audit.snow_user_name = gs.getUserName();
-  audit.mcp_actor_user_id = String(actor.mcp_actor_user_id || '');
-  audit.mcp_actor_email   = String(actor.mcp_actor_email || '');
-  audit.request_id        = String(actor.request_id || '');
-  audit.actor_verified = false;
-  audit.code_hash = new GlideDigest().getSHA256Base64(code);
-  audit.code_size = utf8Len(code);
-  audit.started_at = start;
-  audit.status = 'running';
-  var auditId = audit.insert();
-  if (!auditId) { res.setStatus(500); res.setBody({ error: 'audit_unavailable' }); return; } // fail closed
-
-  // 2) VERIFY the signed actor BEFORE trusting any actor field (§2.0). Fail closed.
-  //    x_mcp_verify (proven in Phase 0.13a): recompute script_sha256, rebuild the canonical payload,
-  //    HMAC against hmac_secret then hmac_secret_prev, enforce the freshness window, reject replayed nonce.
-  if (!new x_mcp.x_mcp_verify().verify(code, actor, sig)) {
-    audit.status = 'rejected'; audit.error_class = 'actor_signature_invalid'; audit.update();
-    res.setStatus(401); res.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' }); return;
-  }
-  audit.actor_verified = true; audit.update();
-
-  // 3) Kill switch, then tenant EGRESS toggle (runServerScript can reach ServiceNow outbound; §11).
-  if (gs.getProperty('x_mcp.executor.enabled', 'true') !== 'true') {
-    audit.status = 'killed'; audit.update();
-    res.setStatus(503); res.setBody({ error: 'executor_disabled', audit_id: auditId + '' }); return;
-  }
-  if (gs.getProperty('x_mcp.executor.run_server_script_enabled', 'true') !== 'true') {
-    audit.status = 'killed'; audit.error_class = 'egress_disabled'; audit.update();
-    res.setStatus(503); res.setBody({ error: 'run_server_script_disabled', audit_id: auditId + '' }); return;
-  }
-
-  // 4) UTF-8 BYTE size guard (the host enforces this too; defense in depth).
-  var maxB = parseInt(gs.getProperty('x_mcp.executor.max_bytes', '32768'), 10);
-  var bytes = utf8Len(code);
-  if (bytes === 0 || bytes > maxB) {
-    audit.status = 'error'; audit.error_class = 'code_size'; audit.update();
-    res.setStatus(413); res.setBody({ error: 'code_size', audit_id: auditId + '' }); return;
-  }
-
-  // 5) SYNCHRONOUS execution. No async/await (scoped apps default ES2021). Plain GlideRecord
-  //    bypasses ACLs server-side (the 'maximum reach'); role + ACL + audit + kill switch +
-  //    verified actor are the boundary.
-  var result, err = null, status = 'ok';
-  try {
-    var fn = new Function('gs','GlideRecord','GlideRecordSecure','GlideAggregate','"use strict";\n' + code);
-    result = fn(gs, GlideRecord, GlideRecordSecure, GlideAggregate);
-  } catch (e) { err = String(e); status = 'error'; }
-
-  // 6) SAFE serialize — catch JSON.stringify failures (circular / GlideRecord-like / too deep).
-  var serialized = null;
-  try { serialized = JSON.stringify(result === undefined ? null : result); }
-  catch (se) { err = err || ('unserializable: ' + String(se)); status = 'error'; serialized = null; }
-
-  var maxOut = parseInt(gs.getProperty('x_mcp.executor.max_output_bytes', '65536'), 10);
-  function closeAudit(st, outBytes){ audit.status = st;
-    audit.duration = (new GlideDateTime()).getNumericValue() - start.getNumericValue();
-    audit.output_size = outBytes; audit.error_class = err ? err.split(':')[0] : ''; audit.update(); }
-
-  // 6a) Over-cap: return a SAMPLE STRING. NEVER JSON.parse a truncated string (it can throw post-audit).
-  if (serialized && utf8Len(serialized) > maxOut) {
-    if (status === 'ok') status = 'truncated';
-    closeAudit(status, utf8Len(serialized));
-    res.setStatus(200);
-    res.setBody({ ok: !err, result: null, result_sample: serialized.slice(0, maxOut),
-                  truncated: true, error: err, audit_id: auditId + '' });
-    return;
-  }
-
-  // 6b) Under cap: 'serialized' is a COMPLETE JSON string we just produced — safe to parse back.
-  closeAudit(status, serialized ? utf8Len(serialized) : 0);
-  res.setStatus(err ? 500 : 200);
-  res.setBody({ ok: !err, result: (err || serialized == null) ? null : JSON.parse(serialized),
-                truncated: false, error: err, audit_id: auditId + '' });
-})(request, response);
-```
 
 **Notes and limits.**
 
@@ -863,7 +755,7 @@ Security threats and their mitigations (distinct from the build-time risk regist
 | # | Threat | Impact | Mitigation | Test |
 |---|---|---|---|---|
 | T1 | Stolen Cloudflare account / API token | Read encrypted DO storage; redeploy the Worker | Tokens AES-GCM encrypted, versioned AAD-bound envelope, KEK in a Cloudflare secret; Cloudflare Access + IP allow-list on `/admin/*` and the deploy path; rotate keys | S7; Phase 7.8 |
-| T2 | Stolen ServiceNow refresh token | Reach the user's surface in ServiceNow | Partition tokens per `(user, instance)` in `TokenStoreDO`; short access-token lifetimes; rotate refresh on every refresh; revoke on logout; fail closed on AAD mismatch | S7 |
+| T2 | Stolen ServiceNow refresh token | Reach the user's surface in ServiceNow | Partition tokens per `(user, instance)` in `TokenStoreDO`; short access-token lifetimes; rotate refresh on every refresh; fail closed on AAD mismatch | S7 |
 | T3 | Prompt-injection makes sandboxed code call `fetch("evil")` | Data exfiltration | `globalOutbound: null` makes `fetch()`/`connect()` throw; no creds in the sandbox `env`, only the typed RPC binding | S1, S2 |
 | T4 | LLM-written code mutates records | Unintended writes | Capability is intentional; mitigation is **attributive + recoverable**: every mutating RPC records `(mcp_actor, snow_effective_user, table, sys_id, op, before/after-hash, requestId)` under a **verified** actor; effective-mode gate (§2.0.1) + `ActorPolicy` (§2.12); recovery model (§7.7) | S8, S18 |
 | T5 | Sensitive output bleeds into Cloudflare logs / Tail | PII in the observability stream | Redactor denylist fields + token patterns; never log script body or full RPC response; audit stores hashes only | Phase 7.1 |
@@ -879,9 +771,9 @@ Security threats and their mitigations (distinct from the build-time risk regist
 | T15 | **Forged actor metadata** (a caller fabricates `body.actor`) | False attribution; accountability bypass | Host **HMAC-signs**; executor **verifies** (freshness + nonce, fail-closed); `actor_verified` audited | B1; S8 |
 | T16 | **Mode escalation** via the `mode` tool input | Unauthorized writes / arbitrary script | `effectiveMode = min(requested, scope, tenant, instance)` (requested only narrows); `admin_script` needs allowlist + approval | B3, B4; §2.0.1 |
 | T17 | **`integration_user` over-reads** for a given user | Confidential data disclosure (audit ≠ access control) | `ActorPolicy` (instances/tables/fields/rows) enforced before every RPC; or `per_user_oauth` | B5; §2.12 |
-| T18 | **`scriptedRest` bypasses `runServerScript()`** | Ungated/unaudited executor reach; config/audit tampering | Explicit path denylist (executor, `sys_properties`, audit log, `oauth_*.do`, `login.do`); executor reachable only via `runServerScript()` | B2; §3.2 |
+| T18 | **`scriptedRest` bypasses `runServerScript()`** | Ungated/unaudited executor reach; config/audit tampering | No generic scripted-REST RPC exists; executor reachable only via `runServerScript()`; any future generic adapter must deny executor/config/audit/OAuth paths | B2; §3.2 |
 | T19 | **ServiceNow-side egress** via `runServerScript` | Server-side script calls SN outbound / email / events / records | Tenant `run_server_script_enabled` toggle; `reason` + approval for `admin_script`; best-effort outbound-API denylist scan; separate executor budget; labeled non-recoverable | §5.7; `SNOW_EGRESS.md` |
-| T20 | **Recovery snapshot store** becomes a second sensitive DB | New PII exposure / over-retention | Retention window + `SNAPSHOT_KEK` encryption + access control + scheduled purge + PII classification + tenant opt-out | S18; `RETENTION.md` |
+| T20 | **Recovery snapshot store** becomes a second sensitive DB | New PII exposure / over-retention | Retention window + `SNAPSHOT_KEK` encryption + access control + KV auto-expiry + PII classification + explicit table enablement | S18; `RETENTION.md` |
 
 **ServiceNow-side egress (T19) deserves its own emphasis.** `globalOutbound: null` is a *Cloudflare-side* control; it says nothing about what a server-side script does **inside** ServiceNow. Treat `runServerScript` as an egress-capable primitive: it can reach `RESTMessageV2`/outbound integrations, fire events, send email, or move data between records. The controls are organizational and tenant-scoped (toggle, approval, denylist scan, budget, non-recoverable labeling), documented in `docs/SNOW_EGRESS.md` — not a sandbox.
 
@@ -920,7 +812,7 @@ The goal is **maximum reach with attribution**, not least-privilege-at-all-costs
 | CMDB Instance API | `/api/now/cmdb/instance/{class}/{sys_id}` | `itil` typical; **one record per call** | Class hierarchy under `cmdb_ci`; relationships are separate calls |
 | Knowledge Mgmt API | `/api/sn_km_api/knowledge/articles` | KB user-criteria + read ACL on `kb_knowledge`; some content needs `itil` | Honors KB ACLs strictly; counts differ between admin and integration user |
 | Service Catalog API | `/api/sn_sc/servicecatalog/*` | Catalog roles for variables | Three calls (`add_to_cart` → `checkout` → `submit_order`), or `order_now` in one; references need `sys_id` |
-| Scripted REST | `/api/{scope}/{api}/{resource}` | Whatever the resource's REST_Endpoint ACL requires; for `x_mcp.executor.run` → `x_mcp.executor` | Default ACL is `snc_internal` — override it; `GlideRecord` bypasses ACLs server-side; generic `scriptedRest` is **denylisted** from the executor + `sys_properties` + audit-log + `oauth_*.do` + `login.do` (§3.2) |
+| Scripted REST | `/api/{scope}/{api}/{resource}` | Whatever the resource's REST_Endpoint ACL requires; for `x_mcp.executor.run` → `x_mcp.executor` | Default ACL is `snc_internal` — override it; `GlideRecord` bypasses ACLs server-side; no generic host scripted-REST RPC exists (§3.2) |
 
 **PDI notes (dev/demo only).** Personal Developer Instances hibernate after ~6h of inactivity (~30 min if woken without logging in) and are **reclaimed after 10 days of Developer-Portal inactivity — creating records or changing data does NOT reset the 10-day timer** (it tracks portal activity like config/update-set changes). Therefore: never point staging or any pre-prod at a PDI; ship **no** cron-style keepalive (against Developer Program policy) — a `/health` tool returning `{ instance: "hibernating" | "online" }` is the supported pattern; and the **GA evidence base must be a sub-production instance, not a PDI** (§7).
 
@@ -939,7 +831,7 @@ These are the design corrections that produced the current ("execution-safe") re
 | P4 | Non-atomic global budget | **Accepted.** Atomic reserve-before-load; global counter in a single date-keyed object (§2.5, Phase 4.5, S14). |
 | P5 | Missing MCP Origin validation | **Accepted.** §Decision/§3.1; Phase 7.4; S12. |
 | P6 | Under-specified OAuth security tests | **Accepted.** S13 (O1–O10). |
-| P7 | Compat date + run_code shape inconsistent | **Accepted.** Single compat date everywhere (§2.9); **TS pipeline corrected to esbuild-wasm transform→string with the executor** (§2.2, §3.4); ADR-0001 fixes one shape; worker-bundler demoted to fallback. |
+| P7 | Compat date + run_code shape inconsistent | **Accepted.** Single compat date everywhere (§2.9); **TS pipeline corrected to esbuild-wasm transform→string with the executor** (§2.2, §3.4); ADR-0001 fixes one shape. |
 | P8 | Scoped-app cross-scope unproven | **Accepted.** Phase 1.8/5 cross-scope tests incl. clean-instance re-test; S16. |
 | P9 | `runServerScript` idempotency overstated | **Accepted.** Leveled idempotency (L1/L2/L3); `indeterminate` retry blocked (§7.3, S17). |
 | P10 | "Recoverable" lacks rollback design | **Accepted.** Recovery model (§7.7, `docs/RECOVERY.md`); claim narrowed where snapshots absent; S18. |
@@ -959,13 +851,13 @@ The fourth review approved Phase 0 but blocked Phase 1/4/5 because several prope
 | 3 | `integration_user` read-confidentiality (audit ≠ access control) | **Accepted.** `ActorPolicy` (instances/tables/fields/rows/bytes/mode) enforced before every RPC; `per_user_oauth` is the multi-user default unless ActorPolicy is implemented (§2.12, §0.9 Decision 2; **B5**). |
 | 4 | Executor serialization can crash after the audit update | **Accepted.** Never `JSON.parse` a truncated string — return `result_sample`; wrap `JSON.stringify` in try/catch (circular/GlideRecord-like/deep) (§10; **B6**). |
 | 5 | Table API pagination conflicts with documented behavior | **Accepted.** Default is **10000** (host cap 1000); `sysparm_limit` applies **before** ACL → empty pages; explicit per-mode cursor strategy chosen now, not in Phase 3 (§2.13; **B7**). |
-| 6 | Raw `scriptedRest` could bypass `runServerScript()` | **Accepted.** Explicit denylist (executor paths, `sys_properties`, audit log, `oauth_*.do`, `login.do`); executor reachable only via `runServerScript()` (§3.2; **B2**). |
+| 6 | Raw `scriptedRest` could bypass `runServerScript()` | **Accepted.** No generic scripted-REST RPC exists; executor reachable only via `runServerScript()` (§3.2; **B2**). |
 | 7 | Budget covered unique Workers but not requests/CPU/scarce resources | **Accepted.** Multi-dimensional budgets (unique Workers + RPC + SN requests + rows/bytes), per-run + daily (§2.5; S11/S14). |
-| 8 | ServiceNow refresh-token assumptions unproven | **Accepted.** Confidential client (Auth Code + PKCE + secret); refresh return/rotate/revoke proof gate (§2.8; **B9**). |
+| 8 | ServiceNow refresh-token assumptions unproven | **Accepted.** Confidential client (Auth Code + PKCE + secret); refresh return/rotate proof gate (§2.8; **B9**). |
 | 9 | `OAUTH_KV` missing from infrastructure | **Accepted.** First-class binding in Alchemy/wrangler/.dev.vars; isolated from `TokenStoreDO`; missing → fail (§2.4, §2.11; **B8**). |
 | 10 | esbuild "transform + zod import" internally inconsistent | **Accepted.** Phase 0.8 split into 0.8a (no-import transform) / 0.8b (bundle-or-`modules`); type-check consequence made actionable in ADR-0001 (§Phase 0.8). |
 | + | Human approval for destructive ops | **Accepted.** `admin_script`/delete/broad-import/attachment-write require allowlist + approval (Access-group / token / dry-run; elicitation in stateful variant) (§3.5, Phase 7.9). |
 | + | `runServerScript` is a ServiceNow-side egress channel | **Accepted.** Tenant toggle, approval, best-effort denylist scan, separate budget, non-recoverable labeling (§11 T19, §5.7, `SNOW_EGRESS.md`). |
-| + | Audit/snapshot retention unspecified | **Accepted.** `RETENTION.md`: retention, `SNAPSHOT_KEK` encryption, decrypt access, purge, PII class, tenant opt-out (§7.7). |
+| + | Audit/snapshot retention unspecified | **Accepted.** `RETENTION.md`: retention, `SNAPSHOT_KEK` encryption, decrypt access, purge, PII class, table enablement (§7.7). |
 | + | Audit table not hardened | **Accepted.** `x_mcp.executor` creates/closes only its own row; `x_mcp.admin` (not the integration user) reads/manages; audit-insert fail-closed (§10, §12, Phase 5.1). |
 | + | Nits | **Accepted.** `max_bytes` now means **UTF-8 bytes** (`utf8Len`); Table API limit corrected to 10000/host-cap-1000; MCP Server Console comparison kept as a living `DELTAS.md` note; pre-1.0 SDK exit retained in the GA gate. |

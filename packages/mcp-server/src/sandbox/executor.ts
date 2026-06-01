@@ -17,13 +17,6 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface ExecutorOptions {
   timeoutMs?: number;
-  /**
-   * Allowlisted modules injected into the sandbox module map, importable via
-   * dynamic `import("<key>")`. v1 policy is to pass NOTHING here (no arbitrary
-   * imports — the only capability is the `servicenow` provider). The parameter
-   * exists so a future, vetted allowlist (0.8b) is a config change, not a rewrite.
-   */
-  modules?: Record<string, string>;
 }
 
 /** Construct an isolated, network-less executor bound to the Worker Loader. */
@@ -32,7 +25,6 @@ export function createExecutor(loader: WorkerLoader, options: ExecutorOptions = 
     loader,
     timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     globalOutbound: null, // §2.2 — no network from the sandbox
-    ...(options.modules ? { modules: options.modules } : {}),
   });
 }
 

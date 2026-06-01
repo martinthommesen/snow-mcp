@@ -8,7 +8,6 @@ import { BUDGETS } from "../config.js";
 export interface RunBudgetLimits {
   rpcCallLimit: number;
   serviceNowRequestLimit: number;
-  attachmentBytes: number;
 }
 
 /**
@@ -29,7 +28,6 @@ export class RunBudget {
   serviceNowRequests = 0;
   rowsReturned = 0;
   bytesReturned = 0;
-  attachmentBytes = 0;
   private readonly limits: RunBudgetLimits;
   private readonly maxRows: number;
   private readonly maxBytes: number;
@@ -80,15 +78,6 @@ export class RunBudget {
     }
   }
 
-  countAttachmentBytes(n: number): void {
-    this.attachmentBytes += n;
-    if (this.attachmentBytes > this.limits.attachmentBytes) {
-      throw new McpToolError("budget_exceeded", `Per-run attachment byte limit (${this.limits.attachmentBytes}) exceeded.`, {
-        dimension: "attachmentBytes",
-      });
-    }
-  }
-
   /** Snapshot for logging/metrics (plan §4.5 — emit each dimension). */
   snapshot(): Record<string, number> {
     return {
@@ -96,7 +85,6 @@ export class RunBudget {
       serviceNowRequests: this.serviceNowRequests,
       rowsReturned: this.rowsReturned,
       bytesReturned: this.bytesReturned,
-      attachmentBytes: this.attachmentBytes,
     };
   }
 }

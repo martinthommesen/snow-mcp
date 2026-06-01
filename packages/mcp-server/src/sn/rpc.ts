@@ -38,7 +38,6 @@ import {
   validateLimit,
   validateFields,
   validateUpdateFields,
-  validateIdempotencyKey,
   validateReason,
   validateUserQuery,
 } from "./validate.js";
@@ -75,8 +74,7 @@ export interface ServiceNowRpcDeps {
    * Host-authoritative per-run mutation context + the wired safety layers (plan §P4).
    * When present, every mutating/executor call runs through the idempotency ledger,
    * approval gate, recovery snapshot, and host audit (audit-before-effect, fail-closed).
-   * Absent in read-only / unit-test contexts — but a mutation always HARD-REQUIRES a
-   * tool-level idempotencyKey regardless (see `runContext.runKey`).
+   * Unit tests may omit the durable stores; live handler wiring marks them required.
    */
   mutation?: MutationDeps;
 }
@@ -86,6 +84,8 @@ export interface MutationDeps {
   runContext: RunContext;
   identity: AuditIdentity;
   now: () => number;
+  /** Live handler wiring requires ledger + audit before any mutation/executor effect. */
+  durabilityRequired?: boolean;
   /** Per run+ordinal idempotency-ledger handle (LEDGER_DO-backed in production). */
   ledger?: (ordinal: number) => LedgerHandle;
   /** Durable host audit sink (AUDIT_KV-backed in production). */
@@ -110,11 +110,8 @@ export interface MutationDeps {
   /** Tables eligible for a reversible-from-snapshot tableUpdate (for the recoverability
    *  classification); empty when snapshots are disabled/opted-out for this tenant. */
   snapshotEnabledTables?: readonly string[];
-  /**
-   * Second-approval context for admin_script (allowlist + token/access-group). Present
-   * ONLY when a tenant approval policy is configured; absent preserves single-operator
-   * behavior (the gate is skipped, today's deployment keeps working).
-   */
+  /** Second-approval context for admin_script (allowlist + token/access-group).
+   * Absent is treated as an empty policy, which denies admin_script. */
   approval?: Omit<ApprovalContext, "mode" | "actorUserId" | "reason">;
 }
 
@@ -168,6 +165,13 @@ export class ServiceNowRPC {
 
   constructor(private readonly deps: ServiceNowRpcDeps) {}
 
+  private requireMutationDeps(op: "tableUpdate" | "runServerScript"): MutationDeps {
+    if (!this.deps.mutation) {
+      throw new McpToolError("internal_error", `${op} requires mutation safety wiring — refusing to mutate (fail closed).`);
+    }
+    return this.deps.mutation;
+  }
+
   // ── shared gate (the order is a security property, §3.1) ──
   private gateRead(table: string, fields?: string[]): void {
     assertActorPolicy(this.deps.actorPolicy, { instance: this.deps.instanceHost, table, mode: this.deps.effectiveMode });
@@ -194,7 +198,7 @@ export class ServiceNowRPC {
     const query = applyRowFilter(this.deps.actorPolicy, table, userQuery);
     const limit = reqLimit ?? TABLE_PAGE_CAP;
 
-    // sys_id is always fetched internally — the keyset cursor needs it (§1.7).
+    // sys_id is always fetched internally so row identity remains available after field selection.
     const fields = reqFields ? Array.from(new Set(["sys_id", ...reqFields])) : undefined;
     const q: Record<string, string> = {
       sysparm_limit: String(limit),
@@ -237,17 +241,15 @@ export class ServiceNowRPC {
     return masked;
   }
 
-  async aggregate(args: { table: string; query?: string; groupBy?: string[]; countField?: string }): Promise<unknown> {
+  async aggregate(args: { table: string; query?: string; groupBy?: string[] }): Promise<unknown> {
     const table = validateTableName(args.table);
     const userQuery = validateUserQuery(args.query, this.hasMandatoryFilter(table));
-    // groupBy / countField are field references: validate AND mask-check (no masked
-    // field may be grouped/counted on — same boundary as requested read fields).
+    // groupBy fields are field references: validate AND mask-check (no masked field may be
+    // grouped on — same boundary as requested read fields).
     const groupBy = validateFields(args.groupBy);
-    const countFields = args.countField !== undefined ? validateFields([args.countField]) : undefined;
-    const fieldRefs = [...(groupBy ?? []), ...(countFields ?? [])];
-    this.gateRead(table, fieldRefs.length > 0 ? fieldRefs : undefined);
+    this.gateRead(table, groupBy);
     // M-6: the aggregate `query` is an equality/inference oracle if it can filter on a masked field
-    // (groupBy/countField are already mask-checked via gateRead; the predicate was not).
+    // (groupBy is already mask-checked via gateRead; the predicate was not).
     assertQueryFieldsAllowed(this.deps.actorPolicy, table, userQuery);
     const query = applyRowFilter(this.deps.actorPolicy, table, userQuery);
     const q: Record<string, string> = { sysparm_count: "true" };
@@ -264,11 +266,10 @@ export class ServiceNowRPC {
   }
 
   // ── mutating / executor methods: capability-gated; integration mode signs the actor ──
-  async tableUpdate(args: { table: string; sys_id: string; fields: Record<string, unknown>; idempotencyKey: string }): Promise<Record<string, unknown>> {
+  async tableUpdate(args: { table: string; sys_id: string; fields: Record<string, unknown> }): Promise<Record<string, unknown>> {
     const table = validateTableName(args.table);
     const sysId = validateSysId(args.sys_id);
     const fields = validateUpdateFields(args.fields);
-    validateIdempotencyKey(args.idempotencyKey);
     assertActorPolicy(this.deps.actorPolicy, { instance: this.deps.instanceHost, table, mode: this.deps.effectiveMode });
     requireCapability(this.deps.effectiveMode, "writeTables");
     // Masked fields may not be WRITTEN either (the mask applies to request AND response, §2.12).
@@ -276,15 +277,7 @@ export class ServiceNowRPC {
     assertRequestedFieldsAllowed(this.deps.actorPolicy, table, Object.keys(fields));
     this.deps.runBudget.countRpcCall();
 
-    const mutation = this.deps.mutation;
-    if (!mutation) {
-      // Read-only / unit contexts without the live safety wiring: enforce gates only.
-      this.deps.runBudget.countServiceNowRequest();
-      const result = await this.patchRow(table, sysId, fields);
-      // Per-run byte enforcement (§P5): count the PATCH response (mirrors runServerScript).
-      this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result ?? null)));
-      return result;
-    }
+    const mutation = this.requireMutationDeps("tableUpdate");
 
     const ordinal = ++this.ordinal;
     const reason = mutation.runContext.reason;
@@ -296,7 +289,7 @@ export class ServiceNowRPC {
     // non-recoverable (handled in that method — no snapshot).
     let beforeRow: Record<string, unknown> | undefined;
     let snapshotStep: (() => Promise<void>) | undefined;
-    const snapshotConfig = { enabledTables: mutation.snapshotEnabledTables ?? [], retentionMs: 0 };
+    const snapshotConfig = { enabledTables: mutation.snapshotEnabledTables ?? [] };
     const reversible = Boolean(mutation.captureSnapshot) && recoverability("update", table, snapshotConfig) === "reversible_from_snapshot";
     if (reversible) {
       snapshotStep = async () => {
@@ -329,6 +322,7 @@ export class ServiceNowRPC {
         instance: this.deps.instanceHost,
         identity: mutation.identity,
         now: mutation.now,
+        ...(mutation.durabilityRequired ? { durabilityRequired: true } : {}),
         ...(mutation.ledger ? { ledger: mutation.ledger } : {}),
         ...(mutation.audit ? { audit: mutation.audit } : {}),
       },
@@ -386,15 +380,10 @@ export class ServiceNowRPC {
    *    TOP-LEVEL runServerScript call + its response — NOT the script's internal
    *    GlideRecord operations (Level 3 in mutation-ledger.ts is a documented limitation).
    */
-  async runServerScript(args: { script: string; reason: string; idempotencyKey: string }): Promise<unknown> {
+  async runServerScript(args: { script: string }): Promise<unknown> {
     if (typeof args.script !== "string" || args.script.length === 0) {
       throw new McpToolError("path_denied", "runServerScript requires a non-empty script string.");
     }
-    // Shape-validate the SNIPPET-supplied reason for INPUT HYGIENE only — it is NOT the
-    // authoritative audited/hashed/approved/sent value (that is the host tool-level
-    // runContext.reason below, mirroring tableUpdate).
-    validateReason(args.reason);
-    validateIdempotencyKey(args.idempotencyKey);
     // H-1: ActorPolicy mode ceiling on the executor path. assertActorPolicy is table-scoped and
     // never runs here (runServerScript is table-less), so the per-actor `maxMode` cap previously
     // failed OPEN on the single most dangerous capability — an actor pinned to `write` could still
@@ -424,14 +413,17 @@ export class ServiceNowRPC {
     const signing = this.deps.signing;
     this.deps.runBudget.countRpcCall();
 
-    // Host-authoritative justification: the operator-supplied tool-level reason, never the
-    // snippet's args.reason. Used for the executor-side audit (P7) POST body, the requestHash,
-    // the approval context, and the host audit row.
+    // Host-authoritative justification: the operator-supplied tool-level reason. Used for the
+    // executor-side audit (P7) POST body, the requestHash, the approval context, and the host
+    // audit row.
     const sendScript = async (reason: string): Promise<unknown> => {
       // §6b: in per_user_oauth, resolve the effective user's sys_id at sign time and bind it into
-      // the signed claims (the executor verifies it). Empty/absent (or integration_user) keeps
-      // the base claim "" — native attribution / shared-credential, unchanged from today.
+      // the signed claims (the executor verifies it). Unresolved per-user attribution fails closed;
+      // integration_user has no resolver and keeps the base shared-credential claim.
       const effectiveSysId = signing.resolveEffectiveUserSysId ? await signing.resolveEffectiveUserSysId() : "";
+      if (signing.resolveEffectiveUserSysId && !effectiveSysId) {
+        throw new McpToolError("reauth_required", "ServiceNow principal could not be resolved — re-authenticate.");
+      }
       const signed = await signActor({
         claims: effectiveSysId ? { ...signing.claims, snow_effective_user_sys_id: effectiveSysId } : signing.claims,
         script: args.script,
@@ -454,17 +446,7 @@ export class ServiceNowRPC {
       return res.json;
     };
 
-    const mutation = this.deps.mutation;
-    if (!mutation) {
-      // No live safety wiring (unit contexts) — sign + send only. No host runContext here;
-      // the validated snippet reason is the only justification available.
-      this.deps.runBudget.countServiceNowRequest();
-      const out = await sendScript(args.reason);
-      // Per-run byte enforcement (§P5): count the executor response. AFTER the send, never
-      // inside the effect, so a byte-cap trip can't be misclassified as post-send unknown.
-      this.deps.runBudget.countBytes(utf8Len(JSON.stringify(out ?? null)));
-      return out;
-    }
+    const mutation = this.requireMutationDeps("runServerScript");
 
     // run_code hard-requires a non-empty tool-level reason for admin_script (run_code.ts:68)
     // and runServerScript requires admin_script — so runContext.reason is guaranteed here.
@@ -488,19 +470,18 @@ export class ServiceNowRPC {
       script: args.script, reason, mode: this.deps.effectiveMode, instance: this.deps.instanceHost, actorUserId,
     });
 
-    // Second-approval gate (§7.9) — non-interactive token / access-group branch ONLY when a
-    // tenant approval policy is configured (mutation.approval present). Absent => skipped,
-    // preserving single-operator behavior (the interactive dry-run branch is stateless-
-    // unsupported in createMcpHandler — documented in approval.ts).
-    const preflight = mutation.approval
-      ? () =>
-          assertAdminScriptApproved({
-            ...mutation.approval!,
-            mode: this.deps.effectiveMode,
-            actorUserId,
-            reason,
-          })
-      : undefined;
+    // Second-approval gate (§7.9). Empty/unconfigured policy denies admin_script by default.
+    // The interactive dry-run branch is stateless-unsupported in createMcpHandler, so the
+    // supported non-interactive paths are approval token or current access-group membership.
+    const approval = mutation.approval ?? { adminScriptAllowlist: [] };
+    const preflight = () =>
+      assertAdminScriptApproved({
+        ...approval,
+        mode: this.deps.effectiveMode,
+        actorUserId,
+        reason,
+        approvalToken: mutation.runContext.approvalToken,
+      });
 
     // Per-run SN-request budget for the executor POST — counted PRE-guard (clean pre-send).
     this.deps.runBudget.countServiceNowRequest();
@@ -511,6 +492,7 @@ export class ServiceNowRPC {
         instance: this.deps.instanceHost,
         identity: mutation.identity,
         now: mutation.now,
+        ...(mutation.durabilityRequired ? { durabilityRequired: true } : {}),
         ...(mutation.ledger ? { ledger: mutation.ledger } : {}),
         ...(mutation.audit ? { audit: mutation.audit } : {}),
       },
@@ -519,7 +501,7 @@ export class ServiceNowRPC {
         op: "runServerScript",
         reason,
         requestHash,
-        ...(preflight ? { preflight } : {}),
+        preflight,
         // runServerScript is NON-RECOVERABLE (recovery/policy.ts) — no snapshot.
         effect: async () => ({ result: await sendScript(reason) }),
         isIndeterminate: isPostSendUnknown,
@@ -560,8 +542,8 @@ export class ServiceNowRPC {
       tableQuery: (a) => this.coded(this.tableQuery(a as TableQueryArgs)),
       tableGet: (a) => this.coded(this.tableGet(a as { table: string; sys_id: string; fields?: string[] })),
       aggregate: (a) => this.coded(this.aggregate(a as { table: string; query?: string; groupBy?: string[] })),
-      tableUpdate: (a) => this.coded(this.tableUpdate(a as { table: string; sys_id: string; fields: Record<string, unknown>; idempotencyKey: string })),
-      runServerScript: (a) => this.coded(this.runServerScript(a as { script: string; reason: string; idempotencyKey: string })),
+      tableUpdate: (a) => this.coded(this.tableUpdate(a as { table: string; sys_id: string; fields: Record<string, unknown> })),
+      runServerScript: (a) => this.coded(this.runServerScript(a as { script: string })),
     };
   }
 }

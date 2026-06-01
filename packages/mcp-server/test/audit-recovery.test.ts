@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildAuditRecord, emitAudit, hashValue, type AuditRecord } from "../src/observability/audit.js";
-import { takeSnapshot, readSnapshot, reversalFields, isSnapshotEnabled, isExpired, type SnapshotConfig } from "../src/recovery/snapshots.js";
-import { recoverability, isDeletePermitted } from "../src/recovery/policy.js";
+import { takeSnapshot, readSnapshot, reversalFields, isSnapshotEnabled, type SnapshotConfig } from "../src/recovery/snapshots.js";
+import { recoverability } from "../src/recovery/policy.js";
 import { auditKey } from "../src/sn/mutation-guard.js";
 import type { KekRing } from "../src/auth/crypto.js";
 
@@ -23,7 +23,7 @@ describe("§7.2 audit", () => {
 
   it("emitAudit redacts stray sensitive strings", async () => {
     const captured: AuditRecord[] = [];
-    const rec = await buildAuditRecord({ ts: 1, requestId: "Bearer abcdef1234567890", instance: "i", actor: { mcpActorUserId: "u" }, op: "delete", status: "ok" });
+    const rec = await buildAuditRecord({ ts: 1, requestId: "Bearer abcdef1234567890", instance: "i", actor: { mcpActorUserId: "u" }, op: "update", status: "ok" });
     await emitAudit((r) => { captured.push(r); }, rec);
     expect(captured[0]!.requestId).toContain("[REDACTED]");
   });
@@ -50,7 +50,7 @@ describe("§7.2 audit", () => {
 
 // ─── §7.7 — encrypted recovery snapshots ──────────────────────────────────────
 const ring: KekRing = { current: { version: "2026-05", keyBytes: new Uint8Array(32).fill(3) } };
-const config: SnapshotConfig = { enabledTables: ["incident"], retentionMs: 30 * 24 * 3600 * 1000 };
+const config: SnapshotConfig = { enabledTables: ["incident"] };
 
 describe("§7.7 recovery snapshots", () => {
   it("takes an encrypted snapshot for a configured table and round-trips", async () => {
@@ -78,11 +78,6 @@ describe("§7.7 recovery snapshots", () => {
     await expect(readSnapshot(ring, tampered)).rejects.toThrow();
   });
 
-  it("flags snapshots past the retention window for purge", () => {
-    const snap = { table: "incident", sysId: "a", takenAt: 0, envelope: {} as never };
-    expect(isExpired(config, snap, config.retentionMs + 1)).toBe(true);
-    expect(isExpired(config, snap, config.retentionMs - 1)).toBe(false);
-  });
 });
 
 // ─── §7.7 / S18 — recovery evidence: honest per-op recoverability ─────────────
@@ -90,14 +85,6 @@ describe("§7.7 / S18 recoverability classification", () => {
   it("classifies each operation honestly (claim narrowed without a snapshot)", () => {
     expect(recoverability("update", "incident", config)).toBe("reversible_from_snapshot");
     expect(recoverability("update", "change_request", config)).toBe("non_recoverable"); // not configured
-    expect(recoverability("delete", "incident", config)).toBe("soft_delete_only");
     expect(recoverability("runServerScript", undefined, config)).toBe("non_recoverable");
-    expect(recoverability("importSet", "incident", config)).toBe("idempotent_cleanup");
-  });
-
-  it("tableDelete is admin_script-only (disallowed by default)", () => {
-    expect(isDeletePermitted({ mode: "read_only" })).toBe(false);
-    expect(isDeletePermitted({ mode: "write" })).toBe(false);
-    expect(isDeletePermitted({ mode: "admin_script" })).toBe(true);
   });
 });

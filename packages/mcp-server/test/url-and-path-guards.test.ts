@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { canonicalizeInstanceHost, UrlNotAllowed } from "../src/sn/url-allowlist.js";
-import { checkScriptedRestPath, PathDenied } from "../src/sn/scripted-rest-denylist.js";
 import { SnFetchClient } from "../src/sn/http.js";
 
 // ─── S15 — URL allowlist / SSRF canonicalization (Phase 2.4) ──────────────────
@@ -35,42 +34,6 @@ describe("S15 — instance host allowlist / SSRF", () => {
   it("strips a trailing dot and matches the suffix exactly (no partial-suffix bypass)", () => {
     expect(canonicalizeInstanceHost("dev1.service-now.com.", allow)).toBe("dev1.service-now.com");
     expect(() => canonicalizeInstanceHost("evilservice-now.com", allow)).toThrow(UrlNotAllowed);
-  });
-});
-
-// ─── B2 — scriptedRest path denylist (Phase 3.2) ──────────────────────────────
-describe("B2 — scriptedRest cannot reach the executor or tamper config/audit", () => {
-  it("permits an ordinary /api path", () => {
-    expect(checkScriptedRestPath("/api/now/table/incident")).toBe("/api/now/table/incident");
-  });
-
-  it("denies the executor endpoint at any depth (incl. numeric global-scope namespace)", () => {
-    expect(() => checkScriptedRestPath("/api/x_mcp/executor/run")).toThrow(PathDenied);
-    expect(() => checkScriptedRestPath("/api/some_scope/executor/go")).toThrow(PathDenied);
-    expect(() => checkScriptedRestPath("/api/1793136/x_mcp/executor/run")).toThrow(PathDenied);
-  });
-
-  it("denies config/audit/auth/login tampering paths", () => {
-    for (const p of [
-      "/api/now/table/sys_properties",
-      "/api/now/table/x_mcp_audit_log",
-      "/oauth_token.do",
-      "/login.do",
-    ]) {
-      expect(() => checkScriptedRestPath(p)).toThrow(PathDenied);
-    }
-  });
-
-  it("denies absolute URLs, userinfo, non-/api paths, and traversal", () => {
-    for (const p of [
-      "https://evil.com/api/now/table/incident",
-      "//evil.com/api/x",
-      "/api/now/../x_mcp/executor/run",
-      "/sys_properties.do",
-      "/api/now/table/incident/%2e%2e/sys_properties",
-    ]) {
-      expect(() => checkScriptedRestPath(p)).toThrow(PathDenied);
-    }
   });
 });
 

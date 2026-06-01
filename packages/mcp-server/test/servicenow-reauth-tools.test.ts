@@ -14,6 +14,8 @@ interface TestEnv {
   LOADER: WorkerLoader;
   TOKEN_DO: DurableObjectNamespace;
   BUDGET_DO: DurableObjectNamespace;
+  LEDGER_DO: DurableObjectNamespace;
+  AUDIT_KV: KVNamespace;
 }
 const E = env as unknown as TestEnv;
 
@@ -38,10 +40,13 @@ function perUserEnv(): HandlerEnv {
 }
 
 const auth = {
+  userId: "reauthUser",
   scopeMaxMode: "admin_script" as const,
   props: { userId: "reauthUser", scopes: ["servicenow:read"], maxMode: "admin_script" },
   workerOrigin: "https://mcp.example.workers.dev",
 };
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no token)", () => {
   it("run_code → reauth_required with authorizeUrl, before any Worker/network (preflight)", async () => {
@@ -51,6 +56,15 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
     expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
     const detail = (res.structuredContent as { detail?: { authorizeUrl?: string } }).detail;
     expect(detail?.authorizeUrl).toContain("/servicenow/authorize?ticket=");
+  });
+
+  it("run_code fails closed when per_user_oauth lacks a configured public worker origin", async () => {
+    const handlers = buildHandlers(perUserEnv(), { ...auth, workerOrigin: undefined });
+    const res = await handlers.runCode({ code: "async () => 1" });
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect(res.content[0]!.text).toContain("WORKER_PUBLIC_ORIGIN");
+    expect((res.structuredContent as { detail?: { authorizeUrl?: string } }).detail?.authorizeUrl).toBeUndefined();
   });
 
   it("describe_table → reauth_required with authorizeUrl (catch → toToolResult carries detail)", async () => {
@@ -68,6 +82,223 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
     expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
     expect((res.structuredContent as { detail?: { authorizeUrl?: string } }).detail?.authorizeUrl).toContain("/servicenow/authorize?ticket=");
   });
+
+  it("explicit per_user_oauth with incomplete OAuth wiring fails closed and never falls back to Basic dev creds", async () => {
+    let networkCalls = 0;
+    vi.stubGlobal("fetch", (async () => {
+      networkCalls++;
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        BUDGET_DO: E.BUDGET_DO,
+        SNOW_INSTANCE_HOST: "dev999.service-now.com",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
+      },
+      auth,
+    );
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect(res.content[0]!.text).toContain("per_user_oauth");
+    expect(networkCalls).toBe(0);
+  });
+
+  it("an invalid SERVICENOW_CREDENTIAL_MODE fails closed at runtime instead of selecting Basic auth", async () => {
+    let networkCalls = 0;
+    vi.stubGlobal("fetch", (async () => {
+      networkCalls++;
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        BUDGET_DO: E.BUDGET_DO,
+        SNOW_INSTANCE_HOST: "dev999.service-now.com",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        SERVICENOW_CREDENTIAL_MODE: "per-user" as "per_user_oauth",
+      },
+      auth,
+    );
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect(res.content[0]!.text).toContain("SERVICENOW_CREDENTIAL_MODE");
+    expect(networkCalls).toBe(0);
+  });
+
+  it("dev Basic auth stays disabled when SNOW_DEV_ROPC is absent even if credentials are present", async () => {
+    let networkCalls = 0;
+    vi.stubGlobal("fetch", (async () => {
+      networkCalls++;
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        BUDGET_DO: E.BUDGET_DO,
+        SNOW_INSTANCE_HOST: "dev999.service-now.com",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+      },
+      auth,
+    );
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect(networkCalls).toBe(0);
+  });
+
+  it("dev Basic auth stays disabled when SNOW_DEV_ROPC is not exactly 1", async () => {
+    let networkCalls = 0;
+    vi.stubGlobal("fetch", (async () => {
+      networkCalls++;
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        BUDGET_DO: E.BUDGET_DO,
+        SNOW_INSTANCE_HOST: "dev999.service-now.com",
+        SNOW_DEV_ROPC: "0",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+      },
+      auth,
+    );
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect(networkCalls).toBe(0);
+  });
+
+  it("dev Basic auth is enabled only when SNOW_DEV_ROPC=1", async () => {
+    const calls: { authorization?: string }[] = [];
+    vi.stubGlobal("fetch", (async (_url: string, init?: RequestInit) => {
+      calls.push({ authorization: (init?.headers as Record<string, string> | undefined)?.authorization });
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        BUDGET_DO: E.BUDGET_DO,
+        SNOW_INSTANCE_HOST: "dev999.service-now.com",
+        SNOW_DEV_ROPC: "1",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+      },
+      auth,
+    );
+    const res = await handlers.listTables({});
+    expect(res.isError).not.toBe(true);
+    expect(calls[0]?.authorization).toBe(`Basic ${btoa("dev-user:dev-pass")}`);
+  });
+
+  it("OAuth ROPC credentials are ignored unless SNOW_DEV_ROPC=1", async () => {
+    let networkCalls = 0;
+    vi.stubGlobal("fetch", (async () => {
+      networkCalls++;
+      return new Response(JSON.stringify({ access_token: "SHOULD_NOT_MINT", expires_in: 1800 }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        TOKEN_DO: E.TOKEN_DO,
+        BUDGET_DO: E.BUDGET_DO,
+        SNOW_INSTANCE_HOST: "dev999.service-now.com",
+        SNOW_OAUTH_CLIENT_ID: "cid",
+        SNOW_OAUTH_CLIENT_SECRET: "csec",
+        TOKEN_KEK_CURRENT: "kek-passphrase",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+      },
+      auth,
+    );
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect(networkCalls).toBe(0);
+  });
+
+  it("reuses one decrypted bearer across multiple ServiceNow requests for the same handler", async () => {
+    const HOST = "dev999.service-now.com";
+    const USER = "bearerCacheUser";
+    const ring = await buildKekRing("kek-passphrase");
+    let rawToken: string | undefined;
+    let tokenReads = 0;
+    const backend = {
+      async putToken(_tokenType: string, opaque: string): Promise<void> {
+        rawToken = opaque;
+      },
+      async getToken(_tokenType: string): Promise<string | undefined> {
+        tokenReads++;
+        return rawToken;
+      },
+    };
+    await new TokenStore(backend, ring, USER, HOST).put("servicenow", {
+      access_token: "AT_CACHE",
+      refresh_token: "RT_CACHE",
+      expires_at: Date.now() + 3_600_000,
+    });
+    tokenReads = 0;
+
+    const tokenDo = {
+      idFromName: (name: string) => name,
+      get: () => backend,
+    } as unknown as DurableObjectNamespace;
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", (async (_url: string, init?: RequestInit) => {
+      authorizations.push((init?.headers as Record<string, string> | undefined)?.authorization ?? "");
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        TOKEN_DO: tokenDo,
+        SNOW_INSTANCE_HOST: HOST,
+        SNOW_OAUTH_CLIENT_ID: "cid",
+        SNOW_OAUTH_CLIENT_SECRET: "csec",
+        TOKEN_KEK_CURRENT: "kek-passphrase",
+        SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
+      },
+      {
+        userId: USER,
+        scopeMaxMode: "read_only",
+        props: { userId: USER, scopes: ["servicenow:read"], maxMode: "read_only" },
+        workerOrigin: "https://mcp.example.workers.dev",
+      },
+    );
+
+    expect((await handlers.listTables({})).isError).not.toBe(true);
+    expect((await handlers.listTables({ filter: "inc" })).isError).not.toBe(true);
+    expect(authorizations).toEqual(["Bearer AT_CACHE", "Bearer AT_CACHE"]);
+    expect(tokenReads).toBe(1);
+  });
 });
 
 // ─── §6b-1 FIX 3 — live resolve-and-persist of the per-user principal (integrity glue) ──
@@ -80,8 +311,6 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
 // but WITHOUT sys_id; assert the signed actor carries the resolved sys_id, the principal is
 // persisted, and the concurrent-safe re-read-merge (FIX 2) leaves access_token intact.
 describe("§6b-1 buildHandlers resolves + persists the per-user principal at sign time", () => {
-  afterEach(() => vi.unstubAllGlobals());
-
   const RESOLVE_HOST = "dev999.service-now.com"; // canonical form of SNOW_INSTANCE_HOST below
   const RESOLVE_USER = "resolveUser";
 
@@ -90,6 +319,8 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
       LOADER: E.LOADER,
       TOKEN_DO: E.TOKEN_DO,
       BUDGET_DO: E.BUDGET_DO,
+      LEDGER_DO: E.LEDGER_DO,
+      AUDIT_KV: E.AUDIT_KV,
       SNOW_INSTANCE_HOST: RESOLVE_HOST,
       SNOW_OAUTH_CLIENT_ID: "cid",
       SNOW_OAUTH_CLIENT_SECRET: "csec",
@@ -99,9 +330,13 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
       // Executor signing wiring so runServerScript reaches signing.resolveEffectiveUserSysId().
       X_MCP_EXECUTOR_HMAC_KEY: btoa(String.fromCharCode(...new Uint8Array(32).fill(7))),
       SNOW_EXECUTOR_PATH: "/api/x_1793136_mcp/x_mcp/executor/run",
+      ADMIN_SCRIPT_ALLOWLIST: RESOLVE_USER,
+      ADMIN_SCRIPT_REQUIRED_GROUP: "mcp-admins",
+      MCP_OPERATOR_ACCESS_GROUPS: "mcp-admins",
     };
   }
   const resolveAuth = {
+    userId: RESOLVE_USER,
     scopeMaxMode: "admin_script" as const,
     props: { userId: RESOLVE_USER, scopes: ["servicenow:admin_script"], maxMode: "admin_script" },
     workerOrigin: "https://mcp.example.workers.dev",
@@ -140,7 +375,7 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
 
     const handlers = buildHandlers(resolveEnv(), resolveAuth);
     const res = await handlers.runCode({
-      code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')", reason: "rotate", idempotencyKey: "k1" }); return "done"; }`,
+      code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')" }); return "done"; }`,
       mode: "admin_script",
       reason: "rotate",
       idempotencyKey: "k1",
@@ -155,6 +390,7 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
     const after = await s.get("servicenow");
     expect(after?.sys_id).toBe("BEARER_SYS");
     expect(after?.roles).toEqual(["itil", "catalog_admin"]);
+    expect(after?.principal_resolved_at).toEqual(expect.any(Number));
     // 3) Invariant: the resolve-and-persist writes back a COMPLETE token (the re-read-merge
     //    target of FIX 2), never a sys_id-only partial — the existing access_token/refresh_token
     //    survive. (This asserts the merge invariant, not FIX 2's mid-flight race-safety, which is

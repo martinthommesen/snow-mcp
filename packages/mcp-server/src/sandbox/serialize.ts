@@ -1,9 +1,19 @@
 // Host-side run_code result serialization (plan §4.4, §10 safe-serialize spirit).
 // Never throws on a non-serializable / over-cap result.
 
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
 export function utf8Len(s: string): number {
   // TextEncoder gives exact UTF-8 byte length.
-  return new TextEncoder().encode(s).length;
+  return enc.encode(s).length;
+}
+
+function truncateEncodedUtf8(bytes: Uint8Array, maxBytes: number): string {
+  let end = maxBytes;
+  // Walk back off continuation bytes (0b10xxxxxx) to the start of the boundary sequence.
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  return dec.decode(bytes.subarray(0, end));
 }
 
 /**
@@ -14,12 +24,9 @@ export function utf8Len(s: string): number {
  * result back over the cap.
  */
 export function truncateUtf8(s: string, maxBytes: number): string {
-  const bytes = new TextEncoder().encode(s);
+  const bytes = enc.encode(s);
   if (bytes.length <= maxBytes) return s;
-  let end = maxBytes;
-  // Walk back off continuation bytes (0b10xxxxxx) to the start of the boundary sequence.
-  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
-  return new TextDecoder().decode(bytes.subarray(0, end));
+  return truncateEncodedUtf8(bytes, maxBytes);
 }
 
 export interface SerializedResult {
@@ -37,11 +44,12 @@ export function serializeResult(value: unknown, maxBytes: number): SerializedRes
     const fallback = JSON.stringify({ error: "result_not_serializable" });
     return { text: fallback, truncated: false, totalBytes: utf8Len(fallback) };
   }
-  const totalBytes = utf8Len(json);
+  const bytes = enc.encode(json);
+  const totalBytes = bytes.length;
   if (totalBytes > maxBytes) {
     // Byte-safe truncation: cap at maxBytes UTF-8 bytes without splitting a sequence
     // (§P2). Flag truncation (never re-parse the slice).
-    return { text: truncateUtf8(json, maxBytes), truncated: true, totalBytes };
+    return { text: truncateEncodedUtf8(bytes, maxBytes), truncated: true, totalBytes };
   }
   return { text: json, truncated: false, totalBytes };
 }

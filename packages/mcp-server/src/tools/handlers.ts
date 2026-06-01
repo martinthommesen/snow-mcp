@@ -16,38 +16,46 @@ import { loadActorPolicy, type ActorPolicy, type PolicyEnv } from "../authz/acto
 import { McpToolError, toToolResult } from "../sn/errors.js";
 import { RunBudget } from "../sn/run-budget.js";
 import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
-import { MODE_RISK } from "@servicenow-codemode/shared";
-import { SchemaCache, roleHash } from "../cache/schema.js";
+import { SchemaCache, roleHash, type SchemaCachePrincipalIdentity } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
-import { getServiceNowBearer, preflightAuth, resolveSnPrincipal, type SnOAuthConfig } from "../auth/servicenow-oauth.js";
+import {
+  getServiceNowBearer,
+  preflightAuth,
+  resolveStoredSnPrincipal,
+  type CredentialMode,
+  type SnOAuthConfig,
+} from "../auth/servicenow-oauth.js";
 import { mintTicket } from "../auth/servicenow-ticket.js";
 import { buildKekRing } from "../auth/crypto.js";
+import { decodeFixedBase64Secret } from "../auth/encoding.js";
 import type { MutationDeps } from "../sn/rpc.js";
 import { auditKey, type RunContext, type AuditIdentity, type LedgerHandle } from "../sn/mutation-guard.js";
 import type { AuditRecord } from "../observability/audit.js";
 import { takeSnapshot, type SnapshotConfig } from "../recovery/snapshots.js";
 import type { ApprovalContext } from "../authz/approval.js";
 import type { Mode } from "@servicenow-codemode/shared";
+import { parseMaxMode } from "../authz/effective-mode.js";
 
 /** Durable-store retention for audit + snapshot KV keys (§7.7/§10): 30 days, auto-expire. */
 const RETENTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 class NotConnectedHttpClient implements SnHttpClient {
+  constructor(private readonly message = "Not connected to ServiceNow — complete OAuth (Phase 1) first.") {}
+
   async request(): Promise<never> {
-    throw new McpToolError("reauth_required", "Not connected to ServiceNow — complete OAuth (Phase 1) first.");
+    throw new McpToolError("reauth_required", this.message);
   }
 }
 
 export interface HandlerEnv extends PolicyEnv {
   LOADER: WorkerLoader;
   BUDGET_DO?: DurableObjectNamespace;
-  // Idempotency ledger (§7.3). Optional HERE BY DESIGN — read-only and test deployments omit it —
-  // but the worker `Env` (index.ts) requires it, and a mutation-capable deployment MUST bind it
-  // (buildHandlers warns once if absent; L-4). Present in the committed wrangler.jsonc.
+  // Idempotency ledger (§7.3). Optional at the env type boundary for read-only/test boots; live
+  // mutating/executor calls fail closed if it is absent.
   LEDGER_DO?: DurableObjectNamespace;
   SCHEMA_KV?: KVNamespace;
-  // Host audit (§7.2) + recovery snapshots (§7.7). AUDIT_KV optional by design (read-only/test);
-  // a mutation-capable deployment MUST bind it for audit-before-effect (L-4 warn covers absence).
+  // Host audit (§7.2) + recovery snapshots (§7.7). AUDIT_KV is optional at boot, but required
+  // before live mutation effects.
   AUDIT_KV?: KVNamespace;
   SNAPSHOT_KV?: KVNamespace;
   SNOW_INSTANCE_HOST?: string;
@@ -66,10 +74,11 @@ export interface HandlerEnv extends PolicyEnv {
   SNAPSHOT_KEK_CURRENT?: string;
   SNAPSHOT_KEK_PREV?: string;
   // Credential mode (P6) + mode ceilings (P5). All optional in P0.
-  SERVICENOW_CREDENTIAL_MODE?: "per_user_oauth" | "integration_user";
+  SERVICENOW_CREDENTIAL_MODE?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
-  // Dev Basic-Auth fallback (mirrors .dev.vars) + ROPC creds reused by the OAuth path.
+  // Dev Basic-Auth fallback + ROPC creds, enabled only by explicit SNOW_DEV_ROPC=1.
+  SNOW_DEV_ROPC?: string;
   SNOW_DEV_ROPC_USERNAME?: string;
   SNOW_DEV_ROPC_PASSWORD?: string;
   // Executor (runServerScript / admin_script): HMAC signing key + endpoint path (§2.0, §5.6).
@@ -78,77 +87,47 @@ export interface HandlerEnv extends PolicyEnv {
   // Recovery-snapshot config (§7.7): the snapshot ring uses SNAPSHOT_KEK_CURRENT/_PREV
   // (declared above) via buildKekRing (same scheme as the token ring, P3).
   SNAPSHOT_ENABLED_TABLES?: string; // comma-separated tables that get before/after snapshots.
-  SNAPSHOT_OPT_OUT?: string; // "true" disables snapshots for this tenant (claim narrowed).
   // Second-approval policy (§7.9). All optional: when NONE is set the gate is SKIPPED,
   // preserving single-operator behavior. When ANY is set the gate ENFORCES (P4).
   ADMIN_SCRIPT_ALLOWLIST?: string; // comma-separated actor userIds permitted admin_script.
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string; // comma-separated valid approval tokens.
   ADMIN_SCRIPT_REQUIRED_GROUP?: string; // required access-group name (token OR group).
+  MCP_OPERATOR_ACCESS_GROUPS?: string; // current operator groups for group-based second approval.
 }
 
-function b64ToBytes(b64: string): Uint8Array {
-  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+function csv(value: string | undefined): string[] {
+  return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
 function utcDateKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/**
- * Parse an env-supplied mode ceiling (§P5). An UNSET var defaults to `admin_script` to
- * preserve today's behavior (no tenant/instance ceiling configured → scope is the cap). But a
- * value that IS SET yet is not a valid Mode FAILS CLOSED to `read_only` (the most restrictive
- * ceiling): an operator typo on a security ceiling must visibly lock the instance down, never
- * silently grant the widest access. A minimal, safe membership check; the formal unknown-mode
- * validator lands in P6a (effective-mode.ts).
- */
-function parseMaxMode(value: string | undefined): Mode {
-  if (value === undefined) return "admin_script"; // unset → scope is the cap (no ceiling configured)
-  // OWN-property check (not `in`, which would let prototype keys like "toString" through).
-  // Set-but-invalid → fail closed to the most restrictive ceiling (loud operator typo, not silent widen).
-  return Object.prototype.hasOwnProperty.call(MODE_RISK, value) ? (value as Mode) : "read_only";
+type ParsedCredentialMode = CredentialMode | "invalid";
+
+function parseCredentialMode(value: string | undefined): ParsedCredentialMode {
+  if (value === undefined || value.trim() === "") return "integration_user";
+  if (value === "integration_user" || value === "per_user_oauth") return value;
+  return "invalid";
 }
 
 export interface AuthContext {
+  /** Authenticated MCP actor identity, validated once by apiHandler. */
+  userId: string;
   /** Highest mode the client's OAuth scope permits (auth.props.maxMode, §2.0.1/§2.4). */
   scopeMaxMode: Mode;
-  props?: Record<string, unknown>;
-  /** The worker's own public origin (request-derived in apiHandler), used to build the §6b
-   *  reauth ticket URL `${origin}/servicenow/authorize?ticket=…`. Absent in non-HTTP callers. */
+  props: Record<string, unknown>;
+  /** The worker's configured public origin, used to build the §6b reauth ticket URL
+   *  `${origin}/servicenow/authorize?ticket=…`. Required for per_user_oauth. */
   workerOrigin?: string;
-  /** Hash of the per-user SN principal's roles (§6b) for the SchemaCache identity, so a role
-   *  change busts the cache. Computed async in apiHandler (roleHash() is SHA-256; buildHandlers
-   *  is sync). Absent ⇒ shared "default" — the role-change cache-bust applies ONLY to
-   *  per_user_oauth (integration_user has no per-user principal). */
-  roleHash?: string;
+  /** ServiceNow principal identity for the SchemaCache key (§6b). */
+  schemaIdentity?: SchemaCachePrincipalIdentity;
+  /** Lazy schema identity resolver. Non-schema calls should not pay a TokenStore read. */
+  schemaIdentityResolver?: () => Promise<SchemaCachePrincipalIdentity | undefined>;
 }
 
-// L-4: fire the missing-durability warning at most once per isolate (buildHandlers runs per
-// request, so an unconditional warn would spam and a hard throw would break read-only/test deploys
-// that legitimately omit the ledger/audit bindings).
-let warnedMissingDurability = false;
-
-export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandlers {
-  const scopeMaxMode: Mode = auth?.scopeMaxMode ?? "read_only";
-  // L-4: a mutation-capable deployment (tenant/instance ceiling above read_only) MUST bind both the
-  // idempotency ledger and the durable audit sink; without them, mutations still run (the mandatory
-  // runKey gate is independent) but replay-dedup and audit-before-effect silently degrade. Warn
-  // once so a misconfigured deploy is detectable. (The committed wrangler.jsonc binds both.)
-  if (!warnedMissingDurability) {
-    const mutationCapable = parseMaxMode(env.TENANT_MAX_MODE) !== "read_only" && parseMaxMode(env.INSTANCE_MAX_MODE) !== "read_only";
-    if (mutationCapable && (!env.LEDGER_DO || !env.AUDIT_KV)) {
-      warnedMissingDurability = true;
-      console.warn(
-        JSON.stringify({
-          event: "missing_durability_bindings",
-          severity: "warn",
-          note: "mutation-capable deployment is missing LEDGER_DO and/or AUDIT_KV; idempotency replay-dedup and/or audit-before-effect are disabled (mutations still gated by the mandatory idempotencyKey).",
-          ledger: Boolean(env.LEDGER_DO),
-          audit: Boolean(env.AUDIT_KV),
-        }),
-      );
-    }
-  }
+export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandlers {
+  const scopeMaxMode: Mode = auth.scopeMaxMode;
   // Canonicalize + allowlist the configured instance host ONCE here (plan §P6a, finding "OAuth
   // token off-allowlist"), then thread the canonical value to BOTH SnFetchClient AND the
   // SnOAuthConfig. tokenRequest() POSTs https://${instanceHost}/oauth_token.do with the client
@@ -158,7 +137,7 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   const instanceHost = env.SNOW_INSTANCE_HOST
     ? canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST, { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] })
     : "unconfigured.invalid";
-  const userId = (auth?.props?.userId as string) ?? "operator";
+  const userId = auth.userId;
   // §6b: configurable RESTRICTIVE ActorPolicy. NON-BREAKING — with NO policy config set this
   // returns the permissive single-operator policy (live deployment unchanged). When policy vars
   // ARE set it builds a restrictive policy (table allowlist + field masks + row filters + per-run
@@ -169,22 +148,25 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   // Authorization header strategy (preference order):
   //  1. Per-user ServiceNow OAuth Bearer — tokens minted/refreshed and stored encrypted in
   //     TokenStoreDO (§2.7, §7.5). Preferred.
-  //  2. Dev Basic-Auth fallback.
+  //  2. Explicit dev Basic-Auth fallback (SNOW_DEV_ROPC=1).
   //  3. Not connected -> fail closed.
   // TOKEN_KEK is a one-release alias for TOKEN_KEK_CURRENT (P3 migration).
   const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
-  const credentialMode = env.SERVICENOW_CREDENTIAL_MODE ?? "integration_user";
-  const oauthReady = Boolean(env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST);
-  const devConnected = Boolean(env.SNOW_INSTANCE_HOST && env.SNOW_DEV_ROPC_USERNAME && env.SNOW_DEV_ROPC_PASSWORD);
+  const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
+  const serviceNowCredentialMode: CredentialMode = credentialMode === "per_user_oauth" ? "per_user_oauth" : "integration_user";
+  const devRopcEnabled = env.SNOW_DEV_ROPC === "1";
+  const oauthReady = Boolean(env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST && (credentialMode !== "per_user_oauth" || auth.workerOrigin));
+  const devConnected = Boolean(devRopcEnabled && env.SNOW_INSTANCE_HOST && env.SNOW_DEV_ROPC_USERNAME && env.SNOW_DEV_ROPC_PASSWORD);
 
   // §6b reauth ticket: in per_user_oauth, a missing/corrupt token must surface a click-through
   // reauth link (the host-HMAC ticket URL = `${workerOrigin}/servicenow/authorize?ticket=…`).
   // Minting is async + memoized (one per buildHandlers); the ticket carries the userId from the
-  // authenticated /mcp request. Absent secret/origin (or integration_user) ⇒ undefined URL (the
-  // reauth_required still fires, just without a link). The ticket is short-lived (10 min).
+  // authenticated /mcp request. Absent secret (or integration_user) ⇒ undefined URL (the
+  // reauth_required still fires, just without a link). Missing origin is a per_user_oauth
+  // configuration error handled before this helper. The ticket is short-lived (10 min).
   let authorizeUrlPromise: Promise<string | undefined> | undefined;
   const reauthAuthorizeUrl = (): Promise<string | undefined> => {
-    if (credentialMode !== "per_user_oauth" || !auth?.workerOrigin || !env.OAUTH_PROVIDER_SECRET) {
+    if (credentialMode !== "per_user_oauth" || !auth.workerOrigin || !env.OAUTH_PROVIDER_SECRET) {
       return Promise.resolve(undefined);
     }
     authorizeUrlPromise ??= (async () => {
@@ -200,26 +182,49 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   let http: SnHttpClient;
   let oauthStore: (() => Promise<TokenStore>) | undefined;
   let oauthCfg: SnOAuthConfig | undefined;
-  if (oauthReady) {
+  let requestAuthorization: (() => Promise<string>) | undefined;
+  let perUserConfigurationError: string | undefined;
+  if (credentialMode === "invalid") {
+    http = new NotConnectedHttpClient("Invalid SERVICENOW_CREDENTIAL_MODE; expected integration_user or per_user_oauth.");
+  } else if (credentialMode === "per_user_oauth" && !auth.workerOrigin) {
+    perUserConfigurationError = "SERVICENOW_CREDENTIAL_MODE=per_user_oauth requires WORKER_PUBLIC_ORIGIN.";
+    http = new NotConnectedHttpClient(perUserConfigurationError);
+  } else if (credentialMode === "per_user_oauth" && !oauthReady) {
+    perUserConfigurationError = "SERVICENOW_CREDENTIAL_MODE=per_user_oauth is not fully configured; complete OAuth bindings before use.";
+    http = new NotConnectedHttpClient(perUserConfigurationError);
+  } else if (oauthReady) {
     const stub = env.TOKEN_DO!.get(env.TOKEN_DO!.idFromName(`${userId}|${instanceHost}`)) as unknown as {
-      putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>; revokeAll(): Promise<void>;
+      putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>;
     };
     const cfg: SnOAuthConfig = {
       instanceHost, clientId: env.SNOW_OAUTH_CLIENT_ID!, clientSecret: env.SNOW_OAUTH_CLIENT_SECRET!,
-      ...(env.SNOW_DEV_ROPC_USERNAME ? { ropcUsername: env.SNOW_DEV_ROPC_USERNAME } : {}),
-      ...(env.SNOW_DEV_ROPC_PASSWORD ? { ropcPassword: env.SNOW_DEV_ROPC_PASSWORD } : {}),
+      ...(devRopcEnabled && env.SNOW_DEV_ROPC_USERNAME ? { ropcUsername: env.SNOW_DEV_ROPC_USERNAME } : {}),
+      ...(devRopcEnabled && env.SNOW_DEV_ROPC_PASSWORD ? { ropcPassword: env.SNOW_DEV_ROPC_PASSWORD } : {}),
     };
     oauthCfg = cfg;
     // Versioned, content-addressed KEK ring (P3): TOKEN_KEK_CURRENT (+ optional TOKEN_KEK_PREV)
-    // so a key rotation never bricks stored tokens. Built lazily + reused per call.
-    oauthStore = async () => new TokenStore(stub, await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV), userId, instanceHost);
+    // so a key rotation never bricks stored tokens. Built lazily and memoized per buildHandlers
+    // call so preflight, getAuthorization, and effective-principal resolution share one store.
+    let ringPromise: Promise<Awaited<ReturnType<typeof buildKekRing>>> | undefined;
+    let storePromise: Promise<TokenStore> | undefined;
+    oauthStore = () => {
+      ringPromise ??= buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV);
+      storePromise ??= ringPromise.then((ring) => new TokenStore(stub, ring, userId, instanceHost));
+      return storePromise;
+    };
+    let authorizationPromise: Promise<string> | undefined;
+    requestAuthorization = (): Promise<string> => {
+      authorizationPromise ??= (async () => {
+        const store = await oauthStore!();
+        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), serviceNowCredentialMode, await reauthAuthorizeUrl()));
+      })();
+      return authorizationPromise;
+    };
     http = new SnFetchClient({
       instanceHost, allowlist: { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] },
-      getAuthorization: async () => {
-        const store = await oauthStore!();
-        // per_user_oauth: missing/corrupt token ⇒ reauth_required (+authorizeUrl), never ROPC.
-        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), credentialMode, await reauthAuthorizeUrl()));
-      },
+      // Request-local cache: one buildHandlers instance serves one authenticated /mcp request, so
+      // every ServiceNow call in that request can reuse the same decrypted/refreshed bearer.
+      getAuthorization: requestAuthorization,
     });
   } else if (devConnected) {
     http = new SnFetchClient({
@@ -274,28 +279,16 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   // (option (b): the sys_id is consumed ONLY by the signed `snow_effective_user_sys_id` claim,
   // so resolving it here avoids a per-/mcp-request decrypt for reads/writes that never sign).
   // Reads the principal stored alongside the token (persisted by the §6b callback / a prior
-  // resolve); if absent, resolves it live with the current bearer and persists it. Only in
-  // per_user_oauth — integration_user has no per-user principal (stays "").
+  // resolve); if absent or stale, resolves it live with the current bearer and persists it. Only
+  // in per_user_oauth — integration_user has no per-user principal (stays "").
   const resolveEffectiveSysId = oauthReady && oauthStore && oauthCfg && credentialMode === "per_user_oauth"
     ? async (): Promise<string> => {
         const store = await oauthStore!();
-        const tokens = await store.get("servicenow").catch(() => null);
-        if (!tokens) return "";
-        if (tokens.sys_id) return tokens.sys_id;
-        const principal = await resolveSnPrincipal(oauthCfg!, tokens.access_token);
-        if (!principal) return "";
-        // Compare-and-merge (P6b-1 FIX 2): re-read immediately before rotate and merge ONLY
-        // sys_id/roles onto the LATEST stored value. A concurrent getAuthorization() refresh may
-        // have rotated access_token between our read and here; writing back the token we first
-        // read would clobber that fresher access_token (last-writer-wins). If the re-read returns
-        // null (token revoked mid-flight) we skip the rotate and just return the resolved sys_id.
-        const latest = await store.get("servicenow").catch(() => null);
-        if (latest) {
-          latest.sys_id = principal.sys_id;
-          latest.roles = principal.roles;
-          await store.rotate("servicenow", latest);
-        }
-        return principal.sys_id;
+        const authorization = requestAuthorization ? await requestAuthorization() : "";
+        const principal = await resolveStoredSnPrincipal(oauthCfg!, store, Date.now(), {
+          accessToken: authorization.replace(/^Bearer\s+/i, ""),
+        });
+        return principal?.sys_id ?? "";
       }
     : undefined;
 
@@ -304,13 +297,13 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   const signing = executorReady
     ? {
         claims: {
-          mcp_actor_user_id: (auth?.props?.userId as string) ?? "operator",
-          mcp_actor_email: (auth?.props?.email as string) ?? "",
+          mcp_actor_user_id: userId,
+          mcp_actor_email: (auth.props.email as string) ?? "",
           snow_effective_user_sys_id: "",
           instance: instanceHost,
           request_id: crypto.randomUUID(),
         },
-        hmacKey: b64ToBytes(env.X_MCP_EXECUTOR_HMAC_KEY!),
+        hmacKey: decodeFixedBase64Secret("X_MCP_EXECUTOR_HMAC_KEY", env.X_MCP_EXECUTOR_HMAC_KEY!, 32),
         nonce: () => crypto.randomUUID(),
         now: () => Date.now(),
         // §6b: resolve the effective user's sys_id at sign time (per_user_oauth only).
@@ -324,7 +317,7 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
   // identity is the authenticated actor (no secrets); snowEffectiveUser is wired in P6b.
   const identity: AuditIdentity = {
     mcpActorUserId: userId,
-    ...(auth?.props?.email ? { mcpActorEmail: auth.props.email as string } : {}),
+    ...(auth.props.email ? { mcpActorEmail: auth.props.email as string } : {}),
   };
 
   // Idempotency ledger (§7.3): one DO per (userId|instanceHost|runKey:ordinal).
@@ -353,13 +346,13 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     : undefined;
 
   // Recovery snapshots (§7.7): encrypt under the SNAPSHOT_KEK ring (same buildKekRing scheme
-  // as the token ring, P3) and persist to SNAPSHOT_KV with a 30-day TTL. Honor the tenant
-  // opt-out (no enabled tables => no snapshots, recovery claim narrowed). The integration
-  // user never decrypts (the KEK lives only host-side). The ring is built lazily + cached.
+  // as the token ring, P3) and persist to SNAPSHOT_KV with a 30-day TTL. No enabled tables means
+  // no snapshots, so the recovery claim is narrowed. The integration user never decrypts
+  // (the KEK lives only host-side). The ring is built lazily + cached.
   const snapshotKekSecret = env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK;
   const snapshotEnabledTables = (env.SNAPSHOT_ENABLED_TABLES ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const snapshotReady = Boolean(env.SNAPSHOT_KV && snapshotKekSecret && snapshotEnabledTables.length > 0);
-  const snapshotConfig: SnapshotConfig = { enabledTables: snapshotEnabledTables, retentionMs: RETENTION_TTL_SECONDS * 1000 };
+  const snapshotConfig: SnapshotConfig = { enabledTables: snapshotEnabledTables };
   let snapshotRing: Promise<Awaited<ReturnType<typeof buildKekRing>>> | undefined;
   const captureSnapshot = snapshotReady
     ? async (input: {
@@ -382,39 +375,41 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
       }
     : undefined;
 
-  // Second-approval policy (§7.9): present ONLY when a tenant configures it. When none of
-  // the three knobs is set the gate is SKIPPED (single-operator default keeps working);
-  // when ANY is set it ENFORCES (admin_script without a valid token/group is denied).
-  const adminScriptAllowlist = (env.ADMIN_SCRIPT_ALLOWLIST ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  const validApprovalTokens = (env.ADMIN_SCRIPT_APPROVAL_TOKENS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  // Second-approval policy (§7.9): empty/unconfigured means default-deny for admin_script.
+  // A request passes only when the actor is allowlisted and has either a valid approval token
+  // or the current required access-group membership.
+  const adminScriptAllowlist = csv(env.ADMIN_SCRIPT_ALLOWLIST);
+  const validApprovalTokens = csv(env.ADMIN_SCRIPT_APPROVAL_TOKENS);
   const requiredAccessGroup = env.ADMIN_SCRIPT_REQUIRED_GROUP?.trim();
-  const approvalConfigured = adminScriptAllowlist.length > 0 || validApprovalTokens.length > 0 || Boolean(requiredAccessGroup);
-  const approval: Omit<ApprovalContext, "mode" | "actorUserId" | "reason"> | undefined = approvalConfigured
-    ? {
-        adminScriptAllowlist,
-        ...(validApprovalTokens.length > 0 ? { validApprovalTokens: new Set(validApprovalTokens) } : {}),
-        ...(requiredAccessGroup ? { requiredAccessGroup } : {}),
-        ...(auth?.props?.accessGroups ? { actorAccessGroups: auth.props.accessGroups as string[] } : {}),
-      }
-    : undefined;
+  // Current env only: OAuth grant props can outlive group-based approval changes.
+  const actorAccessGroups = csv(env.MCP_OPERATOR_ACCESS_GROUPS);
+  const approval: Omit<ApprovalContext, "mode" | "actorUserId" | "reason"> = {
+    adminScriptAllowlist,
+    ...(validApprovalTokens.length > 0 ? { validApprovalTokens: new Set(validApprovalTokens) } : {}),
+    ...(requiredAccessGroup ? { requiredAccessGroup } : {}),
+    ...(actorAccessGroups.length > 0 ? { actorAccessGroups } : {}),
+  };
 
   function buildMutationDeps(runContext: RunContext): MutationDeps {
     return {
       runContext,
       identity,
       now: () => Date.now(),
+      durabilityRequired: true,
       ...(ledgerFactory && runContext.runKey ? { ledger: ledgerFactory(runContext.runKey) } : {}),
       ...(auditSink ? { audit: auditSink } : {}),
       ...(captureSnapshot ? { captureSnapshot, snapshotEnabledTables } : {}),
-      ...(approval ? { approval } : {}),
+      approval,
     };
   }
 
   // §6b pre-sandbox reauth preflight: in per_user_oauth, short-circuit with host-attested
   // reauth_required (+authorizeUrl) BEFORE the billable Worker when no usable token exists.
   // No-op in integration_user / non-OAuth boots (oauthStore absent).
-  const preflightAuthDep = oauthStore
-    ? async (): Promise<void> => preflightAuth(await oauthStore!(), credentialMode, await reauthAuthorizeUrl())
+  const preflightAuthDep = perUserConfigurationError
+    ? async (): Promise<never> => { throw new McpToolError("reauth_required", perUserConfigurationError); }
+    : oauthStore
+    ? async (): Promise<void> => preflightAuth(await oauthStore!(), serviceNowCredentialMode, await reauthAuthorizeUrl())
     : undefined;
 
   const runCodeDeps: RunCodeDeps = {
@@ -444,19 +439,27 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget: new RunBudget() };
   }
 
-  // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Keyed by the authenticated user so
-  // ACL-filtered field visibility never leaks across users (S6). §6b: the roleHash comes from the
-  // per-user SN principal's roles (computed async in apiHandler, threaded via auth.roleHash) so a
-  // role change busts the cache; it falls back to the shared "default" in integration_user (no
-  // per-user principal) or any non-HTTP caller that did not resolve it.
-  const cache = env.SCHEMA_KV
-    ? new SchemaCache(env.SCHEMA_KV, { instanceHost, userId, roleHash: auth?.roleHash ?? "default" })
-    : undefined;
+  // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Built lazily so run_code and other
+  // non-schema calls do not pay a per-user TokenStore read/decrypt just to compute identity.
+  // In per_user_oauth the resolver must return the ServiceNow sys_id; if it cannot, we skip cache
+  // for this request rather than keying ACL-filtered schema under a fallback identity.
+  let schemaCachePromise: Promise<SchemaCache | undefined> | undefined;
+  const schemaCache = (): Promise<SchemaCache | undefined> => {
+    if (!env.SCHEMA_KV) return Promise.resolve(undefined);
+    schemaCachePromise ??= (async () => {
+      const identity = auth.schemaIdentity ?? (auth.schemaIdentityResolver
+        ? await auth.schemaIdentityResolver()
+        : { principalId: userId, roleHash: "default" });
+      return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity }) : undefined;
+    })();
+    return schemaCachePromise;
+  };
 
   return {
     runCode: (input) => runCode(input, runCodeDeps),
     describeTable: async ({ table }): Promise<ToolTextResult> => {
       try {
+        const cache = await schemaCache();
         const fetcher = () => describeTable(discoveryDeps(), table);
         const { fields, cached } = cache ? await cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
         return { content: [{ type: "text", text: JSON.stringify({ table, fields }) }], isError: false, structuredContent: { table, fieldCount: fields.length, cached } };
@@ -466,6 +469,7 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
     },
     listTables: async ({ filter }): Promise<ToolTextResult> => {
       try {
+        const cache = await schemaCache();
         const fetcher = () => listTables(discoveryDeps(), filter);
         const { tables, cached } = cache ? await cache.listTables(filter, fetcher) : { tables: await fetcher(), cached: false };
         return { content: [{ type: "text", text: JSON.stringify({ tables }) }], isError: false, structuredContent: { count: tables.length, cached } };
@@ -477,41 +481,49 @@ export function buildHandlers(env: HandlerEnv, auth?: AuthContext): ServerHandle
 }
 
 /**
- * Resolve the SchemaCache `roleHash` for a /mcp request (§6b). roleHash() is async (SHA-256) but
- * buildHandlers is sync, so apiHandler computes the hash here and threads it via AuthContext.roleHash.
+ * Resolve the SchemaCache identity for a /mcp request (§6b). buildHandlers is sync, so apiHandler
+ * threads this async resolver through AuthContext and schema tools invoke it lazily.
  *
- * Returns the shared `"default"` (no extra work, no decrypt) UNLESS the deployment is in
- * per_user_oauth mode with the OAuth path fully configured — so the live integration_user
- * deployment is completely untouched (no second TokenStore read). In per_user_oauth this is a
- * second TokenStore decrypt per /mcp request (the price of keeping buildHandlers sync); flagged
- * for the reviewer. BEST-EFFORT: any failure (missing/undecryptable token, no resolved roles)
- * falls back to `"default"` — it NEVER throws, so it cannot block the reauth_required path.
+ * Returns the authenticated MCP actor identity in integration_user mode (no extra work, no decrypt).
+ * In per_user_oauth it returns a fresh ServiceNow `sys_id` plus role hash. If the principal is
+ * absent, stale-unresolvable, or unreadable, returns undefined so schema tools bypass cache for
+ * that request. It NEVER throws, so it cannot block the reauth_required path.
  */
-export async function resolveRoleHash(env: HandlerEnv, userId: string): Promise<string> {
+export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Promise<SchemaCachePrincipalIdentity | undefined> {
   const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
-  const credentialMode = env.SERVICENOW_CREDENTIAL_MODE ?? "integration_user";
+  const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
   const oauthReady = Boolean(
     env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST,
   );
-  if (credentialMode !== "per_user_oauth" || !oauthReady) return "default";
+  if (credentialMode !== "per_user_oauth") return { principalId: userId, roleHash: "default" };
+  if (!oauthReady) return undefined;
   try {
     const instanceHost = canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST!, {
       allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES],
     });
     const stub = env.TOKEN_DO!.get(env.TOKEN_DO!.idFromName(`${userId}|${instanceHost}`)) as unknown as {
-      putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>; revokeAll(): Promise<void>;
+      putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>;
     };
     const store = new TokenStore(stub, await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV), userId, instanceHost);
-    const tokens = await store.get("servicenow").catch(() => null);
-    const roles = tokens?.roles;
-    if (!roles || roles.length === 0) return "default";
-    return await roleHash(roles);
+    const principal = await resolveStoredSnPrincipal(
+      {
+        instanceHost,
+        clientId: env.SNOW_OAUTH_CLIENT_ID!,
+        clientSecret: env.SNOW_OAUTH_CLIENT_SECRET!,
+      },
+      store,
+      Date.now(),
+    );
+    if (!principal) return undefined;
+    const roles = principal.roles;
+    return {
+      principalId: principal.sys_id,
+      roleHash: roles && roles.length > 0 ? await roleHash(roles) : "default",
+    };
   } catch (e) {
-    // Best-effort: a role-hash failure must NEVER block the request (no throw). But a transient
-    // TokenStore decrypt/read failure silently stops busting the SchemaCache, so ACL-filtered
-    // visibility can go stale for up to the 24h TTL (userId stays in the key — no cross-user
-    // leak). Log so a PERSISTENT degrade is observable; the error object only (no token/key data).
-    console.error("resolveRoleHash failed; SchemaCache not busted on role change", e);
-    return "default";
+    // Best-effort: an identity failure must NEVER block the request. Bypassing cache is safer than
+    // reusing a fallback key for ACL-filtered schema. Log only the error object (no token/key data).
+    console.error("resolveSchemaIdentity failed; SchemaCache disabled for this request", e);
+    return undefined;
   }
 }
