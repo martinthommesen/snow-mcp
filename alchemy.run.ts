@@ -8,7 +8,9 @@ import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import alchemy from "alchemy";
 import { Worker, KVNamespace, DurableObjectNamespace, WorkerLoader } from "alchemy/cloudflare";
-import { tokenKekBindings } from "./alchemy.bindings";
+// Explicit .ts extension: alchemy.run.ts is executed by node's native ESM loader (type-stripping),
+// which — unlike esbuild/vitest — does NOT resolve an extensionless relative import.
+import { tokenKekBindings } from "./alchemy.bindings.ts";
 
 // --- load .dev.vars into process.env (no external dotenv dep) ---
 const devVarsPath = fileURLToPath(new URL("./.dev.vars", import.meta.url));
