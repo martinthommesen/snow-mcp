@@ -162,7 +162,7 @@ describe("finding 4 — consent-write admission cap on GET /authorize", () => {
     );
     expect(res.status).toBe(429);
     expect(await res.text()).not.toContain('name="consent"'); // no consent page minted
-    expect(rate.calls).toEqual(["flooder|203.0.113.7"]); // keyed by client_id + IP
+    expect(rate.calls).toEqual(["203.0.113.7"]); // keyed by SOURCE IP only (not client_id)
   });
 
   it("passes through (200 + consent nonce) when the limiter allows", async () => {

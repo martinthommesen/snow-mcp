@@ -85,6 +85,26 @@ evidence below follow the `docs/CODE_REVIEW_2026-05-31.md` format.
   before the limiter is consulted.
 - **Verdict:** fixed.
 
+#### CDX-4-follow-up — ConsentRateDO allowed unbounded in-memory keys — FIXED
+- **File:** `packages/mcp-server/src/do/consent-rate.ts`, `packages/mcp-server/src/auth/servicenow-auth-handler.ts`
+- **Category:** availability / unbounded memory
+- **State.** The initial CDX-4 limiter keyed by `client_id|ip` and only called `prune()` (drop
+  *expired*) when the map was already large — it never rejected/evicted an unexpired key, so every
+  new key was inserted and `MAX_KEYS` was not actually enforced. Combined with open dynamic client
+  registration, an attacker could mint many `client_id`s from one IP, creating a distinct key each
+  and growing the DO's Map without bound (and splitting the per-key cap so the aggregate write rate
+  per IP was unbounded).
+- **Fix.** (a) Key by **source IP only** (drop `client_id`) so registering more clients cannot
+  multiply keys or split the cap. (b) Make `MAX_KEYS` a **hard** bound: on a genuinely new key,
+  prune expired then evict the oldest-inserted entry (== soonest to expire; constant window) until
+  there is room, BEFORE inserting — the Map can never exceed `MAX_KEYS`. Added a `count()` accessor.
+- **Evidence / tests.** `do-partition.test.ts`: drive one IP to cap, insert `MAX_KEYS` more IPs →
+  `count() === MAX_KEYS` (never exceeds) and the evicted oldest IP gets a fresh window.
+  `auth-surface.test.ts`: limiter is keyed by the source IP.
+- **Residual.** A massive *distributed* (many-IP) flood is still bounded by the single DO's
+  throughput and the hard key cap with eviction; per-IP write rate is capped at 30/window.
+- **Verdict:** fixed.
+
 #### CDX-5 — Daily RPC/request budgets can be exceeded by the accrual path — FIXED
 - **File:** `packages/mcp-server/src/do/budget.ts` (new `reconcile`), `packages/mcp-server/src/tools/run_code.ts`, `packages/mcp-server/src/tools/handlers.ts`
 - **Category:** cost ceiling / concurrency overshoot
