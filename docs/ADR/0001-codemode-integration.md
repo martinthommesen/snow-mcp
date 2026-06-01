@@ -4,7 +4,7 @@
 **Date:** 2026-05-30.
 **Package proven against:** `@cloudflare/[email protected]`, `esbuild-[email protected]`, `[email protected]` (workerd `1.20260526.1`, miniflare `4.20260526.0`).
 
-> Per DEVELOPMENT_PLAN §3.4: "Phase 0.8 proves the exact `execute()` contract and the TS pipeline before this is built … Every sample in the plan then conforms to that one shape." This ADR is that shape, derived from the **installed** package, not from the plan's prose. Where the two differ, this ADR (and the installed package) win; differences are logged in `docs/DELTAS.md`.
+> Per the Code Mode contract (see [`../DESIGN.md`](../DESIGN.md) § Architecture; original wording in [`../archive/DEVELOPMENT_PLAN.md`](../archive/DEVELOPMENT_PLAN.md) §3.4): "Phase 0.8 proves the exact `execute()` contract and the TS pipeline before this is built … Every sample then conforms to that one shape." This ADR is that shape, derived from the **installed** package, not from prose. Where the two differ, this ADR (and the installed package) win; differences are logged in `docs/DELTAS.md`.
 
 ## Decision 1 — Primary pipeline confirmed; no worker-bundler fallback
 

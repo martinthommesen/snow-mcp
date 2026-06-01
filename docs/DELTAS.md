@@ -1,4 +1,4 @@
-# DELTAS — where the installed reality differs from DEVELOPMENT_PLAN.md
+# DELTAS — where the installed reality differs from the design
 
 Plan rule (§0 rule 2): *"If a documented API here no longer matches the installed package, trust the installed package and official docs, and record the delta here."* Each entry: what the plan said → what is true → action taken.
 
@@ -192,4 +192,4 @@ Per the plan's "Deferred" section, future-only adapters stay out of source until
 ## Open / deferred
 
 - `@cloudflare/workers-oauth-provider@0.7.0` storage round-trip (Phase 0.10) — to verify with a mock upstream in Phase 1 wiring.
-- ServiceNow-side proofs (0.13a/c/e, §10) — blocked on a live PDI; see `OPEN_QUESTIONS.md`.
+- ServiceNow-side proofs (0.13a/c/e, §10) — blocked on a live PDI; see `archive/OPEN_QUESTIONS.md`.

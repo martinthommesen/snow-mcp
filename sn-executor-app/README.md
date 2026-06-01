@@ -22,3 +22,6 @@ supported executor install path.
 | HMAC/eval primitives | Global `x_mcp_verify` helper called by the scoped wrapper |
 
 Use [INSTALL.md](INSTALL.md) or [fluent/README.md](fluent/README.md) for the live install path.
+
+To deploy under **your own** ServiceNow vendor prefix (not the `x_1793136_mcp` example above), run
+the one-time re-scope step **before** installing — see [../docs/FORK.md](../docs/FORK.md).

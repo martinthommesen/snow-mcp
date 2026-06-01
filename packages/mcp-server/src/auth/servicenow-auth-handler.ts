@@ -8,6 +8,7 @@
 // scriptable for verification (the consent is a form POST, not a mandatory browser UI).
 
 import type { Mode } from "@servicenow-codemode/shared";
+import { constantTimeEqualAscii } from "./encoding.js";
 import { requireOAuthKv } from "./oauth-kv.js";
 
 interface AuthRequestInfo {
@@ -148,7 +149,7 @@ export const serviceNowAuthHandler = {
         const expected = env.MCP_OPERATOR_SECRET ?? "";
         // Fail closed: no configured secret => never authorize. On a wrong secret, re-render
         // with the SAME nonce (do NOT delete the entry — its TTL keeps the retry valid).
-        if (!expected || secret.length !== expected.length || !timingSafeEqual(secret, expected)) {
+        if (!expected || secret.length !== expected.length || !constantTimeEqualAscii(secret, expected)) {
           return consentPage(oauth, "", nonce, "Invalid operator secret.");
         }
         // Single-use on success: burn the consent nonce so the grant can't be replayed.
@@ -178,9 +179,3 @@ export const serviceNowAuthHandler = {
     return new Response("Not found", { status: 404 });
   },
 };
-
-function timingSafeEqual(a: string, b: string): boolean {
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}

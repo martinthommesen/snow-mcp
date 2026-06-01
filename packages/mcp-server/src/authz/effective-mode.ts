@@ -8,7 +8,7 @@
 // approve `admin_script`: that additionally needs the allowlist + second-approval
 // gate (§3.5, Phase 7.9), layered on top of a successful resolution here.
 
-import { MODE_RISK, modeRisk, type Mode } from "@servicenow-codemode/shared";
+import { isValidMode, modeRisk, type Mode } from "@servicenow-codemode/shared";
 
 /** Plan §0.9 Decision 1 — default floor. Flip to widen for private/internal demos. */
 export const DEFAULT_MODE: Mode = "read_only";
@@ -44,7 +44,7 @@ export interface ModeCeilings {
  */
 export function parseMaxMode(value: string | undefined): Mode {
   if (value === undefined) return "admin_script";
-  return Object.prototype.hasOwnProperty.call(MODE_RISK, value) ? (value as Mode) : "read_only";
+  return isValidMode(value) ? value : "read_only";
 }
 
 export type EffectiveModeResult =

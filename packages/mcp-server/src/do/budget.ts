@@ -60,6 +60,18 @@ export class BudgetDO extends DurableObject {
   // no two reserves interleave and the global cap can never be over-committed (S14).
   private chain: Promise<unknown> = Promise.resolve();
 
+  // Route a read-check-write through the in-instance promise-chain mutex (see `chain`
+  // above). FIFO via this.chain.then; the swallow-tail keeps the chain alive after a
+  // rejection while `run` still rejects to the caller.
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(task);
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   /**
    * Atomically reserve across all requested dimensions. If ANY dimension would exceed
    * its cap, NOTHING is incremented and the breaching dimension is returned. Otherwise
@@ -74,12 +86,7 @@ export class BudgetDO extends DurableObject {
    * documented on the post-run `increment` accrual path.
    */
   reserve(req: ReserveRequest, capOverride?: Partial<Record<BudgetDimension, number>>, userId?: string): Promise<ReserveResult> {
-    const run = this.chain.then(() => this.reserveCritical(req, capOverride, userId));
-    this.chain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+    return this.enqueue(() => this.reserveCritical(req, capOverride, userId));
   }
 
   private async reserveCritical(req: ReserveRequest, capOverride?: Partial<Record<BudgetDimension, number>>, userId?: string): Promise<ReserveResult> {
@@ -144,12 +151,7 @@ export class BudgetDO extends DurableObject {
    * do NOT claim perfect daily byte enforcement.
    */
   increment(req: ReserveRequest, userId?: string): Promise<void> {
-    const run = this.chain.then(() => this.incrementCritical(req, userId));
-    this.chain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+    return this.enqueue(() => this.incrementCritical(req, userId));
   }
 
   private async incrementCritical(req: ReserveRequest, userId?: string): Promise<void> {
@@ -183,12 +185,7 @@ export class BudgetDO extends DurableObject {
    * concurrent op cannot interleave its read-modify-write.
    */
   reconcile(delta: ReserveRequest, userId?: string): Promise<void> {
-    const run = this.chain.then(() => this.reconcileCritical(delta, userId));
-    this.chain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+    return this.enqueue(() => this.reconcileCritical(delta, userId));
   }
 
   private async reconcileCritical(delta: ReserveRequest, userId?: string): Promise<void> {

@@ -22,7 +22,6 @@ export function decodeFixedBase64Secret(name: string, value: string, expectedByt
   if (
     normalized.length === 0 ||
     !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) ||
-    normalized.indexOf("=") !== -1 && !/=+$/.test(normalized.slice(normalized.indexOf("="))) ||
     normalized.length % 4 === 1
   ) {
     throw new Error(`${name} must be valid base64`);

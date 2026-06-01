@@ -6,12 +6,31 @@ import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const BASE = process.argv[2] ?? "https://servicenow-mcp.lammesen.workers.dev";
+// Your deployed Worker base URL — pass as argv[2] or set WORKER_PUBLIC_ORIGIN. No author default.
+// argv > env > .dev.vars (the repo convention this script already uses for MCP_OPERATOR_SECRET).
+const BASE = process.argv[2] ?? process.env.WORKER_PUBLIC_ORIGIN ?? devVar("WORKER_PUBLIC_ORIGIN");
+if (!BASE) {
+  console.error("usage: node scripts/deployed-e2e.mjs <worker-base-url>   (or set WORKER_PUBLIC_ORIGIN in env or .dev.vars)");
+  process.exit(1);
+}
 
 function devVar(key) {
-  for (const raw of readFileSync(".dev.vars", "utf8").split("\n")) {
+  let text;
+  try { text = readFileSync(".dev.vars", "utf8"); } catch { return undefined; }
+  for (const raw of text.split("\n")) {
     const l = raw.trim();
-    if (l.startsWith(`${key}=`)) { let v = l.slice(key.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
+    if (!l.startsWith(`${key}=`)) continue;
+    let v = l.slice(key.length + 1).trim();
+    if (v.startsWith('"')) {
+      // Quoted: take only the content between the quotes, ignoring any trailing `# comment`.
+      const end = v.indexOf('"', 1);
+      v = end >= 1 ? v.slice(1, end) : v.slice(1);
+    } else {
+      // Unquoted: drop an inline ` # comment`.
+      const c = v.search(/\s#/);
+      if (c >= 0) v = v.slice(0, c).trim();
+    }
+    return v === "" ? undefined : v; // an empty/blank value reads as unset (falls through to usage).
   }
   return undefined;
 }

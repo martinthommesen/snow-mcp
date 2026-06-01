@@ -368,7 +368,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // no snapshots, so the recovery claim is narrowed. The integration user never decrypts
   // (the KEK lives only host-side). The ring is built lazily + cached.
   const snapshotKekSecret = env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK;
-  const snapshotEnabledTables = (env.SNAPSHOT_ENABLED_TABLES ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const snapshotEnabledTables = csv(env.SNAPSHOT_ENABLED_TABLES);
   const snapshotReady = Boolean(env.SNAPSHOT_KV && snapshotKekSecret && snapshotEnabledTables.length > 0);
   const snapshotConfig: SnapshotConfig = { enabledTables: snapshotEnabledTables };
   let snapshotRing: Promise<Awaited<ReturnType<typeof buildKekRing>>> | undefined;

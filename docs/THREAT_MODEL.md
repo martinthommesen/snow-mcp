@@ -1,42 +1,44 @@
-# Threat model — implementation status (plan §11)
+# Threat model
 
-The full threat table is in `DEVELOPMENT_PLAN.md` §11 (T1–T20). This file annotates each
-mitigation with its **current** status after the P0–P7 hardening branch
-(`harden/code-review-closeout`):
+Security threats and their mitigations (distinct from the build-time risk register). This is the
+canonical T1–T20 table; the architecture it defends is in [`DESIGN.md`](DESIGN.md). The host-side
+mitigations (authorization, isolation, cost, redaction, idempotency, audit, recovery, KEK rotation,
+OAuth) are wired into the live request path and covered by the test suite; the ServiceNow-side
+executor controls are exercised live by `scripts/executor-scoped-verify.mjs` against a real instance
+(the local suite cannot reach a live instance — see [`DESIGN.md`](DESIGN.md) § *Testing model*).
 
-- ✅ = **wired + locally tested**: the control is invoked by the live request path (call-graph
-  evidence: module + function) AND has a green test. *Not* "merely implemented."
-- 🟢-P8 = **source-complete; live-verified in P8**: code landed + locally tested, but its live
-  behavior is provable only on the PDI (operator-gated P8). NOT a bare ✅.
-- 🟡 = implemented, a sub-part still pending. ⬜ = not yet built.
-
-| # | Threat | Mitigation | Status (wired-module · test) |
+| # | Threat | Impact | Mitigation |
 |---|---|---|---|
-| T3 | Sandbox code calls `fetch("evil")` | `globalOutbound:null` makes fetch throw; no creds in sandbox | ✅ `sandbox/executor.ts` · `sandbox-contract.test.ts` (0.8a) |
-| T4 | LLM code mutates records | effective-mode + ActorPolicy + attribution + idempotency ledger + audit-before-effect + recovery snapshot + approval | ✅ **wired** `sn/rpc.ts`→`sn/mutation-guard.ts` (`guardMutation` on every `tableUpdate`/`runServerScript`) · `mutation-wiring.test.ts`, `audit-recovery.test.ts` (P4) |
-| T5 | Sensitive output in logs | redactor denylist + token patterns; hashes only in audit; redacted client errors | ✅ `observability/redact.ts` wired in `mapServiceNowError`/`toToolResult` · `auth-surface.test.ts` (P6a) |
-| T7 | Schema cache leaks fields across users | user-aware cache key (ServiceNow sys_id + content-addressed roleHash); field masking | ✅ **wired** `cache/schema.ts` `roleHash()` → `SchemaCache` identity via `handlers.resolveSchemaIdentity`; missing per-user sys_id bypasses cache · `schema-cache.test.ts`, `actor-and-policy.test.ts` (P6b-2) |
-| T8 | Replay of request/executor call | leveled idempotency (host); executor DB-unique-index nonce | ✅ host ledger `do/mutation-ledger.ts`→`guardMutation` · `mutation-wiring.test.ts`, `do-partition.test.ts` (S17); 🟢-P8 executor `x_1793136_mcp_nonce` unique-index race-close (INSERT-as-arbiter; DB enforcement provable only live) |
-| T10 | Dynamic Worker cost explosion | multi-dim atomic reserve-before-load (reserves per-run MAX, refunds unused) + ENFORCED per-run row/byte caps + daily admission/accrual | ✅ `do/budget.ts` (mutexed global+per-user; `reserve` commits per-run maximums, `reconcile` refunds actuals — bounds concurrent overshoot, CDX-5) + `sn/run-budget.ts` (`countRows`/`countBytes` throw `budget_exceeded`); `run_code.ts` reconciles on every post-reserve exit incl. transpile failure · `run-budget.test.ts`, `do-partition.test.ts`, `run-code-pipeline.test.ts` (S14, P5) |
-| T11 | MCP SDK cross-client leak (CVE) | per-request `McpServer` | ✅ `index.ts` `apiHandler` builds a per-request server · `health.test.ts` (§2.3) |
-| T13 | DNS rebinding (missing Origin check) | reject invalid Origin (403); env-gated localhost | ✅ `observability/origin.ts` wired in BOTH the `/mcp` `apiHandler` and the top-level auth-surface wrapper; `allowLocalhost` env-gated · `auth-surface.test.ts` (S12, P6a) |
-| T14 | OAuth flow abuse | exact redirect_uri, state/nonce, PKCE S256, signed consent state; consent-write admission cap | ✅ **wired** — MCP-client provider (`@cloudflare/workers-oauth-provider`, `allowPlainPKCE:false`); signed single-use consent nonce in OAUTH_KV (`servicenow-auth-handler.ts`, `requireOAuthKv` fail-closed); GET `/authorize` rejects unknown clients + rate-caps consent writes per SOURCE IP via `ConsentRateDO` (in-memory, HARD-capped key set with oldest-evict) before the KV put (CDX-4 + follow-up; keyed by IP not client_id so dynamic client registration can't multiply keys) · `auth-surface.test.ts`, `do-partition.test.ts`. Per-user SN OAuth PKCE: ✅ source `auth/servicenow-{ticket,callback-handler}.ts` · `servicenow-ticket.test.ts`, `servicenow-callback.test.ts`; 🟢-P8 the live authorize/callback dance |
-| T15 | **Forged actor metadata** | host HMAC-signs (ASCII-canonical incl. signed `reason`); executor verifies (freshness + nonce + instance claim) | ✅ host signer `auth/actor.ts` (`reason` LAST in `CANONICAL_KEYS`; signed by `rpc.ts` `runServerScript`) · `actor-and-policy.test.ts`; 🟢-P8 in-scope executor verify (byte-identical canonical confirmed via Node harness; live HMAC match is the P8 gate) |
-| T16 | **Mode escalation** via `mode` input | `effectiveMode=min(requested,scope,tenant,instance)`; unknown mode → max risk (fail-closed) | ✅ `authz/effective-mode.ts` + `actor-policy.ts` `modeRisk` · `effective-mode.test.ts` (B3/B4, P6a) |
-| T17 | **integration_user over-reads** | ActorPolicy before every RPC (restrictive policy opt-in); mandatory rowFilter AND-ed into reads INCLUDING `tableGet` | ✅ host enforcement `authz/actor-policy.ts` `loadActorPolicy` (permissive default; restrictive when `ACTOR_POLICY_*` set); `tableGet` routes single-record lookups through the filtered list endpoint under a mandatory filter (CDX-8) · `actor-and-policy.test.ts`, `rpc-validation.test.ts`; 🟢-P8 live read-policy on the instance (B5; earlier live proof predates the restrictive loader) |
-| T18 | `scriptedRest` bypasses executor | no generic `scriptedRest` RPC exists; add a guard with the adapter if this surface is introduced | ✅ current RPC surface exposes only typed tools (`server-tools.test.ts`); no standalone denylist helper is carried for an unwired adapter |
-| T19 | **ServiceNow-side egress** via runServerScript | tenant toggle (fail-closed on either namespace) + approval + non-recoverable label + host audit/ledger/snapshot wrap; executor `execute()` cap-gated | ✅ host controls wired `sn/mutation-guard.ts` (audit/ledger/approval on `runServerScript`; signed+audited `reason`) · `mutation-wiring.test.ts` (P4); 🟢-P8 executor kill-switch honors BOTH old+new property namespaces (CDX-7) and `execute()` requires a wrapper-minted capability bound to the consumed nonce (CDX-6) — live behavior at P8 (SNOW_EGRESS.md) |
-| T20 | Recovery snapshot store = 2nd sensitive DB | retention + KEK + PII class + explicit table enablement | ✅ **store built + wired** `recovery/snapshots.ts` → `SNAPSHOT_KV` (30-day TTL, sealed under versioned `SNAPSHOT_KEK` ring, fail-closed before mutate) · `audit-recovery.test.ts`, `mutation-wiring.test.ts`; policy in RETENTION.md (P4) |
-| T1/T2 | Stolen Cloudflare/ServiceNow token | AES-GCM AAD-bound envelope; versioned-KEK ring; per-(user,instance) isolation | ✅ `auth/crypto.ts` (content-addressed KEK ring, rotation) + `auth/token-store.ts` + DO partition · `crypto.test.ts`, `token-store.test.ts`, `do-partition.test.ts` |
-| T9 | PDI hibernation mid-flight | `/health` probe; typed `instance_hibernating` | 🟡 error mapping ✅ `sn/errors.ts`; splash detection pending |
-| T12 | Endpoint exposed publicly | prod `/mcp` requires MCP-client token w/ audience/scope | ✅ **wired** `index.ts` exports `OAuthProvider` (`apiRoute:"/mcp"`, `allowPlainPKCE:false`); unauthenticated `/mcp` → 401 · `health.test.ts` (asserts the 401), `oauth-kv.test.ts` (KV fail-closed) |
+| T1 | Stolen Cloudflare account / API token | Read encrypted DO storage; redeploy the Worker | Tokens AES-GCM encrypted in a versioned, AAD-bound envelope; KEK in a Cloudflare secret; Access + IP allow-list on the deploy path; rotate keys |
+| T2 | Stolen ServiceNow refresh token | Reach the user's surface in ServiceNow | Partition tokens per `(user, instance)` in `TokenStoreDO`; short access-token lifetimes; fail closed on AAD mismatch |
+| T3 | Prompt-injection makes sandboxed code call `fetch("evil")` | Data exfiltration | `globalOutbound: null` makes `fetch()`/`connect()` **throw** in the sandbox; no creds in the sandbox `env`, only the typed RPC binding |
+| T4 | LLM-written code mutates records | Unintended writes | Capability is intentional; mitigation is **attributive + recoverable**: every mutating RPC records `(mcp_actor, snow_effective_user, table, sys_id, op, before/after-hash, requestId)` under a **verified** actor; effective-mode gate + `ActorPolicy` + idempotency ledger + audit-before-effect + recovery snapshot + approval gate |
+| T5 | Sensitive output bleeds into Cloudflare logs / Tail | PII in the observability stream | Redactor denylist fields + token patterns; never log script body or full RPC response; audit stores hashes only; redacted client errors |
+| T6 | Over-broad role on the integration user | Defeats the role matrix | Role matrix (`ROLE_MATRIX.md`); never reuse a human admin; one-click rotate-executor-role runbook; the executor role is decoupled from Table reach |
+| T7 | Schema cache leaks fields across users | Cross-role metadata disclosure | **User-aware** cache key (ServiceNow `userSysId` + content-addressed `roleHash`); short TTL; a missing per-user sys_id bypasses the cache rather than sharing it |
+| T8 | Replay of an MCP request or executor call | Duplicated side effects; forged-actor reuse | **Leveled** idempotency in `MutationLedgerDO` (L1 replays return the original; L2 `indeterminate` retry blocked); the executor **nonce** is consumed via INSERT-as-arbiter against a **DB unique index** |
+| T9 | PDI hibernation / reclamation mid-flight | Hangs, half-applied changes | PDIs dev/demo only; `/health` probe; typed `instance_hibernating` instead of hanging |
+| T10 | Dynamic Worker pricing (workers **and** requests **and** CPU) | Cost explosion from runaway workers, or one cheap Worker making many calls | **Multi-dimensional atomic reserve-before-load** in `BudgetDO` (reserves per-run max, refunds unused); **enforced per-run** row/byte caps; daily hard breaker |
+| T11 | MCP SDK cross-client response leak (CVE) | One client sees another's responses | Construct `McpServer`/transport **per request** |
+| T12 | Endpoint exposed publicly | Anyone invokes `run_code` | Production `/mcp` requires a valid MCP-client token (audience/issuer/scope) **before** tool invocation; unauthenticated `/mcp` → 401; `OAUTH_KV` fail-closed |
+| T13 | DNS rebinding via missing Origin validation | Cross-origin invocation | Reject invalid `Origin` (403) on **both** `/mcp` and the auth surface; `allowLocalhost` env-gated for dev |
+| T14 | OAuth flow abuse (redirect / state / PKCE / consent) | Confused-deputy, token theft | Exact `redirect_uri` match, state/nonce, PKCE `S256` (`allowPlainPKCE:false`); signed single-use consent nonce; GET `/authorize` rejects unknown clients and rate-caps consent writes per **source IP** (`ConsentRateDO`) so dynamic client registration can't multiply keys |
+| T15 | **Forged actor metadata** (a caller fabricates `body.actor`) | False attribution; accountability bypass | Host **HMAC-signs** an ASCII-canonical payload (with `reason` as the **last** key); the executor **verifies** (freshness + single-use nonce + instance claim, fail-closed); `actor_verified` audited |
+| T16 | **Mode escalation** via the `mode` tool input | Unauthorized writes / arbitrary script | `effectiveMode = min(requested, scope, tenant, instance)`; an **unknown mode → maximum risk (fail-closed)**; `admin_script` needs allowlist + approval |
+| T17 | **`integration_user` over-reads** for a given user | Confidential data disclosure (audit ≠ access control) | `ActorPolicy` (instances/tables/fields/rows) before every RPC; mandatory row filter AND-ed into reads **including `tableGet`**; field masks checked on query **predicates**, not just fields/rows; or `per_user_oauth` |
+| T18 | **`scriptedRest` bypasses `runServerScript()`** | Ungated/unaudited executor reach | No generic scripted-REST RPC exists; the executor is reachable only via `runServerScript()`; any future generic adapter must deny executor/config/audit/OAuth paths |
+| T19 | **ServiceNow-side egress** via `runServerScript` | Server-side script calls SN outbound / email / events / records | Tenant `run_server_script_enabled` toggle (fail-closed on **either** property namespace) + `reason` + approval for `admin_script` + non-recoverable label + host audit/ledger/snapshot wrap; the executor `execute()` is cap-gated to the consumed nonce |
+| T20 | **Recovery snapshot store** becomes a second sensitive DB | New PII exposure / over-retention | Retention window + dedicated `SNAPSHOT_KEK` (AES-256-GCM) + admin-only decrypt + KV auto-expiry + PII classification + explicit table enablement (`RETENTION.md`) |
 
-**Net:** the host-side authorization, isolation, cost, redaction, idempotency, audit, recovery,
-KEK-rotation, and OAuth mitigations are **wired into the live request path and locally tested**
-(call-graph evidence above). The ServiceNow-side executor controls are **source-complete and
-locally tested** but their live behavior is **verified in P8** (operator-gated): P7 changed the
-signed actor payload (added `reason`; enforced `actor.instance`), so the earlier live executor
-proof predates the hardened build and must be re-run after the coordinated host+executor
-redeploy. The executor-side P8-live gates are: the `instance_name` property shape, the
-`GlideDigest` SHA-256 UTF-8 encoding (0.13a), and the `x_1793136_mcp_nonce` unique-index DB enforcement
-(the replay-race arbiter).
+**ServiceNow-side egress (T19) deserves its own emphasis.** `globalOutbound: null` is a
+**Cloudflare-side** control; it says nothing about what a server-side script does **inside**
+ServiceNow. Treat `runServerScript` as an egress-capable primitive: it can reach
+`RESTMessageV2`/outbound integrations, fire events, send email, or move data between records. The
+controls are organizational and tenant-scoped (toggle, approval, denylist scan, separate budget,
+non-recoverable labeling), documented in [`SNOW_EGRESS.md`](SNOW_EGRESS.md) — not a sandbox.
+
+**Forged actor metadata (T15) and integration_user over-reads (T17)** are why
+[`DESIGN.md`](DESIGN.md) insists on host **sign-AND-verify** (a claimed `body.actor` is forgeable by
+anyone holding the executor role) and on `ActorPolicy` gating every read (audit records disclosure;
+it does not prevent it). Per-actor `maxMode` is re-checked at the `runServerScript` sink, not
+inherited.

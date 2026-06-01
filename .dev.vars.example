@@ -1,7 +1,7 @@
 # ─── ServiceNow Code Mode MCP — local secrets template ───────────────────────
 # Copy to `.dev.vars` (git-ignored) and fill in. NEVER commit the real file.
 # Generate 256-bit base64 keys with:  openssl rand -base64 32
-# See DEVELOPMENT_PLAN.md §9 (quick-start) and §2.11 (bindings).
+# See docs/FORK.md (quick-start) and docs/DESIGN.md (architecture + bindings).
 
 # --- ServiceNow instance + OAuth (confidential client: Auth Code + PKCE + secret, §2.8) ---
 SNOW_INSTANCE_HOST="dev000000.service-now.com"
