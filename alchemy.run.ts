@@ -8,6 +8,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import alchemy from "alchemy";
 import { Worker, KVNamespace, DurableObjectNamespace, WorkerLoader } from "alchemy/cloudflare";
+import { tokenKekBindings } from "./alchemy.bindings";
 
 // --- load .dev.vars into process.env (no external dotenv dep) ---
 const devVarsPath = fileURLToPath(new URL("./.dev.vars", import.meta.url));
@@ -97,15 +98,16 @@ export const worker = await Worker("servicenow-codemode-mcp", {
         }
       : {}),
     X_MCP_EXECUTOR_HMAC_KEY: alchemy.secret(reqEnv("X_MCP_EXECUTOR_HMAC_KEY")),
-    TOKEN_KEK: alchemy.secret(reqEnv("TOKEN_KEK")),
+    // Token KEK ring (P3): require TOKEN_KEK_CURRENT (preferred) or legacy TOKEN_KEK and bind
+    // whichever are present. The host reads `TOKEN_KEK_CURRENT ?? TOKEN_KEK`, so a versioned-only
+    // config (no legacy alias) must still deploy. See alchemy.bindings.ts.
+    ...tokenKekBindings(process.env, (v) => alchemy.secret(v)),
     OAUTH_PROVIDER_SECRET: alchemy.secret(reqEnv("OAUTH_PROVIDER_SECRET")),
     ...(process.env.SNAPSHOT_KEK ? { SNAPSHOT_KEK: alchemy.secret(process.env.SNAPSHOT_KEK) } : {}),
     ...(process.env.SNOW_OAUTH_CLIENT_SECRET ? { SNOW_OAUTH_CLIENT_SECRET: alchemy.secret(process.env.SNOW_OAUTH_CLIENT_SECRET) } : {}),
     ...(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS ? { ADMIN_SCRIPT_APPROVAL_TOKENS: alchemy.secret(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS) } : {}),
-    // Versioned KEK ring (P3). Optional until P3 provisions them; never reqEnv yet so the
-    // deploy doesn't break before they exist. P3 flips its own secret to required at its gate.
-    ...(process.env.TOKEN_KEK_CURRENT ? { TOKEN_KEK_CURRENT: alchemy.secret(process.env.TOKEN_KEK_CURRENT) } : {}),
-    ...(process.env.TOKEN_KEK_PREV ? { TOKEN_KEK_PREV: alchemy.secret(process.env.TOKEN_KEK_PREV) } : {}),
+    // Versioned snapshot-KEK ring (P3). Optional until provisioned; never reqEnv yet so the
+    // deploy doesn't break before they exist. (Token KEK ring is bound above via tokenKekBindings.)
     ...(process.env.SNAPSHOT_KEK_CURRENT ? { SNAPSHOT_KEK_CURRENT: alchemy.secret(process.env.SNAPSHOT_KEK_CURRENT) } : {}),
     ...(process.env.SNAPSHOT_KEK_PREV ? { SNAPSHOT_KEK_PREV: alchemy.secret(process.env.SNAPSHOT_KEK_PREV) } : {}),
   },

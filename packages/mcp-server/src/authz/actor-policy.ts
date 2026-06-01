@@ -354,6 +354,30 @@ function leadingFieldToken(clause: string): string {
   return m ? m[0] : "";
 }
 
+// LOWERCASE SN encoded-query word-operators. Their UPPERCASE/symbol forms already terminate the
+// leadingFieldToken run; only a LOWERCASE operator glued to a masked field name evades it
+// (`salarylike5` reads as one token). We detect that residual by matching a MASKED field followed
+// by one of these — so a legit UNMASKED field with an operator-looking name (`incident_statelike1`
+// when `incident_state` is not masked) is untouched. List is best-effort; an exotic operator not
+// here is the documented residual, gated on the P8 SN operator case-sensitivity confirmation.
+const LOWERCASE_QUERY_OPERATORS = [
+  "startswith", "endswith", "notlike", "like", "isnotempty", "isempty", "notin", "in",
+  "between", "nsameas", "sameas", "anything", "instanceof", "noton", "on",
+  "dynamic", "valchanges", "changesfrom", "changesto", "changes",
+];
+
+/** If `token` is a masked field immediately followed by a lowercase operator (the
+ *  leadingFieldToken-evasion case), return that masked field; else undefined. */
+function maskedFieldWithLowercaseOperator(masked: MaskIndex, token: string): string | undefined {
+  for (const m of masked.fields) {
+    if (token.length > m.length && token.startsWith(m)) {
+      const suffix = token.slice(m.length);
+      if (LOWERCASE_QUERY_OPERATORS.some((op) => suffix.startsWith(op))) return m;
+    }
+  }
+  return undefined;
+}
+
 /**
  * M-6: reject a caller-supplied encoded query whose PREDICATE / ordering / grouping references a
  * masked field. `fieldMasks` already strips masked fields from requested `fields` and from
@@ -364,9 +388,11 @@ function leadingFieldToken(clause: string): string {
  * Fail-safe: split on `^` clause boundaries; for each clause extract the field token both raw and
  * after stripping one leading operator keyword (so `^ORsalary>5` and `^ORDERBYsalary` are caught),
  * and deny (`actor_policy_denied`) if either is masked (dot-aware via isFieldMasked). This errs toward
- * over-rejection, the correct direction for a confidentiality control. Residual edge: a rare
- * lowercase-operator form (`salarylike5`) is not detected — SN-canonical queries use UPPERCASE
- * operators; this mirrors validate.ts's documented P8 case-sensitivity caveat.
+ * over-rejection, the correct direction for a confidentiality control. L-3: the lowercase-operator
+ * form (`salarylike5`), which the lowercase-only leadingFieldToken would otherwise swallow whole, is
+ * now caught via maskedFieldWithLowercaseOperator (masked-prefix + known lowercase operator), so a
+ * legit unmasked field with an operator-looking name still passes. Residual: an operator outside that
+ * list, or SN case-folding of FIELD names themselves — gated on the P8 case-sensitivity confirmation.
  */
 export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, userQuery: string): void {
   const masked = maskIndex(policy, table);
@@ -374,8 +400,13 @@ export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, use
   for (const clause of userQuery.split("^")) {
     const candidates = [leadingFieldToken(clause), leadingFieldToken(clause.replace(QUERY_OP_PREFIX, ""))];
     for (const f of candidates) {
-      if (f && isFieldMaskedByIndex(masked, f)) {
+      if (!f) continue;
+      if (isFieldMaskedByIndex(masked, f)) {
         throw new McpToolError("actor_policy_denied", `Query references a field not permitted for this actor on "${table}": ${f}.`);
+      }
+      const gluedMask = maskedFieldWithLowercaseOperator(masked, f);
+      if (gluedMask) {
+        throw new McpToolError("actor_policy_denied", `Query references a field not permitted for this actor on "${table}": ${gluedMask}.`);
       }
     }
   }

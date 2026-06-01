@@ -48,4 +48,8 @@ describe("Phase 0.11 — Origin validation predicate (S12)", () => {
     });
     expect(isOriginAllowed(req, { allowedOrigins: [], allowLocalhost: false })).toBe(false);
   });
+  it("L-2 — denies a loopback Origin when allowLocalhost is OMITTED (fail-closed default)", () => {
+    const req = new Request("https://app.example.com/mcp", { headers: { Origin: "http://localhost:8787" } });
+    expect(isOriginAllowed(req, { allowedOrigins: ["https://app.example.com"] })).toBe(false);
+  });
 });

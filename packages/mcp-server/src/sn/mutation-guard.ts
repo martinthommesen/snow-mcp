@@ -172,7 +172,11 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
   // intent + outcome share an AUDIT_KV key even if the effect straddles UTC midnight (deriving the
   // date from each row's own write-time `ts` would leave the day-D intent row orphaned/unresolved).
   const auditDateKey = new Date(guard.now()).toISOString().slice(0, 10);
-  if (guard.durabilityRequired && (!guard.ledger || !guard.audit)) {
+  // P2a: order matters. Require the audit sink FIRST so a missing-AUDIT_KV misconfig always
+  // surfaces as internal_error — never masked into an unaudited capability_denied (emitDenial
+  // no-ops without an audit sink). Only then deny a missing runKey (now guaranteed auditable),
+  // and finally require the ledger (runKey present but ledger missing = durability misconfig).
+  if (guard.durabilityRequired && !guard.audit) {
     throw new McpToolError(
       "internal_error",
       "mutation durability is not fully configured — refusing to mutate (fail closed).",
@@ -185,6 +189,13 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
     const err = new McpToolError("capability_denied", "mutations require an idempotencyKey.");
     await emitDenial(guard, eff, err);
     throw err;
+  }
+  if (guard.durabilityRequired && !guard.ledger) {
+    throw new McpToolError(
+      "internal_error",
+      "mutation durability is not fully configured — refusing to mutate (fail closed).",
+      { ledger: Boolean(guard.ledger), audit: Boolean(guard.audit) },
+    );
   }
   const ledger = guard.ledger?.(eff.ordinal);
 

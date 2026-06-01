@@ -120,6 +120,41 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 
+  it("P2a: a durability-required mutation with NO runKey is denied AND audited (not internal_error)", async () => {
+    // With audit present, a missing idempotencyKey must surface as capability_denied with a
+    // denial audit row — the audit-require check must NOT pre-empt the denial.
+    const rows: AuditRecord[] = [];
+    const http = new MockHttp();
+    const r = rpc({
+      http,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-dur-nokey" },
+        durabilityRequired: true,
+        audit: async (rec) => { rows.push(rec); },
+      }),
+    });
+    await expect(
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
+    ).rejects.toMatchObject({ code: "capability_denied" });
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "denied", errorClass: "capability_denied" });
+  });
+
+  it("P2a: audit-missing + NO runKey stays internal_error (misconfig is not masked as a denial)", async () => {
+    // emitDenial no-ops without an audit sink; the audit-require check must run first so a
+    // missing AUDIT_KV surfaces as internal_error rather than an unaudited capability_denied.
+    const http = new MockHttp();
+    const r = rpc({
+      http,
+      mutation: mutationDeps({ runContext: { requestId: "r-dur-nokey-noaudit" }, durabilityRequired: true }),
+    });
+    await expect(
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
+    ).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+  });
+
   it("a retried tableUpdate with the SAME tool key REPLAYS the stored result (no second PATCH)", async () => {
     const runKey = `dedup-${crypto.randomUUID()}`;
     const http1 = new MockHttp();

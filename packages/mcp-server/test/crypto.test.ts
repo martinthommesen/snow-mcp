@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { seal, open, tokenAad, buildKekRing, deriveKeyBytes, type KekRing } from "../src/auth/crypto.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  seal, open, tokenAad, buildKekRing, deriveKeyBytes, warnIfWeakSecret, warnIfWeakSecretOnce, type KekRing,
+} from "../src/auth/crypto.js";
 
 // ─── §2.7 — AES-256-GCM token envelope (S7 fragments) ─────────────────────────
 // WebCrypto, fully verified locally.
@@ -83,5 +85,45 @@ describe("§P3 buildKekRing", () => {
 
   it("fails closed when no current secret is given (missing KEK)", async () => {
     await expect(buildKekRing("")).rejects.toThrow(/fail closed/i);
+  });
+});
+
+// ─── M-1a — weak-secret warning (warn-only; never throws; once on the per-request path) ───────
+const STRONG = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // 64 hex
+describe("M-1a warnIfWeakSecret(Once)", () => {
+  it("warns on a low-entropy secret and is silent on a CSPRNG-strong one", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      warnIfWeakSecret("S", "hunter2");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0]).toContain("weak_secret_warning");
+      warn.mockClear();
+      warnIfWeakSecret("S", STRONG);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("never logs the secret value", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      warnIfWeakSecret("OAUTH_PROVIDER_SECRET", "weak-passphrase-xyz");
+      expect(warn.mock.calls[0]?.[0]).not.toContain("weak-passphrase-xyz");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("warnIfWeakSecretOnce fires at most once per name per isolate (per-request safe)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const name = `ONCE-${crypto.randomUUID()}`; // unique so the module-level guard is fresh
+      warnIfWeakSecretOnce(name, "weakweak");
+      warnIfWeakSecretOnce(name, "weakweak"); // second call deduped
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

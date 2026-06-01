@@ -54,7 +54,9 @@ export function isOriginAllowed(request: Request, config: OriginConfig): boolean
   // can't be parsed, so it falls through to the deny-by-default allowlist check.
   if (isSameOrigin(origin, request.url)) return true;
 
-  const allowLocalhost = config.allowLocalhost ?? true;
+  // L-2: fail-closed default — a caller that omits allowLocalhost must NOT get a loopback
+  // bypass. The production builder (index.ts) sets this from ALLOW_LOCALHOST === "true".
+  const allowLocalhost = config.allowLocalhost ?? false;
   if (allowLocalhost && isLoopbackOrigin(origin)) return true;
 
   const normalized = origin.toLowerCase().replace(/\/$/, "");

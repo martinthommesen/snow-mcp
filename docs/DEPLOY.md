@@ -18,10 +18,18 @@ API token is present.
 > `X_MCP_EXECUTOR_HMAC_KEY` MUST be CSPRNG-generated 32-byte values — generate each with
 > `openssl rand -base64 32`. KEK derivation is an unsalted single SHA-256 (kept deterministic so
 > the versioned ring can still decrypt existing envelopes), so a low-entropy passphrase would be
-> offline-guessable if envelopes ever leak. The Worker logs a structured `weak_secret_warning` at
-> startup when a KEK does not look CSPRNG-strong — treat it as a release blocker, not noise. Do
-> NOT change `deriveKeyBytes` to add salting/stretching without a KEK rotation (it would make every
-> existing encrypted token/snapshot undecryptable).
+> offline-guessable if envelopes ever leak. The Worker logs a structured `weak_secret_warning`
+> when a KEK or `OAUTH_PROVIDER_SECRET` does not look CSPRNG-strong (the `OAUTH_PROVIDER_SECRET`
+> check is deduped to once per isolate) — treat it as a release blocker, not noise. Do NOT change
+> `deriveKeyBytes` to add salting/stretching without a KEK rotation (it would make every existing
+> encrypted token/snapshot undecryptable).
+
+> **admin_script is default-deny (§7.9, P4).** `run_code` in `admin_script` mode is rejected
+> (`capability_denied`) unless the acting MCP user is listed in `ADMIN_SCRIPT_ALLOWLIST` — an
+> empty/unset allowlist denies ALL admin_script, even in the single-operator deployment. To use
+> admin_script live, set `ADMIN_SCRIPT_ALLOWLIST` (comma-separated actor userIds); optionally add
+> `ADMIN_SCRIPT_APPROVAL_TOKENS` and/or `ADMIN_SCRIPT_REQUIRED_GROUP` for a second factor.
+> `read_only` and `write` modes are unaffected (they run under the permissive default policy).
 
 ## The one blocker: `CLOUDFLARE_API_TOKEN`
 

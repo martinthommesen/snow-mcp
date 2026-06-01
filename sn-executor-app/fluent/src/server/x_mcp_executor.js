@@ -82,6 +82,7 @@ function utf8Slice(s, maxBytes) {
     }
 
     var maxB = parseInt(gs.getProperty('x_1793136_mcp.executor.max_bytes', '32768'), 10)
+    if (isNaN(maxB)) maxB = 32768 // NIT: a malformed property must not disable the cap (NaN compares false)
     if (codeBytes === 0 || codeBytes > maxB) {
         audit.status = 'error'
         audit.error_class = 'code_size'
@@ -178,6 +179,7 @@ function utf8Slice(s, maxBytes) {
     var serialized = out.serialized
     var serializedBytes = serialized ? utf8Len(serialized) : 0
     var maxOut = parseInt(gs.getProperty('x_1793136_mcp.executor.max_output_bytes', '65536'), 10)
+    if (isNaN(maxOut)) maxOut = 65536 // NIT: malformed property must not disable the output cap
     function closeAudit(st, ob) {
         audit.status = st
         audit.duration = new GlideDateTime().getNumericValue() - start.getNumericValue()

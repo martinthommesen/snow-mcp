@@ -5,6 +5,7 @@ import {
   applyRowFilter,
   maskRow,
   assertRequestedFieldsAllowed,
+  assertQueryFieldsAllowed,
   permissivePolicy,
   loadActorPolicy,
   type ActorPolicy,
@@ -117,6 +118,34 @@ describe("§2.12 ActorPolicy (B5)", () => {
   it("rejects an explicit request for a masked field", () => {
     expect(() => assertRequestedFieldsAllowed(policy, "incident", ["number", "u_ssn"])).toThrow(McpToolError);
     expect(() => assertRequestedFieldsAllowed(policy, "incident", ["number"])).not.toThrow();
+  });
+
+  it("rejects a query that FILTERS on a masked field (oracle), incl. operator/ordering forms", () => {
+    // uppercase operator + symbol + clause-prefix forms (pre-existing screen)
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "u_ssnLIKE123")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "caller_id=abc")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "active=true^ORu_ssnSTARTSWITH9")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "ORDERBYu_ssn")).toThrow(McpToolError);
+    // dot-walk descendant of a masked reference field
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "caller_id.nameLIKE9")).toThrow(McpToolError);
+  });
+
+  it("L-3 — catches a LOWERCASE operator glued to a masked field (leadingFieldToken evasion)", () => {
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "u_ssnstartswith123")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "caller_idlike5")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "u_ssnin(1,2,3)")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "active=true^u_ssnisnotempty")).toThrow(McpToolError);
+  });
+
+  it("L-3 — does NOT over-reject legit unmasked fields with operator-looking names", () => {
+    // short_description is not masked; an operator-looking suffix must still pass.
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "short_descriptionlike5")).not.toThrow();
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "short_descriptionSTARTSWITHx")).not.toThrow();
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "active=true^priority=1")).not.toThrow();
+    // a field that merely has a masked field as a non-operator prefix is fine (u_ssn vs u_ssn_note)
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "u_ssn_note=1")).not.toThrow();
+    // no masks configured → no screening
+    expect(() => assertQueryFieldsAllowed(permissivePolicy(["inst1.service-now.com"]), "incident", "u_ssnlike5")).not.toThrow();
   });
 
   it("a permissive policy (single trusted operator) allows broadly", () => {

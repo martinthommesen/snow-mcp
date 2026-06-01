@@ -26,7 +26,7 @@ import {
   type SnOAuthConfig,
 } from "../auth/servicenow-oauth.js";
 import { mintTicket } from "../auth/servicenow-ticket.js";
-import { buildKekRing } from "../auth/crypto.js";
+import { buildKekRing, warnIfWeakSecretOnce } from "../auth/crypto.js";
 import { decodeFixedBase64Secret } from "../auth/encoding.js";
 import type { MutationDeps } from "../sn/rpc.js";
 import { auditKey, type RunContext, type AuditIdentity, type LedgerHandle } from "../sn/mutation-guard.js";
@@ -87,8 +87,11 @@ export interface HandlerEnv extends PolicyEnv {
   // Recovery-snapshot config (§7.7): the snapshot ring uses SNAPSHOT_KEK_CURRENT/_PREV
   // (declared above) via buildKekRing (same scheme as the token ring, P3).
   SNAPSHOT_ENABLED_TABLES?: string; // comma-separated tables that get before/after snapshots.
-  // Second-approval policy (§7.9). All optional: when NONE is set the gate is SKIPPED,
-  // preserving single-operator behavior. When ANY is set the gate ENFORCES (P4).
+  // Second-approval policy (§7.9). admin_script is DEFAULT-DENY (P4, assertAdminScriptApproved):
+  // an empty/unset ADMIN_SCRIPT_ALLOWLIST denies every admin_script request, so a live
+  // deployment must set it to permit specific actors. ADMIN_SCRIPT_APPROVAL_TOKENS /
+  // ADMIN_SCRIPT_REQUIRED_GROUP are the optional SECOND factor (token OR group) layered on top.
+  // (read_only / write are unaffected — those run under the permissive single-operator policy.)
   ADMIN_SCRIPT_ALLOWLIST?: string; // comma-separated actor userIds permitted admin_script.
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string; // comma-separated valid approval tokens.
   ADMIN_SCRIPT_REQUIRED_GROUP?: string; // required access-group name (token OR group).
@@ -128,6 +131,10 @@ export interface AuthContext {
 
 export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandlers {
   const scopeMaxMode: Mode = auth.scopeMaxMode;
+  // M-1a: OAUTH_PROVIDER_SECRET is the reauth-ticket HMAC key (auth/servicenow-ticket.ts),
+  // derived unsalted like the KEK — warn if it is not CSPRNG-strong, matching the KEK guard.
+  // buildHandlers runs per-request, so the warning is deduped to once-per-isolate.
+  if (env.OAUTH_PROVIDER_SECRET) warnIfWeakSecretOnce("OAUTH_PROVIDER_SECRET", env.OAUTH_PROVIDER_SECRET);
   // Canonicalize + allowlist the configured instance host ONCE here (plan §P6a, finding "OAuth
   // token off-allowlist"), then thread the canonical value to BOTH SnFetchClient AND the
   // SnOAuthConfig. tokenRequest() POSTs https://${instanceHost}/oauth_token.do with the client

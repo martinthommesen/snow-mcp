@@ -242,6 +242,19 @@ describe("Phase 4 — run_code pipeline", () => {
     expect(res.structuredContent?.detail).toBeUndefined();
   });
 
+  it("L-1 — a secret-shaped substring in an uncaught error is redacted on the run_error path", async () => {
+    const res = await runCode(
+      { code: `async () => { throw new Error("upstream failed token=supersecretvalue123 boom"); }` },
+      deps({ scope: "read_only", tenant: "read_only", instance: "read_only" }),
+    );
+    expect(res.structuredContent?.code).toBe("run_error");
+    const err = res.structuredContent?.error as string;
+    expect(err).toContain("[REDACTED]");
+    expect(err).not.toContain("supersecretvalue123");
+    // the human-facing text is redacted too (symmetry with toToolResult)
+    expect(res.content?.[0]?.text ?? "").not.toContain("supersecretvalue123");
+  });
+
   it("§P2 — a host token-miss surfaces an attested reauth_required with real authorizeUrl", async () => {
     class ReauthHttp implements SnHttpClient {
       async request(): Promise<SnResponse> {

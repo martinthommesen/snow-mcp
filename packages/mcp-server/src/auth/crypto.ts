@@ -148,6 +148,21 @@ export function warnIfWeakSecret(name: string, secret: string): void {
   }
 }
 
+/** Per-isolate dedup of {@link warnIfWeakSecret} by secret name. */
+const warnedSecretNames = new Set<string>();
+
+/**
+ * Startup-once weak-secret warning for call sites on the PER-REQUEST path (e.g. buildHandlers,
+ * which runs inside fetch). `warnIfWeakSecret` must not be called per-request (log spam, M-1a);
+ * this fires at most once per secret name per isolate. The first call decides — subsequent calls
+ * (strong or weak) are silent, matching the "warn at startup, never per-request" contract.
+ */
+export function warnIfWeakSecretOnce(name: string, secret: string): void {
+  if (warnedSecretNames.has(name)) return;
+  warnedSecretNames.add(name);
+  warnIfWeakSecret(name, secret);
+}
+
 /**
  * Content-addressed KEK version label: `kek-${hex(sha256(keyBytes)).slice(0,8)}`. Distinct
  * keys are overwhelmingly unlikely to share a label (32-bit content address), which avoids

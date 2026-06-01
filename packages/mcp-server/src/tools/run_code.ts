@@ -11,6 +11,7 @@ import { createExecutor, executeSnippet } from "../sandbox/executor.js";
 import { serializeResult, utf8Len, capLogs } from "../sandbox/serialize.js";
 import { SIZE_LIMITS } from "../config.js";
 import { McpToolError, toToolResult, parseSandboxError } from "../sn/errors.js";
+import { redactString } from "../observability/redact.js";
 import { validateIdempotencyKey, validateReason } from "../sn/validate.js";
 import type { ServiceNowRPC } from "../sn/rpc.js";
 import type { RunContext } from "../sn/mutation-guard.js";
@@ -180,10 +181,14 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       // message (it may be forged, or the snippet may have caught a host error and thrown
       // its own). Attest `run_error`; keep the parsed message as ADVISORY text only.
       const parsed = parseSandboxError(exec.error);
+      // L-1: redact the advisory message — a raw (non-McpToolError) host throw can reach this
+      // in-band path (e.g. servicenow_oauth_failed:), and unlike toToolResult() it is otherwise
+      // returned to the model unredacted. Mirror the catch-path redaction for symmetry.
+      const safeMessage = redactString(parsed.message);
       return {
-        content: [{ type: "text", text: `[run_error] ${parsed.message}` }],
+        content: [{ type: "text", text: `[run_error] ${safeMessage}` }],
         isError: true,
-        structuredContent: { code: "run_error", error: parsed.message, logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}), budget },
+        structuredContent: { code: "run_error", error: safeMessage, logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}), budget },
       };
     }
     const ser = serializeResult(exec.result, SIZE_LIMITS.maxOutputBytes);
