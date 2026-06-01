@@ -38,7 +38,8 @@
       { "name": "AUTH_DO", "class_name": "AuthCorrelationDO" },
       { "name": "TOKEN_DO", "class_name": "TokenStoreDO" },
       { "name": "BUDGET_DO", "class_name": "BudgetDO" },
-      { "name": "LEDGER_DO", "class_name": "MutationLedgerDO" }
+      { "name": "LEDGER_DO", "class_name": "MutationLedgerDO" },
+      { "name": "CONSENT_RATE_DO", "class_name": "ConsentRateDO" }
     ]
   },
   "migrations": [
@@ -50,6 +51,10 @@
         "BudgetDO",
         "MutationLedgerDO"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["ConsentRateDO"]
     }
   ]
 

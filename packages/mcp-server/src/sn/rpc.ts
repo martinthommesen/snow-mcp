@@ -225,14 +225,32 @@ export class ServiceNowRPC {
     const sysId = validateSysId(args.sys_id);
     const reqFields = validateFields(args.fields);
     this.gateRead(table, reqFields);
-    const q: Record<string, string> = { sysparm_exclude_reference_link: "true" };
-    if (reqFields) q.sysparm_fields = Array.from(new Set(["sys_id", ...reqFields])).join(",");
-    this.deps.runBudget.countServiceNowRequest();
-    const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`, query: q });
-    if (res.status === 404) return null;
-    const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-    if (mapped) throw mapped;
-    const row = (res.json as { result?: Record<string, unknown> }).result;
+    const fieldsParam = reqFields ? Array.from(new Set(["sys_id", ...reqFields])).join(",") : undefined;
+
+    let row: Record<string, unknown> | undefined;
+    if (this.hasMandatoryFilter(table)) {
+      // Finding 8a: a direct /table/{table}/{sysId} GET ignores the mandatory row filter that
+      // tableQuery/aggregate enforce. Route the single-record lookup through the filtered list
+      // endpoint so the configured rowFilter is AND-ed in (sysId is 32-hex-validated, safe to
+      // embed). A record outside the filter — or absent — returns null with no existence leak.
+      const query = applyRowFilter(this.deps.actorPolicy, table, `sys_id=${sysId}`);
+      const q: Record<string, string> = { sysparm_exclude_reference_link: "true", sysparm_query: query, sysparm_limit: "1" };
+      if (fieldsParam) q.sysparm_fields = fieldsParam;
+      this.deps.runBudget.countServiceNowRequest();
+      const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}`, query: q });
+      const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
+      if (mapped) throw mapped;
+      row = ((res.json as { result?: Record<string, unknown>[] }).result ?? [])[0];
+    } else {
+      const q: Record<string, string> = { sysparm_exclude_reference_link: "true" };
+      if (fieldsParam) q.sysparm_fields = fieldsParam;
+      this.deps.runBudget.countServiceNowRequest();
+      const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`, query: q });
+      if (res.status === 404) return null;
+      const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
+      if (mapped) throw mapped;
+      row = (res.json as { result?: Record<string, unknown> }).result;
+    }
     if (!row) return null;
     const masked = maskRow(this.deps.actorPolicy, table, row);
     // Per-run row + byte enforcement (§P5): one row, measured on the masked payload.

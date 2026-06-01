@@ -173,6 +173,42 @@ export class BudgetDO extends DurableObject {
     await this.ctx.storage.put(updates);
   }
 
+  /**
+   * Post-run RECONCILIATION (§P5 / finding 5): apply SIGNED per-dimension deltas to fold ACTUAL
+   * spend into the daily counters after the pre-run reserve committed the per-run MAXIMUMS.
+   * Reserved dimensions (serviceNowRequests, sandboxRpcCalls) pass a negative refund
+   * (actual − reserved); unreserved dimensions (rowsReturned, bytesReturned) pass a positive
+   * accrual. Each counter — global AND per-user — is clamped at `>= 0` so a refund can never
+   * drive it negative. Routed through the SAME promise-chain mutex as `reserve`/`increment` so a
+   * concurrent op cannot interleave its read-modify-write.
+   */
+  reconcile(delta: ReserveRequest, userId?: string): Promise<void> {
+    const run = this.chain.then(() => this.reconcileCritical(delta, userId));
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async reconcileCritical(delta: ReserveRequest, userId?: string): Promise<void> {
+    const dims = DIMENSIONS.filter((d) => (delta[d] ?? 0) !== 0);
+    if (dims.length === 0) return;
+    const userKeys = userId ? dims.map((d) => this.userKey(userId, d)) : [];
+    const stored = await this.ctx.storage.get<number>([...dims.map(dimensionKey), ...userKeys]);
+    const updates: Record<string, number> = {};
+    for (const d of dims) {
+      const adj = delta[d]!;
+      const globalKey = dimensionKey(d);
+      updates[globalKey] = Math.max(0, (stored.get(globalKey) ?? 0) + adj);
+      if (userId) {
+        const key = this.userKey(userId, d);
+        updates[key] = Math.max(0, (stored.get(key) ?? 0) + adj);
+      }
+    }
+    await this.ctx.storage.put(updates);
+  }
+
   async get(dimension: BudgetDimension): Promise<number> {
     return (await this.ctx.storage.get<number>(dimensionKey(dimension))) ?? 0;
   }

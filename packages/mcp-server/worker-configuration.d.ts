@@ -9,11 +9,12 @@ interface __BaseEnv_Env {
 	TOKEN_DO: DurableObjectNamespace<import("./src/index").TokenStoreDO>;
 	BUDGET_DO: DurableObjectNamespace<import("./src/index").BudgetDO>;
 	LEDGER_DO: DurableObjectNamespace<import("./src/index").MutationLedgerDO>;
+	CONSENT_RATE_DO: DurableObjectNamespace<import("./src/index").ConsentRateDO>;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./src/index");
-		durableNamespaces: "AuthCorrelationDO" | "TokenStoreDO" | "BudgetDO" | "MutationLedgerDO";
+		durableNamespaces: "AuthCorrelationDO" | "TokenStoreDO" | "BudgetDO" | "MutationLedgerDO" | "ConsentRateDO";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

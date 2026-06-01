@@ -62,20 +62,27 @@ export interface RunCodeDeps {
    */
   makeRunBudget?: () => RunBudget;
   /**
-   * Post-run daily accrual of ACTUAL spend (§P5 tier 3). Called on EVERY exit path (success
-   * AND error, in a finally) with the per-run snapshot, so spent rows/requests/bytes are
-   * always accrued into the daily BudgetDO. Backed by BUDGET_DO.increment in production;
-   * optional so tests/unauthenticated boots can omit it.
+   * Post-run daily RECONCILIATION of ACTUAL spend (§P5 tier 3 / finding 5). Called on EVERY
+   * exit path AFTER a successful reserve (success AND error, in a finally). Because the
+   * pre-run reserve commits the per-run MAXIMUMS (so concurrent runs can't collectively
+   * overshoot), this folds the per-run snapshot back into the daily BudgetDO by REFUNDING the
+   * unused reservation and accruing the unreserved dimensions. `snapshot` is undefined when a
+   * post-reserve early exit (e.g. transpile failure) fired before the RunBudget existed —
+   * meaning nothing was spent, so the full reservation is refunded. Backed by
+   * BUDGET_DO.reconcile in production; optional so tests/unauthenticated boots can omit it.
    */
-  accrueDailyBudget?: (snapshot: Record<string, number>) => Promise<void>;
+  reconcileDailyBudget?: (snapshot?: Record<string, number>) => Promise<void>;
   timeoutMs?: number;
 }
 
 export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<ToolTextResult> {
-  // Held at function scope so the finally can accrue actual spend (§P5 tier 3). Undefined
-  // when an early throw (size/mode/reason/reserve/transpile) fires before the budget exists
-  // — nothing was spent, so accrual is skipped.
+  // Held at function scope so the finally can reconcile actual spend (§P5 tier 3). Undefined
+  // when an early throw (size/mode/reason/reserve/transpile) fires before the budget exists.
   let runBudget: RunBudget | undefined;
+  // True once the pre-run reserve COMMITTED the per-run maximums. The finally must then
+  // reconcile/refund on EVERY post-reserve exit — including a transpile failure that throws
+  // before `runBudget` exists (finding 5) — or the reserved maximums leak and starve the cap.
+  let reserved = false;
   try {
     // 1) size check (pre-transpile, pre-auth-cheap-reject)
     if (utf8Len(input.code) > SIZE_LIMITS.maxCodeBytes) {
@@ -113,10 +120,13 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
     if (deps.reserveDailyBudget) {
       const reservation = await deps.reserveDailyBudget();
       if (!reservation.ok) {
+        // All-or-nothing: a denied reserve committed NOTHING, so `reserved` stays false and the
+        // finally skips reconciliation (no phantom refund).
         throw new McpToolError("budget_exceeded", `Daily ${reservation.dimension ?? "budget"} cap exhausted.`, {
           dimension: reservation.dimension,
         });
       }
+      reserved = true;
     }
 
     // 3) transpile TS -> JS string (ADR-0001)
@@ -206,30 +216,30 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
   } catch (e) {
     return toToolResult(e);
   } finally {
-    // POST-RUN ACCRUAL (§P5 tier 3): accrue ACTUAL spend on EVERY exit path (success AND
-    // error) so the daily BudgetDO always reflects what was spent. Skip when no budget was
-    // ever created (early throw — nothing spent). Best-effort: an accrual failure must never
-    // mask the real return value / thrown error, so it is swallowed here.
-    if (runBudget && deps.accrueDailyBudget) {
+    // POST-RUN RECONCILIATION (§P5 tier 3 / finding 5): the pre-run reserve committed the per-run
+    // MAXIMUMS, so reconcile on EVERY post-reserve exit — success, error, AND a transpile failure
+    // that threw before `runBudget` existed (snapshot undefined => full refund) — to release the
+    // unused reservation. Gated on `reserved`, NOT on `runBudget`, so the transpile-failure path
+    // still refunds. Best-effort: a reconcile failure must never mask the real return/throw, so it
+    // is swallowed here.
+    if (reserved && deps.reconcileDailyBudget) {
       try {
-        await deps.accrueDailyBudget(runBudget.snapshot());
+        await deps.reconcileDailyBudget(runBudget?.snapshot());
       } catch (e) {
-        // Swallow so accrual failure never masks the real run result/error — BUT this is NOT
-        // merely a metering gap: budget.ts's admission check reads dim:rowsReturned/
-        // dim:bytesReturned/dim:sandboxRpcCalls, written ONLY by this (now-failed) accrual. So a
-        // PERSISTENT BUDGET_DO failure silently DISABLES those daily ceilings — they degrade to
-        // per-run enforcement, backstopped only by the hard uniqueWorkers daily cap (reserved
-        // pre-run; that path fails CLOSED, so worst-case daily cost stays bounded by it).
-        // M-2: emit a STRUCTURED, alertable signal (not a prose log line) so an SRE log-metric can
-        // page on a sustained streak — the correct place to escalate a silently-degraded ceiling.
-        // We deliberately do NOT fail the next run closed here: that would require cross-DO streak
-        // state and could turn a transient blip into a self-inflicted outage (availability > a
-        // bounded, backstopped overrun). The uniqueWorkers cap is the safety bound meanwhile.
+        // Swallow so a reconcile failure never masks the real run result/error. The failure
+        // direction is SAFE/fail-closed (finding 5): the pre-run reserve already committed the
+        // per-run MAXIMUMS, so a dropped reconcile leaves those maximums reserved — the day
+        // OVER-counts and denies the next run EARLY rather than under-counting. (rows/bytes are
+        // reserved at 0, so a dropped reconcile under-accrues them — the documented residual,
+        // backstopped by the deny-next-run admission check and the uniqueWorkers cap.)
+        // M-2: emit a STRUCTURED, alertable signal so an SRE log-metric can page on a sustained
+        // streak. We deliberately do NOT fail the next run closed here: that would require
+        // cross-DO streak state and could turn a transient blip into a self-inflicted outage.
         console.error(
           JSON.stringify({
-            event: "budget_accrual_failed",
+            event: "budget_reconcile_failed",
             severity: "alert",
-            note: "daily rows/bytes/sandboxRpcCalls ceiling degraded until BUDGET_DO recovers; uniqueWorkers cap still bounds worst case",
+            note: "daily reservation not refunded (over-counts, denies early) and rows/bytes under-accrued until BUDGET_DO recovers; uniqueWorkers cap still bounds worst case",
             error: e instanceof Error ? e.message : String(e),
           }),
         );

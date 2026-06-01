@@ -40,6 +40,8 @@ interface HandlerEnv {
   MCP_OPERATOR_EMAIL?: string;
   MCP_OPERATOR_ACCESS_GROUPS?: string;
   OAUTH_KV?: KVNamespace;
+  // Consent-write rate limiter (finding 4); optional — skipped when unbound.
+  CONSENT_RATE_DO?: DurableObjectNamespace<import("../do/consent-rate.js").ConsentRateDO>;
 }
 
 const SUPPORTED_SCOPES = ["servicenow:read", "servicenow:write", "servicenow:admin_script"] as const;
@@ -109,6 +111,17 @@ export const serviceNowAuthHandler = {
         const oauth = await env.OAUTH_PROVIDER.parseAuthRequest(request);
         if (grantScopes(oauth.scope).length === 0) return unsupportedScopesResponse();
         const client = await env.OAUTH_PROVIDER.lookupClient(oauth.clientId);
+        // Admission cap (finding 4): the consent KV write below is unauthenticated public OAuth
+        // surface. Reject unknown clients, then bound writes per (client_id + IP) per window via
+        // ConsentRateDO — a flood is 429'd BEFORE the kv.put so it cannot churn KV write quota.
+        if (!client) return new Response("Unknown OAuth client.", { status: 400 });
+        if (env.CONSENT_RATE_DO) {
+          const ip = request.headers.get("CF-Connecting-IP") ?? "";
+          const limiter = env.CONSENT_RATE_DO.get(env.CONSENT_RATE_DO.idFromName("consent-rate"));
+          if (!(await limiter.allow(`${oauth.clientId}|${ip}`, Date.now()))) {
+            return new Response("Too many authorization requests; try again shortly.", { status: 429 });
+          }
+        }
         // Bind the authoritative auth-request to server-side state under a server-minted nonce;
         // only the nonce is ever sent to the client. Scope can no longer be tampered between
         // GET (display/validate) and POST (grant) — the POST reads the stored object wholesale.

@@ -186,6 +186,23 @@ describe("P1 — structural-operator guard under a restrictive row filter", () =
       await expect(r.aggregate({ table: "incident", query })).rejects.toMatchObject({ code: "path_denied" });
     }
   });
+
+  // ─── Finding 8a — tableGet must honor the mandatory rowFilter (direct GET bypassed it) ──
+  it("tableGet routes a single-record lookup through the filtered list endpoint under a mandatory filter", async () => {
+    const { rpc: r, http } = rpc({ policy: restrictive });
+    await r.tableGet({ table: "incident", sys_id: HEX });
+    // NOT the direct /table/{table}/{sysId} path — the rowFilter is AND-ed into a list query.
+    expect(http.calls[0]!.path).toBe("/api/now/table/incident");
+    expect(http.calls[0]!.query!.sysparm_query).toBe(`active=true^sys_id=${HEX}`);
+    expect(http.calls[0]!.query!.sysparm_limit).toBe("1");
+  });
+
+  it("tableGet returns null for a sys_id outside the mandatory filter (no existence leak)", async () => {
+    // Responder returns an empty result set: the record is filtered out (or absent) — both null.
+    const http = new MockHttp(() => ({ status: 200, json: { result: [] } }));
+    const { rpc: r } = rpc({ http, policy: restrictive });
+    await expect(r.tableGet({ table: "incident", sys_id: HEX })).resolves.toBeNull();
+  });
 });
 
 describe("P1 — aggregate masks grouped fields", () => {

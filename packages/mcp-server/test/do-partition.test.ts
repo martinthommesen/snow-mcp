@@ -9,6 +9,7 @@ interface TestEnv {
   TOKEN_DO: DurableObjectNamespace<import("../src/do/token-store.js").TokenStoreDO>;
   BUDGET_DO: DurableObjectNamespace<import("../src/do/budget.js").BudgetDO>;
   LEDGER_DO: DurableObjectNamespace<import("../src/do/mutation-ledger.js").MutationLedgerDO>;
+  CONSENT_RATE_DO: DurableObjectNamespace<import("../src/do/consent-rate.js").ConsentRateDO>;
 }
 const E = env as unknown as TestEnv;
 
@@ -110,6 +111,66 @@ describe("Phase P5 — BudgetDO concurrent increments do not lose updates (mutex
     await Promise.all(ops);
     // 50 reserves (+1 each) + 50 increments (+1 each) = 100, none lost to interleaving.
     expect(await obj.get("sandboxRpcCalls")).toBe(100);
+  });
+});
+
+describe("Finding 5 — BudgetDO reserve-max + reconcile (refund) bounds concurrent overshoot", () => {
+  it("refunds the unused reservation: reserve max, reconcile to a smaller actual", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-09-01"));
+    const cap = { serviceNowRequests: 1_000_000, sandboxRpcCalls: 1_000_000 };
+    // Reserve the per-run MAX (200 each), then reconcile to the ACTUAL spend (3 SN reqs, 5 rpc).
+    await obj.reserve({ serviceNowRequests: 200, sandboxRpcCalls: 200 }, cap, "userR");
+    await obj.reconcile({ serviceNowRequests: 3 - 200, sandboxRpcCalls: 5 - 200, rowsReturned: 7 }, "userR");
+    expect(await obj.get("serviceNowRequests")).toBe(3); // 200 reserved − 197 refunded
+    expect(await obj.get("sandboxRpcCalls")).toBe(5);
+    expect(await obj.get("rowsReturned")).toBe(7); // unreserved dimension accrues positively
+    expect(await obj.getUser("userR", "serviceNowRequests")).toBe(3);
+  });
+
+  it("clamps a counter at >= 0 (a refund larger than the stored value cannot go negative)", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-09-02"));
+    await obj.increment({ serviceNowRequests: 10 });
+    await obj.reconcile({ serviceNowRequests: -999 }); // over-refund
+    expect(await obj.get("serviceNowRequests")).toBe(0);
+  });
+
+  it("denies the (N+1)th concurrent reserve once N×max would exceed the daily cap", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-09-03"));
+    const cap = { serviceNowRequests: 500 }; // exactly 2 runs' worth at 200 reserved + 1 uniqueWorker
+    const r1 = await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 200 }, cap);
+    const r2 = await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 200 }, cap);
+    const r3 = await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 200 }, cap);
+    expect(r1.ok).toBe(true);
+    expect(r2.ok).toBe(true);
+    expect(r3.ok).toBe(false); // 3×200 = 600 > 500 cap — concurrent overshoot is bounded
+    if (!r3.ok) expect(r3.dimension).toBe("serviceNowRequests");
+  });
+});
+
+describe("Finding 4 — ConsentRateDO bounds consent writes per key per window", () => {
+  it("allows up to the window cap, then denies; a later window resets", async () => {
+    const ns = E.CONSENT_RATE_DO;
+    const obj = ns.get(ns.idFromName("consent-rate"));
+    const t0 = 1_000_000;
+    let allowed = 0;
+    // 40 attempts in one window: only the first 30 (MAX_PER_WINDOW) are admitted.
+    for (let i = 0; i < 40; i++) if (await obj.allow("clientA|1.2.3.4", t0)) allowed++;
+    expect(allowed).toBe(30);
+    expect(await obj.allow("clientA|1.2.3.4", t0)).toBe(false); // still over cap in-window
+    // A request after the window (60s) rolls into a fresh window and is admitted again.
+    expect(await obj.allow("clientA|1.2.3.4", t0 + 60_001)).toBe(true);
+  });
+
+  it("isolates counters per key (a flood on one client_id+IP doesn't block another)", async () => {
+    const ns = E.CONSENT_RATE_DO;
+    const obj = ns.get(ns.idFromName("consent-rate"));
+    const t0 = 2_000_000;
+    for (let i = 0; i < 30; i++) await obj.allow("noisy|9.9.9.9", t0); // exhaust one key
+    expect(await obj.allow("noisy|9.9.9.9", t0)).toBe(false);
+    expect(await obj.allow("quiet|8.8.8.8", t0)).toBe(true); // a different key is unaffected
   });
 });
 
