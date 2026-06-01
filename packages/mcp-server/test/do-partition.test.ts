@@ -164,13 +164,27 @@ describe("Finding 4 — ConsentRateDO bounds consent writes per key per window",
     expect(await obj.allow("clientA|1.2.3.4", t0 + 60_001)).toBe(true);
   });
 
-  it("isolates counters per key (a flood on one client_id+IP doesn't block another)", async () => {
+  it("isolates counters per key (a flood on one IP doesn't block another)", async () => {
     const ns = E.CONSENT_RATE_DO;
     const obj = ns.get(ns.idFromName("consent-rate"));
     const t0 = 2_000_000;
-    for (let i = 0; i < 30; i++) await obj.allow("noisy|9.9.9.9", t0); // exhaust one key
-    expect(await obj.allow("noisy|9.9.9.9", t0)).toBe(false);
-    expect(await obj.allow("quiet|8.8.8.8", t0)).toBe(true); // a different key is unaffected
+    for (let i = 0; i < 30; i++) await obj.allow("9.9.9.9", t0); // exhaust one key
+    expect(await obj.allow("9.9.9.9", t0)).toBe(false);
+    expect(await obj.allow("8.8.8.8", t0)).toBe(true); // a different key is unaffected
+  });
+
+  it("enforces the MAX_KEYS hard cap: the map never grows past it; oldest is evicted", { timeout: 60_000 }, async () => {
+    const ns = E.CONSENT_RATE_DO;
+    const obj = ns.get(ns.idFromName("cap-probe")); // a fresh DO instance
+    const MAX_KEYS = 10_000;
+    const t0 = 5_000_000;
+    // Drive the very first IP to its cap, then insert MAX_KEYS distinct new IPs (same window).
+    for (let i = 0; i < 30; i++) await obj.allow("ip-0", t0);
+    expect(await obj.allow("ip-0", t0)).toBe(false); // ip-0 is at cap
+    for (let i = 1; i <= MAX_KEYS; i++) await obj.allow("ip-" + i, t0); // forces eviction of oldest
+    expect(await obj.count()).toBe(MAX_KEYS); // NEVER exceeds the bound (was unbounded before)
+    // ip-0 (oldest-inserted) was evicted, so it now gets a FRESH window (true), not the stale cap.
+    expect(await obj.allow("ip-0", t0)).toBe(true);
   });
 });
 

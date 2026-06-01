@@ -112,13 +112,17 @@ export const serviceNowAuthHandler = {
         if (grantScopes(oauth.scope).length === 0) return unsupportedScopesResponse();
         const client = await env.OAUTH_PROVIDER.lookupClient(oauth.clientId);
         // Admission cap (finding 4): the consent KV write below is unauthenticated public OAuth
-        // surface. Reject unknown clients, then bound writes per (client_id + IP) per window via
+        // surface. Reject unknown clients, then bound writes per SOURCE IP per window via
         // ConsentRateDO — a flood is 429'd BEFORE the kv.put so it cannot churn KV write quota.
+        // Keyed by IP (NOT client_id): dynamic client registration lets an attacker mint unlimited
+        // client_ids, so a client_id-keyed limit would be both bypassable and unbounded in memory.
         if (!client) return new Response("Unknown OAuth client.", { status: 400 });
         if (env.CONSENT_RATE_DO) {
+          // CF-Connecting-IP is always present on the Cloudflare edge; a missing header collapses
+          // to one shared "" key (collectively capped) — fail-safe, never a per-IP bypass.
           const ip = request.headers.get("CF-Connecting-IP") ?? "";
           const limiter = env.CONSENT_RATE_DO.get(env.CONSENT_RATE_DO.idFromName("consent-rate"));
-          if (!(await limiter.allow(`${oauth.clientId}|${ip}`, Date.now()))) {
+          if (!(await limiter.allow(ip, Date.now()))) {
             return new Response("Too many authorization requests; try again shortly.", { status: 429 });
           }
         }
