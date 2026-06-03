@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ServiceNowRPC, type MutationDeps } from "../src/sn/rpc.js";
 import { RunBudget } from "../src/sn/run-budget.js";
 import { BUDGETS } from "../src/config.js";
@@ -260,6 +260,35 @@ describe("P4 — host audit wired (audit-before-effect, fail-closed)", () => {
     expect((last as unknown as Record<string, unknown>).after).toBeUndefined();
   });
 
+  it("returns a known success and alerts when ledger.complete fails after the effect", async () => {
+    const rows: AuditRecord[] = [];
+    const http = new MockHttp();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const ledger: LedgerHandle = {
+      begin: async () => ({ state: "new" }),
+      complete: async () => { throw new Error("ledger down"); },
+      fail: async () => {},
+      markIndeterminate: async () => {},
+    };
+    try {
+      const r = rpc({
+        http,
+        mutation: mutationDeps({
+          runContext: { requestId: "r-ledger-complete-gap", runKey: "k-ledger", reason: "fix it" },
+          ledger: () => ledger,
+          audit: async (rec) => { rows.push(rec); },
+        }),
+      });
+      const out = await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
+      expect(out).toMatchObject({ updated: true });
+      expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(1);
+      expect(rows.at(-1)).toMatchObject({ status: "ok", ordinal: 1 });
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('"event":"ledger_complete_failed_after_effect"'));
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("two mutations in one run -> two audit rows + two snapshots with DISTINCT ordinals/keys", async () => {
     const rows: AuditRecord[] = [];
     const snapshots: { ordinal: number }[] = [];
@@ -462,7 +491,7 @@ describe("Phase 1A — row filters are enforced on tableUpdate", () => {
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 
-  it("denies an out-of-scope sys_id with actor_policy_denied, emits denial audit, and sends zero PATCHes/bytes", async () => {
+  it("denies an out-of-scope sys_id with actor_policy_denied, emits denial audit, and sends zero PATCHes", async () => {
     const rows: AuditRecord[] = [];
     const http = new MockHttp();
     http.getHandler = () => ({ status: 200, json: { result: [] } });
@@ -471,7 +500,7 @@ describe("Phase 1A — row filters are enforced on tableUpdate", () => {
       r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2", short_description: "x".repeat(500) } }),
     ).rejects.toMatchObject({ code: "actor_policy_denied" });
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
-    expect(budget.outboundBytesSent).toBe(0);
+    expect(budget.outboundBytesSent).toBeGreaterThan(0); // the scoped preflight GET query is metered
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ status: "denied", errorClass: "actor_policy_denied" });
   });
@@ -546,7 +575,8 @@ describe("Phase 1C — outbound request bodies are pre-serialized and metered", 
     const patch = http.calls.find((c) => c.method === "PATCH")!;
     expect(patch.bodyJson).toBe("{\"a\":1,\"z\":2}");
     expect(patch.body).toBeUndefined();
-    expect(budget.outboundBytesSent).toBe(new TextEncoder().encode("{\"a\":1,\"z\":2}").length);
+    const patchQueryBytes = new TextEncoder().encode(new URLSearchParams(patch.query).toString()).length;
+    expect(budget.outboundBytesSent).toBe(new TextEncoder().encode("{\"a\":1,\"z\":2}").length + patchQueryBytes);
   });
 
   it("tableUpdate rejects non-JSON fields as a clean pre-send precondition error", async () => {

@@ -340,8 +340,22 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
     throw e;
   }
 
-  // 6) Confirmed success — record the result, then audit the outcome.
-  await ledger?.complete(outcome.result);
+  // 6) Confirmed success — record the result, then audit the outcome. A post-effect
+  // ledger.complete failure is a durability gap, not an unknown effect: the result is known.
+  try {
+    await ledger?.complete(outcome.result);
+  } catch (e) {
+    console.error(
+      JSON.stringify({
+        event: "ledger_complete_failed_after_effect",
+        severity: "alert",
+        requestId: guard.run.requestId,
+        ordinal: eff.ordinal,
+        op: eff.op,
+        error: e instanceof Error ? e.message : String(e),
+      }),
+    );
+  }
   if (guard.audit) {
     try {
       const done = await buildAuditRecord({
