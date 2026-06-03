@@ -11,6 +11,7 @@ applies depends on the credential mode (§2.0, Decision 2).
 | `x_1793136_mcp.admin` (scoped app) | ServiceNow scoped app | Manages `x_1793136_mcp_audit_log`, kill-switch + egress properties, role assignments. **Not the integration user.** | Separation of duty: the executor identity cannot read/disable the audit trail. |
 | Cloudflare deploy identity | Cloudflare account | wrangler / Alchemy IaC | Per-engineer scoped tokens; rotate. |
 | MCP-client OAuth identity (per end user) | Cloudflare (OAuthProvider) | Maps end user → signed actor metadata (§2.0); in `per_user_oauth`, → that user's ServiceNow tokens | Per-user attribution propagates into `x_1793136_mcp_audit_log`. |
+| Enterprise IdP subject (`AUTH_MODE=oidc`) | OIDC provider | Produces the MCP actor `userId=sub`, group-derived `maxMode`, and named ActorPolicy selection | Replaces shared operator-secret identity for enterprise deployments; groups are rechecked on MCP refresh. |
 
 ## Credential-mode branch (Decision 2, §2.0)
 
@@ -22,6 +23,9 @@ applies depends on the credential mode (§2.0, Decision 2).
   re-verified in P8) because the broad identity otherwise lets any MCP user read anything.
 - **`per_user_oauth` (multi-user default):** the matrix applies to the human users/groups;
   ServiceNow ACLs bound access natively and attribution is native.
+- **`AUTH_MODE=oidc`:** MCP-client identity comes from the enterprise IdP, then ServiceNow access
+  still follows the credential-mode branch above. OIDC group claims bound both `maxMode` and the
+  named `ActorPolicy`; stale groups are re-evaluated during MCP refresh-token exchange.
 - **Reversible elevation:** to write system tables in global scope, grant `admin` to
   `mcp_integration_user` **explicitly and document it** — visible and reversible, not implicit.
 
@@ -39,3 +43,6 @@ applies depends on the credential mode (§2.0, Decision 2).
   single-operator group branch, and tool-level `approvalToken` supplies the token branch. Empty
   approval settings deny `admin_script`; operators must explicitly configure an allowlisted actor
   and either a token or required group.
+- In-Worker OIDC is source-complete and mock-IdP tested: `/authorize` redirects to the IdP, the
+  callback validates ID-token signature/issuer/audience/nonce, OIDC groups pick named
+  ActorPolicies, and refresh-time group changes downgrade both mode and policy.

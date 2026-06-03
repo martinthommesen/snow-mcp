@@ -13,14 +13,19 @@ none of which the sandbox network block constrains.
 
 ## Controls (organizational + tenant-scoped — NOT a sandbox)
 
-1. **Tenant kill switch** — property `x_1793136_mcp.executor.run_server_script_enabled=false`
-   returns 503 `run_server_script_disabled` (checked in the resource, audit-first).
+1. **Tenant kill switches** — properties `x_1793136_mcp.executor.enabled=false` and
+   `x_1793136_mcp.executor.run_server_script_enabled=false` return 503 before execution
+   (checked in the resource, audit-first). Fresh installs create both scoped toggles disabled;
+   upgrades preserve any operator-set value.
 2. **Mandatory `reason` + second approval** for `admin_script` (§3.5, §7.9 — implemented:
    `authz/approval.ts`, allowlist + token/access-group).
-3. **Best-effort outbound-API denylist scan** (optional, documented as *not* a sandbox):
+3. **Change-ticket/SIEM discipline** — every production `admin_script` run must carry a
+   change-ticket-quality `reason`; host and ServiceNow audit rows should be forwarded to the
+   production SIEM/append-only audit sink before enabling the toggles for broad use.
+4. **Best-effort outbound-API denylist scan** (optional, documented as *not* a sandbox):
    a static scan of obvious outbound APIs in the submitted script before execution.
-4. **Separate executor budget dimension** — executor calls are metered distinctly.
-5. **Non-recoverable labeling** — `runServerScript` has **no general rollback guarantee**
+5. **Separate executor budget dimension** — executor calls are metered distinctly.
+6. **Non-recoverable labeling** — `runServerScript` has **no general rollback guarantee**
    (§7.7); it is the highest-risk capability and is `admin_script`-only.
 
 ## admin_script privilege model (P4)
@@ -45,6 +50,11 @@ approval token or the required current access-group membership. The
 interactive dry-run→approve branch remains **documented-unsupported** (the stateless
 `createMcpHandler` shape cannot elicit, §3.5).
 
+`DEPLOYMENT_PROFILE=pilot` is not an executor safety gate: it skips production posture checks,
+including secret-entropy checks and `X_MCP_EXECUTOR_HMAC_KEY` length validation. Do not enable the
+executor in a pilot profile unless the environment is isolated and the HMAC key has been generated
+and reviewed out of band. Production executor use must pass the production posture preflight.
+
 ## Status
 
 **Executor (`sn-executor-app/`) — hardened in source/build; live PDI proof is a release gate.**
@@ -66,6 +76,10 @@ redeploy and `scripts/executor-scoped-verify.mjs`. Landed source hardenings:
   duplicate insert = replay → reject), plus a 15-minute scheduled nonce-purge job whose
   `run_period` is checked by `scripts/executor-scoped-verify.mjs`.
 - **Admin ACLs** — the audit table + properties are restricted to `x_1793136_mcp.admin`.
+- **Executor defaults OFF** — fresh installs create the scoped `enabled` and
+  `run_server_script_enabled` properties as `false`; the runtime defaults fail closed if either
+  scoped property is absent. The legacy `x_mcp.executor.*` defaults remain neutral so an explicit
+  pre-scoped disable still survives upgrade.
 - **Deprecated global-REST endpoint REMOVED (M-4, 2026-05-31)** — the un-ACL'd HMAC-only
   global-REST install path has been deleted
   from `scripts/executor-install.mjs`; the installer now ships only the global `x_mcp_verify` core

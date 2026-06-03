@@ -27,3 +27,17 @@ sealed (`recovery/snapshots.ts`) under the versioned `SNAPSHOT_KEK` ring (`build
 P3); the integration user never holds the ring. `SNAPSHOT_ENABLED_TABLES` selects which
 tables get snapshots; empty means none and narrows the recovery claim.
 `TOKEN_KEK`/`SNAPSHOT_KEK` are declared in `.dev.vars.example`.
+
+## Token lifecycles and revocation
+
+There are three independent token lifecycles:
+
+| Token | Store | Revocation / refresh behavior |
+|---|---|---|
+| MCP client grant/access token | `workers-oauth-provider` storage (`OAUTH_KV`) | Revoked by deleting the MCP grant/client state; OIDC access-token props never contain the IdP refresh token. |
+| OIDC IdP refresh token | OAuth-provider grant props, encrypted by the provider | Used only during MCP refresh-token exchange to re-check IdP groups and update `maxMode` / `actorPolicyName`; revoke at the IdP to stop renewal. |
+| ServiceNow user token | `TokenStoreDO`, encrypted under `TOKEN_KEK_CURRENT` | Revoked by the IdP/ServiceNow OAuth client or by deleting the per `(user, instance)` token envelope. |
+
+Group removal is bounded by the MCP token refresh window: the Worker re-evaluates OIDC claims when
+the MCP refresh token is exchanged, then writes new grant props and strips IdP secrets from the next
+MCP access token.
