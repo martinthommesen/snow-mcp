@@ -1,3 +1,4 @@
+import '@servicenow/sdk/global'
 import {
     Table,
     Role,
@@ -107,20 +108,11 @@ Acl({
 // window (120s). Purge rows older than 1 hour every 15 minutes so the table stays bounded
 // (the 1-hour cutoff is far longer than the freshness window, so a still-relevant nonce is
 // never deleted).
-// ⚠️ SDK BUG (now-sdk 4.7.1) — P8 MANUAL FIX REQUIRED: the ScheduledScript serializer does
-// String(value) on the interval, so the Duration OBJECT below lands as "[object Object]" in
-// the generated sysauto_script.run_period (reproduced with the documented
-// {hours,minutes,seconds} shape too). The Fluent linter rejects the string escape hatch the
-// underlying `string | Duration` column would accept (`as unknown` => TS159; inline object
-// type => TS150). So the job RECORD (name/type/script/active) is correct and the build is
-// green, but run_period must be set by hand after install (or via a fixup script) until the
-// SDK serializer is fixed. The script + cadence intent (15-min purge of >1h-old nonces) is
-// authoritative; the interval value is the only field needing the manual touch.
 ScheduledScript({
     $id: Now.ID['job_nonce_purge'],
     name: 'MCP Nonce Purge',
     frequency: 'periodically',
-    executionInterval: { hours: 0, minutes: 15, seconds: 0 },
+    executionInterval: Duration({ minutes: 15 }),
     executionStart: '2026-05-31 00:00:00',
     active: true,
     script: `// Purge MCP nonces older than 1 hour (TTL >> the 120s freshness window).

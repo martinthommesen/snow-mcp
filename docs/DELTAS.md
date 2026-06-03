@@ -160,12 +160,10 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
   path is exercised). Fixed: repoint `SNOW_EXECUTOR_PATH` to the scoped two-segment path; delete
   the global op + definition (keep the shared global core); `executor-scoped-verify.mjs` now
   asserts the numeric path is dead (S8b) to lock the regression.
-- **now-sdk 4.7.1 `run_period` `'[object Object]'` ScheduledScript serializer bug.** The SDK's
-  ScheduledScript serializer emits `'[object Object]'` for a structured `run_period`. This affects
-  the scoped `MCP Nonce Purge` job — which is the LIVE purge for the scoped `x_1793136_mcp_nonce`
-  table (not "unused"; there is no global purge job — `executor-install.mjs` creates no tables).
-  Set its interval once in the UI (System Definition → Scheduled Jobs). Replay protection does not
-  depend on the purge — only unbounded table growth does — so this is a hygiene fixup, not a gate.
+- **Nonce purge interval is source-defined and verified.** The scoped `MCP Nonce Purge` job uses
+  the SDK `Duration(...)` helper so `sysauto_script.run_period` builds as `1970-01-01 00:15:00`.
+  `scripts/executor-scoped-verify.mjs` fails if the live period is missing or wrong. Replay
+  protection still depends on the nonce unique index; the purge bounds table growth.
 - **Content-addressed versioned KEK ring (P3).** `buildKekRing(currentSecret, prevSecret?)` with
   version labels `kek-${sha256(keyBytes)[:8]}`, so a same-label rotation can no longer mask the
   previous key. Threaded for both the token ring (`handlers.ts`) and the snapshot ring (P4).

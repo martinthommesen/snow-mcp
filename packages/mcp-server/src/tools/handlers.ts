@@ -12,7 +12,7 @@ import { ServiceNowRPC } from "../sn/rpc.js";
 import { SnFetchClient, type SnHttpClient } from "../sn/http.js";
 import { canonicalizeInstanceHost } from "../sn/url-allowlist.js";
 import { describeTable, listTables, type DiscoveryDeps } from "../sn/discovery.js";
-import { loadActorPolicy, type ActorPolicy, type PolicyEnv } from "../authz/actor-policy.js";
+import { actorPolicyHash, loadActorPolicy, type ActorPolicy, type PolicyEnv } from "../authz/actor-policy.js";
 import { McpToolError, toToolResult } from "../sn/errors.js";
 import { RunBudget } from "../sn/run-budget.js";
 import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
@@ -468,7 +468,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       const identity = auth.schemaIdentity ?? (auth.schemaIdentityResolver
         ? await auth.schemaIdentityResolver()
         : { principalId: userId, roleHash: "default" });
-      return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity }) : undefined;
+      return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity, policyHash: await actorPolicyHash(policy) }) : undefined;
     })();
     return schemaCachePromise;
   };

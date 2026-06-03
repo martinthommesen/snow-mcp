@@ -47,10 +47,10 @@ interactive dry-run→approve branch remains **documented-unsupported** (the sta
 
 ## Status
 
-**Executor (`sn-executor-app/`) — HARDENED IN SOURCE (P7); live-verified in P8.** The scoped
-Fluent app `x_1793136_mcp` + its global `x_mcp_verify` core are no longer "source-only/
-unverified" and not yet "done live" either — P7 hardened them in source and a coordinated
-host+executor redeploy + live re-proof is the P8 gate. Landed source hardenings:
+**Executor (`sn-executor-app/`) — hardened in source/build; live PDI proof is a release gate.**
+The scoped Fluent app `x_1793136_mcp` + its global `x_mcp_verify` core are source/build verified
+locally, but post-hardening live PDI verification still requires a coordinated host+executor
+redeploy and `scripts/executor-scoped-verify.mjs`. Landed source hardenings:
 
 - **Instance-claim enforcement** — `verify()` rejects a payload whose signed `actor.instance`
   does not name this instance (cross-instance replay → clean 401).
@@ -63,7 +63,8 @@ host+executor redeploy + live re-proof is the P8 gate. Landed source hardenings:
   replacing the code-unit slice against a byte cap.
 - **Nonce replay race-close** — the live scoped Fluent wrapper consumes nonces via a bare
   INSERT into the **DB-unique-indexed scoped `x_1793136_mcp_nonce` table** (INSERT-as-arbiter: a
-  duplicate insert = replay → reject), plus a scheduled nonce-purge job.
+  duplicate insert = replay → reject), plus a 15-minute scheduled nonce-purge job whose
+  `run_period` is checked by `scripts/executor-scoped-verify.mjs`.
 - **Admin ACLs** — the audit table + properties are restricted to `x_1793136_mcp.admin`.
 - **Deprecated global-REST endpoint REMOVED (M-4, 2026-05-31)** — the un-ACL'd HMAC-only
   global-REST install path has been deleted
@@ -71,10 +72,11 @@ host+executor redeploy + live re-proof is the P8 gate. Landed source hardenings:
   + properties. The canonical surface is the scoped, role-ACL-gated Fluent REST.
 
 **Breaking payload change:** P7 added the signed `reason` key + the instance claim, so the host
-and executor **must be redeployed together** (P8); the earlier live executor proofs (B1 HMAC
-match, S8/S9/T8/S16) predate this and are re-run in P8. P8-live gates: the `instance_name`
-property shape (fail-closed; an FQDN/empty value is a total 401 brick), the `GlideDigest`
-SHA-256 UTF-8 encoding (0.13a), and the `x_1793136_mcp_nonce` unique-index DB enforcement.
+and executor **must be redeployed together** before live approval; the earlier live executor
+proofs (B1 HMAC match, S8/S9/T8/S16) predate this and are re-run by the P8 live gate. P8-live
+gates: the `instance_name` property shape (fail-closed; an FQDN/empty value is a total 401
+brick), the `GlideDigest` SHA-256 UTF-8 encoding (0.13a), the `x_1793136_mcp_nonce` unique-index
+DB enforcement, and the scheduled nonce-purge `run_period`.
 
 **Host-side: wired + locally tested (P4).** The mutating/executor path runs through the
 idempotency ledger, host audit (AUDIT_KV, 30-day TTL, audit-before-effect fail-closed), recovery

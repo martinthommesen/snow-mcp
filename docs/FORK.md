@@ -275,16 +275,14 @@ Beyond `scripts/executor-scoped-verify.mjs`, confirm these on your live instance
 
 ## 6. Caveats you will hit
 
-- **now-sdk 4.7.1 `run_period` `'[object Object]'` serializer bug.** The SDK serializes a structured
-  `run_period` as the string `'[object Object]'`, which breaks the scoped **`MCP Nonce Purge`** job.
-  Set that job's interval **once in the ServiceNow UI** after install. This is hygiene only —
-  **replay protection does not depend on the purge** (the nonce unique index does); only unbounded
-  table growth does.
-- **`npm audit` on the Fluent toolchain reports CVEs that are dev/build-only.** `sn-executor-app/fluent`
-  shows ~15 advisories, all in the `@servicenow/sdk@4.7.1` build toolchain — none ship to the Worker
-  or to ServiceNow. **Do NOT run `npm audit fix --force`** — it would downgrade to
-  `@servicenow/sdk@4.6.1`, a breaking SDK regression. Re-audit when ServiceNow ships an SDK that
-  bumps the transitive pins.
+- **Nonce purge interval.** The scoped **`MCP Nonce Purge`** job uses the SDK `Duration(...)`
+  helper so `sysauto_script.run_period` builds as `1970-01-01 00:15:00`. Replay protection does not
+  depend on the purge (the nonce unique index does), but `scripts/executor-scoped-verify.mjs` now
+  fails if the live period is missing or wrong because otherwise table growth is unbounded.
+- **Fluent SDK toolchain audit.** `sn-executor-app/fluent` keeps `@servicenow/sdk@4.7.1`, but pins
+  patched transitive build-tool packages via `overrides`. Keep `npm audit --audit-level=moderate`
+  clean in that nested package; **do not run `npm audit fix --force`** because it downgrades the SDK
+  and pulls older critical-vulnerable toolchain packages.
 - **Author-specific IDs remaining outside the re-scope set.** These are illustrative / status
   values, not used by the Alchemy deploy path, but genericize them if you run those tools directly:
   - `packages/mcp-server/wrangler.jsonc` pins the **author's KV namespace GUIDs**

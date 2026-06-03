@@ -411,3 +411,35 @@ export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, use
     }
   }
 }
+
+function sortedEntries<T>(value: Record<string, T>): [string, T][] {
+  return Object.entries(value).sort(([a], [b]) => a.localeCompare(b));
+}
+
+function ruleKey(rule: TableRule): string {
+  return typeof rule === "string" ? `s:${rule}` : `r:${rule.source}/${rule.flags}`;
+}
+
+function canonicalPolicy(policy: ActorPolicy): unknown {
+  return {
+    allowedInstances: [...policy.allowedInstances].sort(),
+    tables: {
+      allow: (policy.tables.allow ?? []).map(ruleKey).sort(),
+      deny: (policy.tables.deny ?? []).map(ruleKey).sort(),
+    },
+    fieldMasks: sortedEntries(policy.fieldMasks).map(([table, fields]) => [table, [...fields].sort()]),
+    rowFilters: sortedEntries(policy.rowFilters ?? {}),
+    maxMode: policy.maxMode,
+    maxRowsPerRun: policy.maxRowsPerRun,
+    maxBytesPerRun: policy.maxBytesPerRun,
+  };
+}
+
+/** Stable fingerprint of the current ActorPolicy for schema-cache isolation. */
+export async function actorPolicyHash(policy: ActorPolicy): Promise<string> {
+  const bytes = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(canonicalPolicy(policy))),
+  );
+  return [...new Uint8Array(bytes).subarray(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}

@@ -16,6 +16,8 @@ export interface SchemaCachePrincipalIdentity {
   principalId: string;
   /** Hash of the user's roles (so a role change busts the cache). */
   roleHash: string;
+  /** Hash of the host ActorPolicy that shaped the cached schema. */
+  policyHash?: string;
   domainId?: string;
   scope?: string;
 }
@@ -32,8 +34,8 @@ export class SchemaCache {
   ) {}
 
   private key(kind: "table" | "list", suffix: string): string {
-    const { instanceHost, principalId, roleHash, domainId, scope } = this.id;
-    return `schema:${SCHEMA_VERSION}:${instanceHost}:${principalId}:${roleHash}:${domainId ?? ""}:${scope ?? ""}:${kind}:${suffix}`;
+    const { instanceHost, principalId, roleHash, policyHash, domainId, scope } = this.id;
+    return `schema:${SCHEMA_VERSION}:${instanceHost}:${principalId}:${roleHash}:${policyHash ?? ""}:${domainId ?? ""}:${scope ?? ""}:${kind}:${suffix}`;
   }
 
   private async fillMiss<T>(key: string, fetcher: () => Promise<T>, write: (value: T) => Promise<void>): Promise<T> {

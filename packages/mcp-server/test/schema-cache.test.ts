@@ -255,4 +255,67 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     expect(identityCalls).toBe(1);
     expect(fetches).toBe(1);
   });
+
+  it("does not serve stale broad cached schema after ActorPolicy is tightened", async () => {
+    const host = `inst-policy-${crypto.randomUUID()}.service-now.com`;
+    const identity = { principalId: "policy-principal", roleHash: "policy-role" };
+    vi.stubGlobal("fetch", (async (url: string) => {
+      const u = new URL(url);
+      if (u.pathname === "/api/now/table/sys_db_object") {
+        const fields = u.searchParams.get("sysparm_fields") ?? "";
+        if (fields === "super_class.name") {
+          return new Response(JSON.stringify({ result: [{ "super_class.name": "" }] }), {
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ result: [
+          { name: "incident", label: "Incident" },
+          { name: "sys_user", label: "User" },
+        ] }), { headers: { "content-type": "application/json" } });
+      }
+      if (u.pathname === "/api/now/table/sys_dictionary") {
+        return new Response(JSON.stringify({ result: [
+          { element: "number", column_label: "Number", internal_type: "string", mandatory: "false" },
+          { element: "caller_id", column_label: "Caller", internal_type: "reference", mandatory: "false" },
+        ] }), { headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ result: [] }), { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch);
+
+    function handlers(env: Partial<HandlerEnv> = {}) {
+      return buildHandlers(
+        {
+          LOADER,
+          SCHEMA_KV: KV,
+          SNOW_INSTANCE_HOST: host,
+          SNOW_DEV_ROPC: "1",
+          SNOW_DEV_ROPC_USERNAME: "dev-user",
+          SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+          ...env,
+        } as HandlerEnv,
+        {
+          userId: "policy-user",
+          scopeMaxMode: "read_only",
+          props: { userId: "policy-user", scopes: ["servicenow:read"], maxMode: "read_only" },
+          schemaIdentityResolver: async () => identity,
+        },
+      );
+    }
+
+    const broad = handlers();
+    const broadTables = JSON.parse((await broad.listTables({})).content[0]!.text) as { tables: { name: string }[] };
+    expect(broadTables.tables.map((t) => t.name)).toContain("sys_user");
+    const broadFields = JSON.parse((await broad.describeTable({ table: "incident" })).content[0]!.text) as { fields: { name: string }[] };
+    expect(broadFields.fields.map((f) => f.name)).toContain("caller_id");
+
+    const restricted = handlers({
+      ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
+      ACTOR_POLICY_FIELD_MASKS: "incident:caller_id",
+      ACTOR_POLICY_MAX_MODE: "read_only",
+    });
+    const restrictedTables = JSON.parse((await restricted.listTables({})).content[0]!.text) as { tables: { name: string }[] };
+    expect(restrictedTables.tables.map((t) => t.name)).toEqual(["incident"]);
+    const restrictedFields = JSON.parse((await restricted.describeTable({ table: "incident" })).content[0]!.text) as { fields: { name: string }[] };
+    expect(restrictedFields.fields.map((f) => f.name)).toEqual(["number"]);
+  });
 });

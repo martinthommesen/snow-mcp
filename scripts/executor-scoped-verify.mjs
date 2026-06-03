@@ -31,6 +31,8 @@ const keyBytes = Uint8Array.from(atob(dv("X_MCP_EXECUTOR_HMAC_KEY")), (c) => c.c
 // mismatch can't 404. Falls back to the scope-name form if SNOW_EXECUTOR_PATH is unset.
 const ENDPOINT = `https://${host}${assertApiPath(dv("SNOW_EXECUTOR_PATH") || "/api/x_1793136_mcp/x_mcp/executor/run")}`;
 const h = { authorization: basic, accept: "application/json" };
+const NONCE_PURGE_JOB_NAME = "MCP Nonce Purge";
+const NONCE_PURGE_RUN_PERIOD = "1970-01-01 00:15:00";
 
 async function api(method, path, body) {
   const r = await fetch(`https://${host}${path}`, { method, headers: { ...h, ...(body ? { "content-type": "application/json" } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
@@ -267,20 +269,16 @@ skip("SIGNED reason persisted in x_1793136_mcp_audit_log.reason column", "scoped
     rejected413 && reuse.status === 200, `(oversized ${oversized.status}, reuse ${reuse.status})`);
 }
 
-// L-6: the scoped `MCP Nonce Purge` ScheduledScript's interval serializes to a bad string under
-// now-sdk 4.7.1 ("[object Object]"), needing a one-time UI fix. This is FAIL-SAFE for replay
-// (more retained nonces only strengthen the unique-index defense), so a bad/missing period is an
-// operational note, NOT a hard failure. PASS when the period looks valid; SKIP (operator-verify)
-// otherwise so the suite still exits 0 on a green security run.
+// L-6: the scoped `MCP Nonce Purge` ScheduledScript must have the exact 15-minute period generated
+// from the Fluent Duration helper. Replay protection is still enforced by the unique nonce index,
+// but retention must fail verification if the deploy leaves the purge job unbounded.
 {
-  const job = (await api("GET", "/api/now/table/sysauto_script?sysparm_query=nameLIKEMCP Nonce Purge&sysparm_limit=1&sysparm_fields=sys_id,run_period,run_type")).json?.result?.[0];
+  const query = encodeURIComponent(`name=${NONCE_PURGE_JOB_NAME}`);
+  const job = (await api("GET", `/api/now/table/sysauto_script?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,run_period,run_type`)).json?.result?.[0];
   const period = String(job?.run_period ?? "");
-  const valid = Boolean(job) && period !== "" && !period.includes("[object Object]");
-  if (valid) {
-    check("L-6 — MCP Nonce Purge job has a valid run_period (table stays bounded)", true, `(run_period "${period}", run_type "${job.run_type}")`);
-  } else {
-    skip("L-6 — MCP Nonce Purge run_period", `set it in the UI (System Definition > Scheduled Jobs) — now-sdk 4.7.1 serializes it as "${period || "MISSING"}"; replay protection is unaffected (fail-safe), only purge is deferred`);
-  }
+  check("L-6 — MCP Nonce Purge job has the 15-minute run_period (table stays bounded)",
+    Boolean(job) && job.run_type === "periodically" && period === NONCE_PURGE_RUN_PERIOD,
+    `(run_period "${period || "MISSING"}", run_type "${job?.run_type ?? "MISSING"}")`);
 }
 
 } finally {
