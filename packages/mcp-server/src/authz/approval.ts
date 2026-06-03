@@ -5,6 +5,7 @@
 // locally (extends B3/B4). The stateless createMcpHandler shape cannot elicit (§3.5).
 
 import { McpToolError } from "../sn/errors.js";
+import { constantTimeEqualAscii } from "../auth/encoding.js";
 import type { Mode } from "@servicenow-codemode/shared";
 
 export interface ApprovalContext {
@@ -20,6 +21,15 @@ export interface ApprovalContext {
   /** Second-approval option B: the actor's access groups vs a required group. */
   actorAccessGroups?: readonly string[];
   requiredAccessGroup?: string;
+}
+
+function approvalTokenMatches(presented: string | undefined, validTokens: ReadonlySet<string> | undefined): boolean {
+  if (!presented || !validTokens || validTokens.size === 0) return false;
+  let matched = false;
+  for (const token of validTokens) {
+    matched = constantTimeEqualAscii(presented, token) || matched;
+  }
+  return matched;
 }
 
 /**
@@ -39,7 +49,7 @@ export function assertAdminScriptApproved(ctx: ApprovalContext): void {
     });
   }
 
-  const tokenOk = Boolean(ctx.approvalToken) && (ctx.validApprovalTokens?.has(ctx.approvalToken!) ?? false);
+  const tokenOk = approvalTokenMatches(ctx.approvalToken, ctx.validApprovalTokens);
   const groupOk =
     Boolean(ctx.requiredAccessGroup) && (ctx.actorAccessGroups?.includes(ctx.requiredAccessGroup!) ?? false);
 

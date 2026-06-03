@@ -77,6 +77,11 @@ export interface CallbackHandlerEnv {
 /** TTL for an in-flight authorize→callback correlation (a started-but-unfinished flow). */
 const CORRELATION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SCOPE = "useraccount";
+const OAUTH_RESPONSE_HEADERS = {
+  "cache-control": "no-store",
+  pragma: "no-cache",
+  "referrer-policy": "no-referrer",
+} as const;
 
 function canonicalHost(env: CallbackHandlerEnv): string {
   return canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST!, { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] });
@@ -108,6 +113,20 @@ function redirectUri(origin: string): string {
   return `${origin}/servicenow/callback`;
 }
 
+function textResponse(body: string, status: number): Response {
+  return new Response(body, {
+    status,
+    headers: { ...OAUTH_RESPONSE_HEADERS, "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+function redirectResponse(location: string): Response {
+  return new Response(null, {
+    status: 302,
+    headers: { ...OAUTH_RESPONSE_HEADERS, location },
+  });
+}
+
 function principalMatchesActorEmail(principal: SnPrincipal, actorEmail: string): boolean {
   const expected = normalizeIdentityEmail(actorEmail);
   if (!expected) return false;
@@ -124,25 +143,25 @@ function principalMatchesBinding(principal: SnPrincipal, record: AuthCorrelation
 }
 
 async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promise<Response> {
-  if (!configured(env)) return new Response("ServiceNow OAuth is not configured.", { status: 400 });
+  if (!configured(env)) return textResponse("ServiceNow OAuth is not configured.", 400);
   const now = Date.now();
   const url = new URL(request.url);
   const ticketStr = url.searchParams.get("ticket") ?? "";
-  // The host-HMAC ticket is the ONLY identity authority here — verify it (signature + exp).
+  // The opaque host ticket is the ONLY identity authority here — decrypt it and verify exp.
   const ticket = await verifyTicket(ticketStr, env.OAUTH_PROVIDER_SECRET!, now);
-  if (!ticket) return new Response("Invalid or expired authorization ticket.", { status: 401 });
+  if (!ticket) return textResponse("Invalid or expired authorization ticket.", 401);
 
   const instanceHost = canonicalHost(env);
   const publicOrigin = canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN)!;
   // The ticket's instanceHost must match this worker's configured instance — a ticket minted
   // for another instance must not start a flow against this one.
   if (ticket.instanceHost !== instanceHost) {
-    return new Response("Ticket instance mismatch.", { status: 400 });
+    return textResponse("Ticket instance mismatch.", 400);
   }
   const ns = env.AUTH_DO;
   const nonceClaimed = await ns.get(ns.idFromName(`ticket:${ticket.nonce}`)).consumeTicketNonce(ticket.nonce, ticket.exp, now);
   if (!nonceClaimed) {
-    return new Response("Authorization ticket already used.", { status: 401 });
+    return textResponse("Authorization ticket already used.", 401);
   }
 
   const { verifier, challenge } = await generatePkce();
@@ -167,27 +186,27 @@ async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promi
   authorize.searchParams.set("state", state);
   authorize.searchParams.set("code_challenge", challenge);
   authorize.searchParams.set("code_challenge_method", "S256");
-  return Response.redirect(authorize.toString(), 302);
+  return redirectResponse(authorize.toString());
 }
 
 async function handleCallback(request: Request, env: CallbackHandlerEnv): Promise<Response> {
-  if (!configured(env)) return new Response("ServiceNow OAuth is not configured.", { status: 400 });
+  if (!configured(env)) return textResponse("ServiceNow OAuth is not configured.", 400);
   const url = new URL(request.url);
   const code = url.searchParams.get("code") ?? "";
   const state = url.searchParams.get("state") ?? "";
-  if (!code || !state) return new Response("Missing code or state.", { status: 400 });
+  if (!code || !state) return textResponse("Missing code or state.", 400);
 
   // ATOMIC consume-once: read-and-delete inside the DO input gate. A replayed callback for the
   // same state sees the deletion and gets null → rejected. The record is the SOLE authority for
   // userId/instanceHost — never a request param (this is what makes the cross-user test pass).
   const ns = env.AUTH_DO;
   const record = await ns.get(ns.idFromName(`state:${state}`)).consumeRecord(state);
-  if (!record) return new Response("Invalid or already-used authorization state.", { status: 400 });
-  if (Date.now() > record.expiresAt) return new Response("Authorization state expired.", { status: 400 });
+  if (!record) return textResponse("Invalid or already-used authorization state.", 400);
+  if (Date.now() > record.expiresAt) return textResponse("Authorization state expired.", 400);
 
   const instanceHost = canonicalHost(env);
   // The record's instance must match this worker's configured instance (cross-instance reject).
-  if (record.instanceHost !== instanceHost) return new Response("Authorization instance mismatch.", { status: 400 });
+  if (record.instanceHost !== instanceHost) return textResponse("Authorization instance mismatch.", 400);
 
   const cfg = oauthConfig(env, instanceHost);
   const publicOrigin = canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN)!;
@@ -197,14 +216,14 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
     tokens = await authorizationCodeGrant(cfg, code, record.pkceVerifier, redirectUri(publicOrigin), now);
   } catch (e) {
     console.error("servicenow callback: code exchange failed:", redactString(e instanceof Error ? e.message : String(e)));
-    return new Response("ServiceNow token exchange failed.", { status: 400 });
+    return textResponse("ServiceNow token exchange failed.", 400);
   }
 
   // Resolve + persist the SN principal alongside the token. Fail closed: a per-user token without
   // a resolved ServiceNow sys_id cannot provide trustworthy admin_script attribution.
   const principal = await resolveSnPrincipal(cfg, tokens.access_token);
   if (!principal) {
-    return new Response("ServiceNow principal resolution failed.", { status: 400 });
+    return textResponse("ServiceNow principal resolution failed.", 400);
   }
 
   const ring = await buildKekRing((env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK)!, env.TOKEN_KEK_PREV);
@@ -222,7 +241,7 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
     }));
   }
   if (!principalMatchesBinding(principal, record, existing)) {
-    return new Response("ServiceNow principal does not match the MCP actor binding.", { status: 403 });
+    return textResponse("ServiceNow principal does not match the MCP actor binding.", 403);
   }
 
   tokens.sys_id = principal.sys_id;
@@ -232,10 +251,7 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
   tokens.principal_resolved_at = now;
   await store.put("servicenow", tokens);
 
-  return new Response("ServiceNow authorization complete. You may close this window.", {
-    status: 200,
-    headers: { "content-type": "text/plain; charset=utf-8" },
-  });
+  return textResponse("ServiceNow authorization complete. You may close this window.", 200);
 }
 
 /** Route the /servicenow/* surface. Returns null when the path is not one of ours (so the

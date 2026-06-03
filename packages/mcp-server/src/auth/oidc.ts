@@ -267,13 +267,22 @@ function parseGroupPolicyMap(env: OidcEnv): Record<string, GroupPolicy> {
 
 function bestGroupPolicy(env: OidcEnv, groups: string[]): GroupPolicy {
   const map = parseGroupPolicyMap(env);
-  let best: GroupPolicy = { maxMode: "read_only", policyName: env.OIDC_DEFAULT_POLICY_NAME?.trim() || "default" };
+  let best: GroupPolicy | undefined;
   for (const group of groups) {
     if (!Object.prototype.hasOwnProperty.call(map, group)) continue;
     const entry = map[group];
-    if (entry && isValidMode(entry.maxMode) && modeRisk(entry.maxMode) >= modeRisk(best.maxMode)) best = entry;
+    if (!entry || !isValidMode(entry.maxMode)) continue;
+    if (!best || modeRisk(entry.maxMode) > modeRisk(best.maxMode)) {
+      best = entry;
+      continue;
+    }
+    if (modeRisk(entry.maxMode) === modeRisk(best.maxMode) && entry.policyName !== best.policyName) {
+      throw new OAuthError("invalid_grant", {
+        description: "OIDC group policy map is ambiguous for equally privileged groups; configure one policy per risk level.",
+      });
+    }
   }
-  return best;
+  return best ?? { maxMode: "read_only", policyName: env.OIDC_DEFAULT_POLICY_NAME?.trim() || "default" };
 }
 
 function oidcProviderUserId(subject: string): string {

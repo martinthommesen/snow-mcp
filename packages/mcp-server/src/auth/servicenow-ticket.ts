@@ -1,22 +1,23 @@
-// Host-HMAC reauth ticket (plan §6b) — the identity bridge from an authenticated /mcp
+// Opaque reauth ticket (plan §6b) — the identity bridge from an authenticated /mcp
 // request to the UNauthenticated /servicenow/authorize route (which has no ctx.props).
 //
-// Inside /mcp, where ctx.props.userId EXISTS, the host mints a ticket {userId, actorEmail?,
-// instanceHost, nonce, exp} signed with a HOST secret (OAUTH_PROVIDER_SECRET, domain-separated).
-// This ticket string is the `authorizeUrl` the reauth_required carries (P2 detail channel). At
-// /servicenow/authorize the host VERIFIES this signature + exp — it is the route's ONLY identity
-// authority; nothing client-supplied at that route is trusted.
+// Inside /mcp, where ctx.props.userId EXISTS, the host mints an encrypted ticket {userId,
+// actorEmail?, instanceHost, nonce, exp} under a HOST secret (OAUTH_PROVIDER_SECRET,
+// domain-separated as AES-GCM AAD). This ticket string is the `authorizeUrl` the
+// reauth_required carries (P2 detail channel). At /servicenow/authorize the host decrypts and
+// verifies exp — it is the route's ONLY identity authority; nothing client-supplied at that route
+// is trusted. The browser URL carries only opaque ciphertext, not readable user claims.
 //
-// Reuses the HMAC-SHA256 primitive from auth/actor.ts. The secret is derived to 32 raw bytes
-// via SHA-256 (auth/crypto.ts deriveKeyBytes), so any passphrase works as the HMAC key.
+// The secret is derived to 32 raw bytes via SHA-256 (auth/crypto.ts deriveKeyBytes), matching the
+// token-store KEK derivation model.
 
-import { hmacSha256Base64 } from "./actor.js";
 import { deriveKeyBytes } from "./crypto.js";
-import { base64UrlToString, bytesToBase64Url, constantTimeEqualAscii } from "./encoding.js";
+import { base64UrlToBytes, bytesToBase64Url } from "./encoding.js";
 
 /** Domain-separation prefix so this signature can never be confused with another use of the
  *  same host secret (e.g. Alchemy state, OAuthProvider internals). */
 const TICKET_CONTEXT = "sn-oauth-reauth-ticket\n";
+const TICKET_VERSION = "v2";
 
 export interface ReauthTicket {
   userId: string;
@@ -28,23 +29,25 @@ export interface ReauthTicket {
 }
 
 const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+async function ticketKey(secret: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", await deriveKeyBytes(secret) as BufferSource, { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+}
 
 export function normalizeIdentityEmail(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
-/** The canonical bytes that get HMAC'd: a domain prefix + the base64url JSON payload. */
-function canonical(payloadB64Url: string): string {
-  return TICKET_CONTEXT + payloadB64Url;
-}
-
 /**
- * Mint a signed ticket string `<payload>.<sig>` (both base64url). `secret` is the host
+ * Mint an opaque ticket string `v2.<iv>.<ciphertext>` (base64url parts). `secret` is the host
  * OAUTH_PROVIDER_SECRET. Returns the opaque token only — the caller builds the full
  * `${origin}/servicenow/authorize?ticket=…` URL.
  */
 export async function mintTicket(ticket: ReauthTicket, secret: string): Promise<string> {
-  const keyBytes = await deriveKeyBytes(secret);
   const actorEmail = normalizeIdentityEmail(ticket.actorEmail);
   const normalized = {
     userId: ticket.userId,
@@ -54,34 +57,37 @@ export async function mintTicket(ticket: ReauthTicket, secret: string): Promise<
     ...(ticket.expectedSnSysId?.trim() ? { expectedSnSysId: ticket.expectedSnSysId.trim() } : {}),
     exp: ticket.exp,
   } satisfies ReauthTicket;
-  const payloadB64Url = bytesToBase64Url(enc.encode(JSON.stringify(normalized)));
-  const sig = await hmacSha256Base64(canonical(payloadB64Url), keyBytes);
-  return `${payloadB64Url}.${bytesToBase64Url(enc.encode(sig))}`;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: iv as BufferSource, additionalData: enc.encode(TICKET_CONTEXT) as BufferSource },
+      await ticketKey(secret),
+      enc.encode(JSON.stringify(normalized)) as BufferSource,
+    ),
+  );
+  return `${TICKET_VERSION}.${bytesToBase64Url(iv)}.${bytesToBase64Url(ciphertext)}`;
 }
 
 /**
  * Verify a ticket string against the host secret + expiry. Returns the ticket on success, or
- * null on ANY failure (malformed, bad signature, expired) — the caller fails closed. `now` is
+ * null on ANY failure (malformed, tampered, wrong secret, expired) — the caller fails closed. `now` is
  * injected for testability.
  */
 export async function verifyTicket(token: string, secret: string, now: number): Promise<ReauthTicket | null> {
-  const dot = token.indexOf(".");
-  if (dot <= 0) return null;
-  const payloadB64Url = token.slice(0, dot);
-  const sigPart = token.slice(dot + 1);
-  const keyBytes = await deriveKeyBytes(secret);
-  const expectedSig = await hmacSha256Base64(canonical(payloadB64Url), keyBytes);
-  let presentedSig: string;
-  try {
-    presentedSig = base64UrlToString(sigPart);
-  } catch {
-    return null;
-  }
-  // Constant-time-ish compare of the base64 signatures.
-  if (!constantTimeEqualAscii(presentedSig, expectedSig)) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== TICKET_VERSION) return null;
   let ticket: ReauthTicket;
   try {
-    ticket = JSON.parse(base64UrlToString(payloadB64Url)) as ReauthTicket;
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: base64UrlToBytes(parts[1]!) as BufferSource,
+        additionalData: enc.encode(TICKET_CONTEXT) as BufferSource,
+      },
+      await ticketKey(secret),
+      base64UrlToBytes(parts[2]!) as BufferSource,
+    );
+    ticket = JSON.parse(dec.decode(plaintext)) as ReauthTicket;
   } catch {
     return null;
   }

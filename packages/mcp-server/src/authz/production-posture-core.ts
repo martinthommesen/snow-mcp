@@ -22,6 +22,7 @@ export interface PostureEnv {
   SNAPSHOT_KEK_CURRENT?: string;
   ALLOW_LOCALHOST?: string;
   ALLOWED_ORIGINS?: string;
+  ADMIN_SCRIPT_APPROVAL_TOKENS?: string;
   SNOW_INSTANCE_HOST?: string;
   SNOW_EXECUTOR_PATH?: string;
   SNOW_DEV_ROPC?: string;
@@ -91,11 +92,36 @@ function hasText(value: string | undefined): boolean {
   return value !== undefined && value.trim() !== "";
 }
 
+function isForbiddenPublicOriginHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host.startsWith("[")) return true;
+  const parts = host.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  const [a, b] = parts as [number, number, number, number];
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
 function isCanonicalHttpsOrigin(value: string | undefined): boolean {
   if (!hasText(value)) return false;
   try {
     const url = new URL(value!);
-    return url.protocol === "https:" && !url.username && !url.password && url.pathname === "/" && url.search === "" && url.hash === "";
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === "" &&
+      !isForbiddenPublicOriginHost(url.hostname)
+    );
   } catch {
     return false;
   }
@@ -131,6 +157,17 @@ function strongSecret(value: string | undefined): boolean {
 
 function requireStrongSecret(violations: string[], label: string, value: string | undefined): void {
   if (!strongSecret(value)) violations.push(`${label} must be a strong CSPRNG secret.`);
+}
+
+function validateStrongTokenList(violations: string[], label: string, value: string | undefined): void {
+  const tokens = csv(value);
+  if (hasText(value) && tokens.length === 0) {
+    violations.push(`${label} is set but contains no tokens.`);
+    return;
+  }
+  for (const token of tokens) {
+    if (!looksLikeStrongSecret(token)) violations.push(`${label} entries must be strong CSPRNG secrets.`);
+  }
 }
 
 function base64ToBytes(value: string): Uint8Array {
@@ -466,6 +503,10 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   if (csv(env.ALLOWED_ORIGINS).length === 0) {
     violations.push("ALLOWED_ORIGINS must include at least one origin in production.");
   }
+  for (const origin of csv(env.ALLOWED_ORIGINS)) {
+    if (!isCanonicalHttpsOrigin(origin)) violations.push("ALLOWED_ORIGINS entries must be canonical public HTTPS origins in production.");
+  }
+  validateStrongTokenList(violations, "ADMIN_SCRIPT_APPROVAL_TOKENS", env.ADMIN_SCRIPT_APPROVAL_TOKENS);
   for (const binding of coreBindings) {
     if (!env[binding]) violations.push(`${binding} binding is required in production.`);
   }

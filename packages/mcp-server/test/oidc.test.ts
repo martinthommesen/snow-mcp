@@ -171,6 +171,19 @@ describe("Phase 3 OIDC identity projection", () => {
     expect(oidcPropsFromClaims(env, { sub: "u-writer", groups: ["writers"] }, ["servicenow:write"]).grantProps.actorPolicyName).toBe("fallback");
   });
 
+  it("rejects equally privileged groups that select different ActorPolicies", () => {
+    const env = {
+      ...envWithFetch(fetch),
+      OIDC_GROUP_POLICY_MAP: JSON.stringify({
+        teamA: { maxMode: "write", policy: "writer-a" },
+        teamB: { maxMode: "write", policy: "writer-b" },
+      }),
+    };
+    expect(() => oidcPropsFromClaims(env, { sub: "u-ambiguous", groups: ["teamA", "teamB"] }, ["servicenow:write"])).toThrow(
+      /ambiguous/i,
+    );
+  });
+
   it("does not let prototype-named IdP groups inherit a wider policy", () => {
     const { grantProps } = oidcPropsFromClaims(
       { ...envWithFetch(fetch), OIDC_GROUP_POLICY_MAP: undefined },

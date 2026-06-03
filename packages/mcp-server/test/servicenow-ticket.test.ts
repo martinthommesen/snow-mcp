@@ -17,8 +17,16 @@ describe("§6b reauth ticket mint/verify", () => {
   it("round-trips a valid ticket and returns its claims", async () => {
     const ticket = { userId: "alice", actorEmail: "alice@example.com", instanceHost: "inst1.service-now.com", nonce: "n1", exp: 10_000 };
     const token = await mintTicket(ticket, SECRET);
+    expect(token.startsWith("v2.")).toBe(true);
     const verified = await verifyTicket(token, SECRET, 5_000); // before exp
     expect(verified).toEqual(ticket);
+  });
+
+  it("does not expose readable JSON claims in the browser-visible ticket", async () => {
+    const token = await mintTicket(mkTicket({ userId: "alice", actorEmail: "alice@example.com" }), SECRET);
+    expect(token).not.toContain("alice");
+    expect(token).not.toContain("userId");
+    expect(atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/").padEnd(16, "="))).not.toContain("alice");
   });
 
   it("round-trips UTF-8 user ids without changing the TokenStore partition key", async () => {
@@ -68,13 +76,12 @@ describe("§6b reauth ticket mint/verify", () => {
     expect(await verifyTicket(token, "another-secret", 5_000)).toBeNull();
   });
 
-  it("rejects a tampered payload (signature no longer matches the claims)", async () => {
+  it("rejects tampered ciphertext", async () => {
     const token = await mintTicket(mkTicket(), SECRET);
-    // Flip the userId in the base64url payload while keeping the original signature.
-    const [, sig] = token.split(".");
-    const forged = btoa(JSON.stringify({ userId: "mallory", instanceHost: "inst1", nonce: "n", exp: 10_000 }))
-      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    expect(await verifyTicket(`${forged}.${sig}`, SECRET, 5_000)).toBeNull();
+    const parts = token.split(".");
+    const cipher = parts[2]!;
+    const flipped = `${cipher.slice(0, -1)}${cipher.endsWith("A") ? "B" : "A"}`;
+    expect(await verifyTicket(`${parts[0]}.${parts[1]}.${flipped}`, SECRET, 5_000)).toBeNull();
   });
 
   it("rejects a malformed token (no dot separator)", async () => {

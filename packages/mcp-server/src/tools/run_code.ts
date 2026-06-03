@@ -12,7 +12,7 @@ import { serializeResult, utf8Len, capLogs, type CappedLogs } from "../sandbox/s
 import { SIZE_LIMITS } from "../config.js";
 import { McpToolError, toToolResult, parseSandboxError } from "../sn/errors.js";
 import { redactString } from "../observability/redact.js";
-import { validateIdempotencyKey, validateReason } from "../sn/validate.js";
+import { validateApprovalToken, validateIdempotencyKey, validateReason } from "../sn/validate.js";
 import type { ServiceNowRPC } from "../sn/rpc.js";
 import type { RunContext } from "../sn/mutation-guard.js";
 import { RunBudget } from "../sn/run-budget.js";
@@ -129,6 +129,7 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
     }
     const reason = input.reason !== undefined ? validateReason(input.reason) : undefined;
     const runKey = input.idempotencyKey !== undefined ? validateIdempotencyKey(input.idempotencyKey) : undefined;
+    const approvalToken = input.approvalToken !== undefined ? validateApprovalToken(input.approvalToken) : undefined;
 
     // 2.6) per-user auth preflight (§6b). Must precede the daily reserve + executor so a
     //      per_user_oauth caller with no usable ServiceNow token reauths BEFORE any billable
@@ -173,7 +174,7 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       requestId: crypto.randomUUID(),
       ...(reason !== undefined ? { reason } : {}),
       ...(runKey !== undefined ? { runKey } : {}),
-      ...(input.approvalToken !== undefined ? { approvalToken: input.approvalToken } : {}),
+      ...(approvalToken !== undefined ? { approvalToken } : {}),
     };
     runBudget = deps.makeRunBudget?.() ?? new RunBudget();
     const rpc = deps.buildRpc(effectiveMode, runBudget, runContext);

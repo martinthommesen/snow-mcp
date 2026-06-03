@@ -92,6 +92,8 @@ async function authorize(
     hEnv,
   );
   expect(res!.status).toBe(302);
+  expect(res!.headers.get("cache-control")).toBe("no-store");
+  expect(res!.headers.get("referrer-policy")).toBe("no-referrer");
   const location = new URL(res!.headers.get("location")!);
   expect(location.host).toBe(HOST);
   expect(location.searchParams.get("code_challenge_method")).toBe("S256");
@@ -120,6 +122,8 @@ describe("§6b authorize → callback stores a per-user token", () => {
     const state = await authorize("userDance", hEnv);
     const res = await callback(state, hEnv);
     expect(res!.status).toBe(200);
+    expect(res!.headers.get("cache-control")).toBe("no-store");
+    expect(res!.headers.get("referrer-policy")).toBe("no-referrer");
     // The exchange was an authorization_code grant (NOT ROPC), then the principal was resolved.
     expect(calls.some((c) => c.grant === "authorization_code")).toBe(true);
     expect(calls.some((c) => c.grant === "password")).toBe(false);

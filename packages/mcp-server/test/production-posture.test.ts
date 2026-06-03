@@ -189,6 +189,24 @@ describe("Phase 1B production posture", () => {
     }))).toContain("WORKER_PUBLIC_ORIGIN must be a canonical HTTPS origin in production.");
   });
 
+  it("rejects loopback/private allowed origins in production", () => {
+    expect(collectPostureViolations(productionEnv({
+      ALLOWED_ORIGINS: "https://app.example.com,https://localhost",
+    }))).toContain("ALLOWED_ORIGINS entries must be canonical public HTTPS origins in production.");
+    expect(collectPostureViolations(productionEnv({
+      ALLOWED_ORIGINS: "https://192.168.1.10",
+    }))).toContain("ALLOWED_ORIGINS entries must be canonical public HTTPS origins in production.");
+  });
+
+  it("requires configured admin_script approval tokens to be strong CSPRNG secrets", () => {
+    expect(collectPostureViolations(productionEnv({
+      ADMIN_SCRIPT_APPROVAL_TOKENS: "token-1",
+    }))).toContain("ADMIN_SCRIPT_APPROVAL_TOKENS entries must be strong CSPRNG secrets.");
+    expect(collectPostureViolations(productionEnv({
+      ADMIN_SCRIPT_APPROVAL_TOKENS: STRONG_SECRET,
+    }))).toEqual([]);
+  });
+
   it("requires OIDC config and rejects the operator secret when AUTH_MODE=oidc", () => {
     expect(collectPostureViolations(productionEnv({
       AUTH_MODE: "oidc",
