@@ -98,6 +98,8 @@ export async function generatePkce(): Promise<{ verifier: string; challenge: str
 export interface SnPrincipal {
   sys_id: string;
   roles: string[];
+  user_name?: string;
+  email?: string;
 }
 
 function hasFreshPrincipal(tokens: SnTokens | null, now: number): tokens is SnTokens & { sys_id: string } {
@@ -112,7 +114,37 @@ function hasFreshPrincipal(tokens: SnTokens | null, now: number): tokens is SnTo
 function stampPrincipal(tokens: SnTokens, principal: SnPrincipal, now: number): void {
   tokens.sys_id = principal.sys_id;
   tokens.roles = principal.roles;
+  copyPrincipalIdentity(tokens, principal);
   tokens.principal_resolved_at = now;
+}
+
+function stringClaim(record: Record<string, unknown> | undefined, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function copyPrincipalIdentity(target: Pick<SnTokens, "user_name" | "email">, source: Pick<SnPrincipal, "user_name" | "email">): void {
+  if (source.user_name) target.user_name = source.user_name;
+  if (source.email) target.email = source.email;
+}
+
+function buildPrincipal(sys_id: string, roles: string[], identity: Pick<SnPrincipal, "user_name" | "email"> = {}): SnPrincipal {
+  return {
+    sys_id,
+    roles,
+    ...(identity.user_name ? { user_name: identity.user_name } : {}),
+    ...(identity.email ? { email: identity.email } : {}),
+  };
+}
+
+function carryForwardPrincipal(target: SnTokens, source: SnTokens): void {
+  if (source.sys_id) target.sys_id = source.sys_id;
+  if (source.roles) target.roles = source.roles;
+  copyPrincipalIdentity(target, source);
+  if (source.principal_resolved_at !== undefined) target.principal_resolved_at = source.principal_resolved_at;
 }
 
 /**
@@ -141,19 +173,21 @@ export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string
       { headers: auth, redirect: "manual" },
     );
     if (meRes.status >= 300 && meRes.status < 400) return null;
-    const me = (await meRes.json().catch(() => ({}))) as { result?: { user_sys_id?: string } };
-    const sys_id = me.result?.user_sys_id;
+    const me = (await meRes.json().catch(() => ({}))) as { result?: Record<string, unknown> };
+    const sys_id = stringClaim(me.result, ["user_sys_id", "sys_id"]);
     if (!sys_id) return null;
+    const user_name = stringClaim(me.result, ["user_name"]);
+    const email = stringClaim(me.result, ["email", "user_email"]);
     const roleRes = await fetchImpl(
       `https://${cfg.instanceHost}/api/now/table/sys_user_has_role?sysparm_query=user=${encodeURIComponent(sys_id)}&sysparm_fields=role.name&sysparm_limit=200`,
       { headers: auth, redirect: "manual" },
     );
-    if (roleRes.status >= 300 && roleRes.status < 400) return { sys_id, roles: [] };
+    if (roleRes.status >= 300 && roleRes.status < 400) return buildPrincipal(sys_id, [], { user_name, email });
     const rolesJson = (await roleRes.json().catch(() => ({}))) as { result?: Record<string, unknown>[] };
     const roles = (rolesJson.result ?? [])
       .map((r) => String(r["role.name"] ?? ""))
       .filter(Boolean);
-    return { sys_id, roles };
+    return buildPrincipal(sys_id, roles, { user_name, email });
   } catch {
     return null; // principal resolution is best-effort; token is still usable.
   }
@@ -172,7 +206,7 @@ export async function resolveStoredSnPrincipal(
 ): Promise<SnPrincipal | null> {
   const existing = await store.get("servicenow").catch(() => null);
   if (hasFreshPrincipal(existing, now)) {
-    return { sys_id: existing.sys_id, roles: existing.roles ?? [] };
+    return buildPrincipal(existing.sys_id, existing.roles ?? [], existing);
   }
 
   const accessToken = opts.accessToken ?? await getServiceNowBearer(cfg, store, now, "per_user_oauth", opts.authorizeUrl);
@@ -240,9 +274,7 @@ export async function getServiceNowBearer(
       // Carry forward the refresh token if the server didn't return a new one (B9), and the
       // resolved principal (sys_id/roles) so a refresh never drops the effective user.
       if (!refreshed.refresh_token && existing.refresh_token) refreshed.refresh_token = existing.refresh_token;
-      if (existing.sys_id) refreshed.sys_id = existing.sys_id;
-      if (existing.roles) refreshed.roles = existing.roles;
-      if (existing.principal_resolved_at !== undefined) refreshed.principal_resolved_at = existing.principal_resolved_at;
+      carryForwardPrincipal(refreshed, existing);
       await store.rotate("servicenow", refreshed);
       return refreshed.access_token;
     } catch {

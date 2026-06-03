@@ -7,7 +7,7 @@
 //
 //   GET /servicenow/authorize?ticket=…
 //     VERIFY the host-HMAC ticket (its only authority) + exp → generate PKCE → create a
-//     single-use AuthCorrelationDO record {userId, instanceHost, pkceVerifier,
+//     single-use AuthCorrelationDO record {userId, actorEmail?, instanceHost, pkceVerifier,
 //     expiresAt} keyed by an opaque random `state` → 302 to the instance OAuth authorize
 //     endpoint (response_type=code, PKCE S256, state).
 //
@@ -20,14 +20,15 @@
 
 import { canonicalizeInstanceHost } from "../sn/url-allowlist.js";
 import { DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
-import { verifyTicket } from "./servicenow-ticket.js";
+import { normalizeIdentityEmail, verifyTicket } from "./servicenow-ticket.js";
 import {
   authorizationCodeGrant,
   generatePkce,
   resolveSnPrincipal,
+  type SnPrincipal,
   type SnOAuthConfig,
 } from "./servicenow-oauth.js";
-import { TokenStore } from "./token-store.js";
+import { TokenStore, type SnTokens } from "./token-store.js";
 import { buildKekRing } from "./crypto.js";
 import { redactString } from "../observability/redact.js";
 import { canonicalPublicOrigin } from "./public-origin.js";
@@ -107,6 +108,21 @@ function redirectUri(origin: string): string {
   return `${origin}/servicenow/callback`;
 }
 
+function principalMatchesActorEmail(principal: SnPrincipal, actorEmail: string): boolean {
+  const expected = normalizeIdentityEmail(actorEmail);
+  if (!expected) return false;
+  return [principal.email, principal.user_name].some((value) => normalizeIdentityEmail(value) === expected);
+}
+
+function principalMatchesBinding(principal: SnPrincipal, record: AuthCorrelationRecord, existing: SnTokens | null): boolean {
+  const expectedSysId = record.expectedSnSysId ?? existing?.sys_id;
+  if (expectedSysId) return principal.sys_id === expectedSysId;
+  if (record.actorEmail) return principalMatchesActorEmail(principal, record.actorEmail);
+  // No readable existing sys_id and no actor email means the callback has no independent MCP-to-SN
+  // binding authority. Reject first-time no-email links instead of letting the SN login choose it.
+  return false;
+}
+
 async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promise<Response> {
   if (!configured(env)) return new Response("ServiceNow OAuth is not configured.", { status: 400 });
   const now = Date.now();
@@ -135,6 +151,8 @@ async function handleAuthorize(request: Request, env: CallbackHandlerEnv): Promi
   const state = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
   const record: AuthCorrelationRecord = {
     userId: ticket.userId,
+    ...(ticket.actorEmail ? { actorEmail: ticket.actorEmail } : {}),
+    ...(ticket.expectedSnSysId ? { expectedSnSysId: ticket.expectedSnSysId } : {}),
     instanceHost,
     pkceVerifier: verifier,
     expiresAt: now + CORRELATION_TTL_MS,
@@ -188,13 +206,30 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
   if (!principal) {
     return new Response("ServiceNow principal resolution failed.", { status: 400 });
   }
-  tokens.sys_id = principal.sys_id;
-  tokens.roles = principal.roles;
-  tokens.principal_resolved_at = now;
 
   const ring = await buildKekRing((env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK)!, env.TOKEN_KEK_PREV);
   const tokStub = env.TOKEN_DO.get(env.TOKEN_DO.idFromName(`${record.userId}|${instanceHost}`));
   const store = new TokenStore(tokStub, ring, record.userId, instanceHost);
+  let existing: SnTokens | null = null;
+  try {
+    existing = await store.get("servicenow");
+  } catch (e) {
+    console.warn(JSON.stringify({
+      event: "servicenow_token_binding_unreadable",
+      userId: record.userId,
+      instanceHost,
+      reason: redactString(e instanceof Error ? e.message : String(e)),
+    }));
+  }
+  if (!principalMatchesBinding(principal, record, existing)) {
+    return new Response("ServiceNow principal does not match the MCP actor binding.", { status: 403 });
+  }
+
+  tokens.sys_id = principal.sys_id;
+  tokens.roles = principal.roles;
+  if (principal.user_name) tokens.user_name = principal.user_name;
+  if (principal.email) tokens.email = principal.email;
+  tokens.principal_resolved_at = now;
   await store.put("servicenow", tokens);
 
   return new Response("ServiceNow authorization complete. You may close this window.", {

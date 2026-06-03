@@ -5,8 +5,9 @@
 const TOKEN_PATTERNS: readonly RegExp[] = [
   /\b(Bearer|Basic)\s+[A-Za-z0-9._\-+/=]{8,}/gi, // auth headers
   /\beyJ[A-Za-z0-9._\-]{10,}/g, // JWT-ish
-  /\b(?:password|secret|token|api[_-]?key|client_secret)\s*[=:]\s*[^\s,&"']+/gi,
 ];
+
+const SECRET_ASSIGNMENT = /(^|[^A-Za-z0-9_.-])([A-Za-z0-9_.-]*(?:password|secret|token|api[_-]?key|authorization)[A-Za-z0-9_.-]*)\s*[=:]\s*[^\s,&"'}\]]+/gi;
 
 /** Field names whose VALUES are always redacted in objects (case-insensitive). */
 const DENY_FIELDS = new Set(
@@ -17,6 +18,9 @@ const DENY_FIELDS = new Set(
     "token",
     "access_token",
     "refresh_token",
+    "approval_token",
+    "operator_secret",
+    "oidc_client_secret",
     "authorization",
     "hmac_secret",
     "token_kek",
@@ -27,9 +31,25 @@ const DENY_FIELDS = new Set(
 
 export const REDACTED = "[REDACTED]";
 
+function normalizeFieldName(key: string): string {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[.\-]/g, "_")
+    .toLowerCase();
+}
+
+function isDeniedField(key: string): boolean {
+  const normalized = normalizeFieldName(key);
+  if (DENY_FIELDS.has(normalized)) return true;
+  if (normalized === "authorization") return true;
+  if (normalized.includes("api_key") || normalized.includes("apikey")) return true;
+  return normalized.split("_").some((part) => part === "password" || part === "secret" || part === "token");
+}
+
 export function redactString(input: string): string {
   let out = input;
   for (const re of TOKEN_PATTERNS) out = out.replace(re, REDACTED);
+  out = out.replace(SECRET_ASSIGNMENT, (_match, prefix: string) => `${prefix}${REDACTED}`);
   return out;
 }
 
@@ -41,7 +61,7 @@ export function redactValue(value: unknown, depth = 0): unknown {
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = DENY_FIELDS.has(k.toLowerCase()) ? REDACTED : redactValue(v, depth + 1);
+      out[k] = isDeniedField(k) ? REDACTED : redactValue(v, depth + 1);
     }
     return out;
   }

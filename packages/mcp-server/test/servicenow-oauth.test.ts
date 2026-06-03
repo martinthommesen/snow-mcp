@@ -254,7 +254,7 @@ describe("§6b resolveSnPrincipal", () => {
     }) as unknown as typeof fetch;
     const cfg: SnOAuthConfig = { instanceHost: "inst1", clientId: "c", clientSecret: "s", fetchImpl };
     const principal = await resolveSnPrincipal(cfg, "BEARER");
-    expect(principal).toEqual({ sys_id: "SYS123", roles: ["itil", "admin"] });
+    expect(principal).toEqual({ sys_id: "SYS123", roles: ["itil", "admin"], user_name: "alice" });
     expect(calls).toEqual([
       expect.objectContaining({ redirect: "manual", authorization: "Bearer BEARER" }),
       expect.objectContaining({ redirect: "manual", authorization: "Bearer BEARER" }),

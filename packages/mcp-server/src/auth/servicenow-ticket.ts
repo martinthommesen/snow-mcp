@@ -1,11 +1,11 @@
 // Host-HMAC reauth ticket (plan §6b) — the identity bridge from an authenticated /mcp
 // request to the UNauthenticated /servicenow/authorize route (which has no ctx.props).
 //
-// Inside /mcp, where ctx.props.userId EXISTS, the host mints a ticket {userId, instanceHost,
-// nonce, exp} signed with a HOST secret (OAUTH_PROVIDER_SECRET, domain-separated). This ticket
-// string is the `authorizeUrl` the reauth_required carries (P2 detail channel). At
-// /servicenow/authorize the host VERIFIES this signature + exp — it is the route's ONLY
-// identity authority; nothing client-supplied at that route is trusted.
+// Inside /mcp, where ctx.props.userId EXISTS, the host mints a ticket {userId, actorEmail?,
+// instanceHost, nonce, exp} signed with a HOST secret (OAUTH_PROVIDER_SECRET, domain-separated).
+// This ticket string is the `authorizeUrl` the reauth_required carries (P2 detail channel). At
+// /servicenow/authorize the host VERIFIES this signature + exp — it is the route's ONLY identity
+// authority; nothing client-supplied at that route is trusted.
 //
 // Reuses the HMAC-SHA256 primitive from auth/actor.ts. The secret is derived to 32 raw bytes
 // via SHA-256 (auth/crypto.ts deriveKeyBytes), so any passphrase works as the HMAC key.
@@ -20,12 +20,18 @@ const TICKET_CONTEXT = "sn-oauth-reauth-ticket\n";
 
 export interface ReauthTicket {
   userId: string;
+  actorEmail?: string;
   instanceHost: string;
   nonce: string;
+  expectedSnSysId?: string;
   exp: number; // epoch ms
 }
 
 const enc = new TextEncoder();
+
+export function normalizeIdentityEmail(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
 
 /** The canonical bytes that get HMAC'd: a domain prefix + the base64url JSON payload. */
 function canonical(payloadB64Url: string): string {
@@ -39,7 +45,16 @@ function canonical(payloadB64Url: string): string {
  */
 export async function mintTicket(ticket: ReauthTicket, secret: string): Promise<string> {
   const keyBytes = await deriveKeyBytes(secret);
-  const payloadB64Url = bytesToBase64Url(enc.encode(JSON.stringify(ticket)));
+  const actorEmail = normalizeIdentityEmail(ticket.actorEmail);
+  const normalized = {
+    userId: ticket.userId,
+    ...(actorEmail ? { actorEmail } : {}),
+    instanceHost: ticket.instanceHost,
+    nonce: ticket.nonce,
+    ...(ticket.expectedSnSysId?.trim() ? { expectedSnSysId: ticket.expectedSnSysId.trim() } : {}),
+    exp: ticket.exp,
+  } satisfies ReauthTicket;
+  const payloadB64Url = bytesToBase64Url(enc.encode(JSON.stringify(normalized)));
   const sig = await hmacSha256Base64(canonical(payloadB64Url), keyBytes);
   return `${payloadB64Url}.${bytesToBase64Url(enc.encode(sig))}`;
 }
@@ -71,7 +86,13 @@ export async function verifyTicket(token: string, secret: string, now: number): 
     return null;
   }
   if (typeof ticket.exp !== "number" || now > ticket.exp) return null;
-  if (typeof ticket.userId !== "string" || typeof ticket.instanceHost !== "string" || typeof ticket.nonce !== "string") return null;
+  if (
+    typeof ticket.userId !== "string" ||
+    typeof ticket.instanceHost !== "string" ||
+    typeof ticket.nonce !== "string"
+  ) return null;
   if (!ticket.userId || !ticket.instanceHost || !ticket.nonce) return null;
+  if (ticket.actorEmail !== undefined && (typeof ticket.actorEmail !== "string" || !normalizeIdentityEmail(ticket.actorEmail))) return null;
+  if (ticket.expectedSnSysId !== undefined && (typeof ticket.expectedSnSysId !== "string" || ticket.expectedSnSysId.trim() === "")) return null;
   return ticket;
 }

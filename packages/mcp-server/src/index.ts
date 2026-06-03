@@ -9,6 +9,16 @@ import { canonicalPublicOrigin } from "./auth/public-origin.js";
 import type { Mode } from "@servicenow-codemode/shared";
 import { isValidMode } from "@servicenow-codemode/shared";
 import { redactString } from "./observability/redact.js";
+import {
+  assertProductionPostureOnce,
+  collectPostureViolations,
+  parseDeploymentProfile,
+  ProductionPostureError,
+  type PostureEnv,
+} from "./authz/production-posture-core.js";
+import { oidcAccessTokenProps, oidcAuthorizationCodeTokenResult, refreshOidcGrantProps } from "./auth/oidc.js";
+import { SUPPORTED_SCOPES } from "./auth/mcp-scopes.js";
+import { sourceIpRateLimited, type ConsentRateNamespace } from "./auth/rate-limit.js";
 
 // Durable Objects must be exported from the entry module (plan §2.10).
 export { AuthCorrelationDO } from "./do/auth-correlation.js";
@@ -29,9 +39,8 @@ export interface Env {
   TOKEN_DO: DurableObjectNamespace;
   BUDGET_DO: DurableObjectNamespace;
   LEDGER_DO: DurableObjectNamespace;
-  // Consent-write rate limiter (finding 4). Optional: when unbound (older config/tests), the
-  // GET /authorize admission check is skipped — wire it in wrangler.jsonc to enable.
-  CONSENT_RATE_DO?: DurableObjectNamespace<import("./do/consent-rate.js").ConsentRateDO>;
+  // Consent-write rate limiter (finding 4). Missing binding fails closed on consent/registration.
+  CONSENT_RATE_DO?: ConsentRateNamespace;
   ALLOWED_ORIGINS?: string;
   // I-1: pin the worker's public origin for OAuth redirect_uri / reauth URLs instead of deriving
   // it from the request Host. Required when SERVICENOW_CREDENTIAL_MODE=per_user_oauth.
@@ -40,12 +49,14 @@ export interface Env {
   MCP_OPERATOR_USER_ID?: string;
   MCP_OPERATOR_EMAIL?: string;
   MCP_OPERATOR_ACCESS_GROUPS?: string;
+  AUTH_MODE?: string;
   SNOW_INSTANCE_HOST?: string;
   SNOW_DEV_ROPC?: string;
   SNOW_DEV_ROPC_USERNAME?: string;
   SNOW_DEV_ROPC_PASSWORD?: string;
   SNOW_OAUTH_CLIENT_ID?: string;
   SNOW_OAUTH_CLIENT_SECRET?: string;
+  SNOW_EXECUTOR_PATH?: string;
   X_MCP_EXECUTOR_HMAC_KEY?: string;
   TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
   OAUTH_PROVIDER_SECRET?: string;
@@ -57,6 +68,8 @@ export interface Env {
   SNAPSHOT_KEK_PREV?: string;
   // Credential mode (P6) + ceilings (P5) + origin gate (P6a). All optional in P0.
   SERVICENOW_CREDENTIAL_MODE?: string;
+  DEPLOYMENT_PROFILE?: string;
+  ALLOW_ADMIN_SCRIPT_CEILING?: string;
   ALLOW_LOCALHOST?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
@@ -75,6 +88,16 @@ export interface Env {
   ACTOR_POLICY_MAX_ROWS_PER_RUN?: string;
   ACTOR_POLICY_MAX_BYTES_PER_RUN?: string;
   ACTOR_POLICY_MAX_MODE?: Mode;
+  ACTOR_POLICIES_JSON?: string;
+  OIDC_ISSUER?: string;
+  OIDC_CLIENT_ID?: string;
+  OIDC_CLIENT_SECRET?: string;
+  OIDC_SCOPES?: string;
+  OIDC_GROUP_CLAIM?: string;
+  OIDC_GROUP_POLICY_MAP?: string;
+  OIDC_DEFAULT_POLICY_NAME?: string;
+  GIT_COMMIT_SHA?: string;
+  BUILD_TIMESTAMP?: string;
 }
 
 function originConfig(env: Env): OriginConfig {
@@ -95,8 +118,63 @@ function isAuthSurfacePath(pathname: string): boolean {
     pathname === "/authorize" ||
     pathname === "/oauth/token" ||
     pathname === "/oauth/register" ||
+    pathname.startsWith("/oidc/") ||
     pathname.startsWith("/servicenow/")
   );
+}
+
+function oauthAuthorizationServerMetadataRequest(request: Request): Request {
+  const url = new URL(request.url);
+  url.pathname = "/.well-known/oauth-authorization-server";
+  return new Request(url, request);
+}
+
+const serviceName = "servicenow-codemode-mcp";
+const appVersion = "0.1.0";
+const workerCompatibilityDate = "2026-05-13";
+
+function healthLive(): Response {
+  return Response.json({ ok: true, service: serviceName });
+}
+
+function healthReady(env: Env): Response {
+  const violations = collectPostureViolations(env as PostureEnv);
+  const ok = violations.length === 0;
+  return Response.json(
+    {
+      ok,
+      service: serviceName,
+      profile: parseDeploymentProfile(env.DEPLOYMENT_PROFILE) ?? "invalid",
+      ...(ok ? { violations: [] } : { violationCount: violations.length }),
+    },
+    { status: ok ? 200 : 503 },
+  );
+}
+
+function productionPostureResponse(error: ProductionPostureError, includeViolations: boolean): Response {
+  return Response.json(
+    {
+      error: "production_posture",
+      ...(includeViolations ? { violations: error.violations } : { violationCount: error.violations.length }),
+    },
+    { status: 503 },
+  );
+}
+
+function healthVersion(env: Env): Response {
+  return Response.json({
+    ok: true,
+    service: serviceName,
+    appVersion,
+    compatibilityDate: workerCompatibilityDate,
+    commitSha: env.GIT_COMMIT_SHA ?? null,
+    buildTimestamp: env.BUILD_TIMESTAMP ?? null,
+  });
+}
+
+async function registrationRateLimitResponse(request: Request, env: Env): Promise<Response | undefined> {
+  if (!(await sourceIpRateLimited(request, env.CONSENT_RATE_DO, "registration-rate"))) return undefined;
+  return Response.json({ error: "rate_limited" }, { status: 429 });
 }
 
 export function authenticatedUserId(props: Record<string, unknown>): string | undefined {
@@ -110,6 +188,7 @@ const apiHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       if (!isOriginAllowed(request, originConfig(env))) return originDeniedResponse();
+      assertProductionPostureOnce(env as PostureEnv);
       const props = ((ctx as { props?: unknown }).props as Record<string, unknown>) ?? {};
       // I-3: validate (not just null-coalesce) — a set-but-invalid maxMode falls back to read_only,
       // consistent with parseMaxMode/loadActorPolicy. modeRisk would already block escalation, but
@@ -132,6 +211,9 @@ const apiHandler = {
         authContext: { props },
       })(request, env, ctx);
     } catch (e) {
+      if (e instanceof ProductionPostureError) {
+        return productionPostureResponse(e, true);
+      }
       // Fail closed with a generic message (never leak internals); detail to the log only.
       // I-5: redact the logged message (matches sn/errors.ts) so a secret-bearing error can't reach
       // server logs unscrubbed.
@@ -141,19 +223,43 @@ const apiHandler = {
   },
 };
 
-// The OAuthProvider wraps the Worker: it implements /authorize metadata, /oauth/token,
-// /oauth/register, validates tokens on /mcp, and routes everything else to the consent
-// handler. No valid token on /mcp -> 401 (plan §2.4, §7.8; closes the open-endpoint gap).
-const provider = new OAuthProvider({
-  apiRoute: "/mcp",
-  apiHandler,
-  defaultHandler: serviceNowAuthHandler as never,
-  authorizeEndpoint: "/authorize",
-  tokenEndpoint: "/oauth/token",
-  clientRegistrationEndpoint: "/oauth/register",
-  scopesSupported: ["servicenow:read", "servicenow:write", "servicenow:admin_script"],
-  allowPlainPKCE: false,
-});
+// Memoized per `env` (i.e. per isolate): the provider is built inside fetch() only so
+// tokenExchangeCallback can close over `env`, but its config is otherwise constant — so cache it
+// rather than reconstruct on every request. (Same WeakMap-per-env pattern as assertProductionPostureOnce.)
+const providerCache = new WeakMap<Env, OAuthProvider<Env>>();
+
+function providerForEnv(env: Env): OAuthProvider<Env> {
+  const cached = providerCache.get(env);
+  if (cached) return cached;
+  // The OAuthProvider wraps the Worker: it implements /authorize metadata, /oauth/token,
+  // /oauth/register, validates tokens on /mcp, and routes everything else to the consent/OIDC
+  // handler. No valid token on /mcp -> 401 (plan §2.4, §7.8; closes the open-endpoint gap).
+  const provider = new OAuthProvider<Env>({
+    apiRoute: "/mcp",
+    apiHandler,
+    defaultHandler: serviceNowAuthHandler as never,
+    authorizeEndpoint: "/authorize",
+    tokenEndpoint: "/oauth/token",
+    clientRegistrationEndpoint: "/oauth/register",
+    scopesSupported: [...SUPPORTED_SCOPES],
+    allowPlainPKCE: false,
+    tokenExchangeCallback: async (options: { grantType: string; scope: string[]; requestedScope?: string[]; props: unknown }) => {
+      const props = (options.props && typeof options.props === "object" ? options.props : {}) as Record<string, unknown>;
+      if (props.authMode !== "oidc") return undefined;
+      const requestedScope = options.requestedScope ?? options.scope;
+      if (options.grantType === "authorization_code") {
+        return oidcAuthorizationCodeTokenResult(props, requestedScope);
+      }
+      if (options.grantType === "refresh_token") {
+        const refreshed = await refreshOidcGrantProps(env, props, options.scope);
+        return refreshed ? { newProps: refreshed.grantProps, accessTokenProps: oidcAccessTokenProps(refreshed.grantProps, requestedScope) } : undefined;
+      }
+      return undefined;
+    },
+  });
+  providerCache.set(env, provider);
+  return provider;
+}
 
 // Top-level fetch wrapper (plan §P6a, finding 32): run the Origin guard on the auth-surface
 // paths (which OAuthProvider routes BEFORE apiHandler, so they would otherwise be unchecked)
@@ -166,8 +272,23 @@ export default {
       // MissingOAuthKvError (unbound OAUTH_KV) from provider.fetch is caught below -> 500,
       // mirroring apiHandler's catch (plan §P6a, finding 36).
       const url = new URL(request.url);
+      if (url.pathname === "/health" || url.pathname === "/health/live") return healthLive();
+      if (url.pathname === "/health/ready") return healthReady(env);
+      if (url.pathname === "/health/version") return healthVersion(env);
+      const provider = providerForEnv(env);
+      // Some MCP clients discover OAuth authorization-server metadata at the path-scoped
+      // RFC 8414 URL for the protected resource (`/.well-known/oauth-authorization-server/mcp`).
+      // workers-oauth-provider serves the root metadata URL; delegate there so both forms match.
+      if (url.pathname === "/.well-known/oauth-authorization-server/mcp") {
+        return await provider.fetch(oauthAuthorizationServerMetadataRequest(request), env, ctx);
+      }
+      if (url.pathname !== "/mcp") assertProductionPostureOnce(env as PostureEnv);
       if (isAuthSurfacePath(url.pathname) && !isOriginAllowed(request, originConfig(env))) {
         return originDeniedResponse();
+      }
+      if (url.pathname === "/oauth/register" && request.method === "POST") {
+        const limited = await registrationRateLimitResponse(request, env);
+        if (limited) return limited;
       }
       // Per-user ServiceNow OAuth routes (§6b) live OUTSIDE /mcp and are NOT served by the
       // OAuthProvider's defaultHandler — route them here (behind the origin guard above), and
@@ -179,6 +300,9 @@ export default {
       }
       return await provider.fetch(request, env, ctx);
     } catch (e) {
+      if (e instanceof ProductionPostureError) {
+        return productionPostureResponse(e, false);
+      }
       console.error("top-level fetch error:", redactString(e instanceof Error ? e.message : String(e)));
       return Response.json({ error: "internal_error" }, { status: 500 });
     }

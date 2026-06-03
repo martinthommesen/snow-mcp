@@ -14,6 +14,14 @@ SNOW_DEV_ROPC_PASSWORD=""
 
 # --- MCP-client OAuth provider (§2.4) ---
 OAUTH_PROVIDER_SECRET=""             # signing/encryption secret for @cloudflare/workers-oauth-provider
+AUTH_MODE="operator_secret"          # "operator_secret" (pilot/dev) | "oidc" (enterprise identity)
+OIDC_ISSUER=""                       # issuer URL when AUTH_MODE=oidc
+OIDC_CLIENT_ID=""
+OIDC_CLIENT_SECRET=""
+OIDC_SCOPES="openid profile email offline_access" # offline_access lets the Worker refresh and re-check groups before MCP refresh tokens are renewed.
+OIDC_GROUP_CLAIM="groups"
+OIDC_GROUP_POLICY_MAP=""             # JSON: {"group":{"maxMode":"write","policy":"default"}}
+OIDC_DEFAULT_POLICY_NAME="default"
 
 # --- Encryption keys (§2.7, §7.7) ---
 TOKEN_KEK=""                         # one-release alias for TOKEN_KEK_CURRENT (P3 migration)
@@ -25,10 +33,12 @@ TOKEN_KEK_PREV=""                    # accepted during a rotation window (option
 SNAPSHOT_KEK_CURRENT=""              # AES-256-GCM KEK for recovery snapshots (current)
 SNAPSHOT_KEK_PREV=""                 # accepted during a rotation window (optional)
 
-# --- Mode / credential config (P5/P6) ---
+# --- Deployment posture + mode / credential config (P5/P6) ---
+DEPLOYMENT_PROFILE="pilot"           # "pilot" preserves today's permissive defaults; "production" enables fail-closed preflight
 SERVICENOW_CREDENTIAL_MODE=""        # "per_user_oauth" | "integration_user" (default integration_user)
 TENANT_MAX_MODE=""                   # mode ceiling: read_only | write | admin_script (default admin_script)
 INSTANCE_MAX_MODE=""                 # mode ceiling: read_only | write | admin_script (default admin_script)
+ALLOW_ADMIN_SCRIPT_CEILING=""        # production only: "true" deliberately permits an admin_script tenant/instance ceiling
 ALLOW_LOCALHOST=""                   # "true" to allow http://localhost Origin (dev only; default false)
 ALLOWED_ORIGINS=""                   # comma-separated allowed Origins for /mcp and auth-surface requests
 WORKER_PUBLIC_ORIGIN=""              # canonical https://<worker> origin; required for per_user_oauth redirect/ticket URLs
@@ -42,16 +52,17 @@ ADMIN_SCRIPT_APPROVAL_TOKENS=""      # comma-separated valid approval tokens
 ADMIN_SCRIPT_REQUIRED_GROUP=""       # required access-group name (token OR group satisfies the second approval)
 
 # --- Restrictive ActorPolicy (§6b) ---
-# NON-BREAKING: leave ALL empty to keep the permissive single-operator default (today's live
-# deployment is unchanged). Set ANY var to build a RESTRICTIVE host-side policy. The values below
-# are a RECOMMENDED conservative example (commented out) — uncomment + tailor per tenant. A
-# self-defeating mandatory row filter (one containing ^NQ/^OR/^EQ) is REJECTED at load (fail-closed).
+# PILOT: leave ALL empty to keep the permissive single-operator default. PRODUCTION:
+# configure a restrictive host-side policy or the production posture preflight fails closed.
+# The values below are a RECOMMENDED conservative example (commented out) — uncomment + tailor
+# per tenant. A self-defeating mandatory row filter (one containing ^NQ/^OR/^EQ) is REJECTED at load.
 # ACTOR_POLICY_TABLE_ALLOWLIST="incident,problem,change_request,task,sc_request"   # only these tables (whole-name match)
 # ACTOR_POLICY_FIELD_MASKS="incident:caller_id,u_ssn;sys_user:vip"                  # table:field,field;table:field (stripped from reads, rejected on writes; dot-aware)
 # ACTOR_POLICY_ROW_FILTERS="incident:active=true"                                   # table:encodedQuery;table:encodedQuery (AND-ed into every read; no ^NQ/^OR/^EQ)
 # ACTOR_POLICY_MAX_ROWS_PER_RUN="10000"                                             # per-run row ceiling (RunBudget enforces → budget_exceeded)
 # ACTOR_POLICY_MAX_BYTES_PER_RUN="5000000"                                          # per-run byte ceiling
-# ACTOR_POLICY_MAX_MODE="read_only"                                                 # highest mode this actor may request (read_only | write | admin_script)
+# ACTOR_POLICY_MAX_MODE="read_only"                                                 # flat default policy max mode (read_only | write | admin_script)
+# ACTOR_POLICIES_JSON='{"default":{"ACTOR_POLICY_TABLE_ALLOWLIST":"incident","ACTOR_POLICY_MAX_MODE":"read_only"},"admin":{"ACTOR_POLICY_TABLE_ALLOWLIST":"incident,problem","ACTOR_POLICY_MAX_MODE":"write"}}'
 
 # --- Executor actor-signing HMAC (§2.0) ---
 # Mirror this value to the ServiceNow property `x_1793136_mcp.executor.hmac_secret` on the instance.
