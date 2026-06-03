@@ -1,6 +1,6 @@
 // Verify the PRODUCTION scoped app (x_1793136_mcp, installed via now-sdk + Fluent):
 // S8 role-gating (no role -> 403), then B1 valid/forged after assigning the role.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { canonicalize, hmacSha256Base64, sha256Base64 } from "../packages/mcp-server/dist/auth/actor.js";
 import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
 
@@ -16,6 +16,8 @@ function assertApiPath(p) {
 }
 
 function dv(k) {
+  if (process.env[k]) return process.env[k];
+  if (!existsSync(".dev.vars")) return undefined;
   for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
     const t = l.trim();
     if (t.startsWith(`${k}=`)) { let v = t.slice(k.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
@@ -33,6 +35,10 @@ const ENDPOINT = `https://${host}${assertApiPath(dv("SNOW_EXECUTOR_PATH") || "/a
 const h = { authorization: basic, accept: "application/json" };
 const NONCE_PURGE_JOB_NAME = "MCP Nonce Purge";
 const NONCE_PURGE_RUN_PERIOD = "1970-01-01 00:15:00";
+const EXECUTOR_TOGGLE_NAMES = [
+  "x_1793136_mcp.executor.enabled",
+  "x_1793136_mcp.executor.run_server_script_enabled",
+];
 
 async function api(method, path, body) {
   const r = await fetch(`https://${host}${path}`, { method, headers: { ...h, ...(body ? { "content-type": "application/json" } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
@@ -44,6 +50,26 @@ async function apiOk(method, path, body) {
     throw new Error(`${method} ${path} failed with HTTP ${res.status}: ${JSON.stringify(res.json)}`);
   }
   return res;
+}
+async function getProperty(name) {
+  const query = encodeURIComponent(`name=${name}`);
+  const row = (await apiOk("GET", `/api/now/table/sys_properties?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,name,value`)).json?.result?.[0];
+  if (!row?.sys_id) throw new Error(`Required executor property ${name} is missing; install the scoped app and run scripts/executor-install.mjs first.`);
+  return { name, sys_id: row.sys_id, value: String(row.value ?? "") };
+}
+async function setPropertyValue(prop, value) {
+  await apiOk("PATCH", `/api/now/table/sys_properties/${prop.sys_id}`, { value });
+}
+async function enableExecutorTogglesForVerify() {
+  const props = [];
+  for (const name of EXECUTOR_TOGGLE_NAMES) props.push(await getProperty(name));
+  for (const prop of props) {
+    if (prop.value !== "true") await setPropertyValue(prop, "true");
+  }
+  return props;
+}
+async function restoreExecutorToggles(props) {
+  for (const prop of props) await setPropertyValue(prop, prop.value);
 }
 async function signed(script, opts = {}) {
   const actor = {
@@ -104,6 +130,7 @@ async function grantAdminExecutorRole() {
 // the starting state in finally so an interrupted failed verify does not leave prod access changed.
 const existing = await currentAdminExecutorRoles();
 const hadExecutorRole = existing.length > 0;
+let executorToggleSnapshot = [];
 let cleanupFailed = false;
 
 try {
@@ -135,6 +162,10 @@ for (const deadPath of ["/api/1793136/x_mcp/executor/run", "/api/x_mcp/executor/
   check(`S8b — GLOBAL shadow endpoint is RETIRED (${deadPath} is dead)`,
     r.status === 404 || r.status === 400, `(status ${r.status} — must be 404/400, never 200)`);
 }
+
+// Fresh installs deliberately default both kill switches off. Enable them only for this live
+// verification window, then restore the operator's starting values in finally.
+executorToggleSnapshot = await enableExecutorTogglesForVerify();
 
 // Assign the role to admin (so the broad-identity call is also role-authorized), then execute.
 await grantAdminExecutorRole();
@@ -282,6 +313,12 @@ skip("SIGNED reason persisted in x_1793136_mcp_audit_log.reason column", "scoped
 }
 
 } finally {
+  try {
+    if (executorToggleSnapshot.length) await restoreExecutorToggles(executorToggleSnapshot);
+  } catch (e) {
+    cleanupFailed = true;
+    console.error("FAILED to restore executor kill-switch properties:", e instanceof Error ? e.message : String(e));
+  }
   try {
     await removeAdminExecutorRole();
     if (hadExecutorRole) await grantAdminExecutorRole();
