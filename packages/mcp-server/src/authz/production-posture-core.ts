@@ -1,4 +1,4 @@
-type Mode = "read_only" | "write" | "admin_script";
+import { parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
 
 export type DeploymentProfile = "pilot" | "production";
 
@@ -461,8 +461,10 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   if (env.SERVICENOW_CREDENTIAL_MODE !== "per_user_oauth") {
     violations.push('SERVICENOW_CREDENTIAL_MODE must be "per_user_oauth" in production.');
   }
-  const authMode = env.AUTH_MODE?.trim() || "operator_secret";
-  if (authMode !== "operator_secret" && authMode !== "oidc") {
+  let authMode: AuthMode | undefined;
+  try {
+    authMode = parseAuthMode(env.AUTH_MODE);
+  } catch {
     violations.push('AUTH_MODE must be "operator_secret" or "oidc".');
   }
   if (!hasText(env.SNOW_OAUTH_CLIENT_ID)) violations.push("SNOW_OAUTH_CLIENT_ID is required in production.");
@@ -483,7 +485,7 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     if (!hasText(env.OIDC_CLIENT_SECRET)) violations.push("OIDC_CLIENT_SECRET is required when AUTH_MODE=oidc.");
     if (!hasText(env.OIDC_GROUP_POLICY_MAP)) violations.push("OIDC_GROUP_POLICY_MAP is required when AUTH_MODE=oidc.");
     validateOidcPolicyReferences(violations, env, actorPolicyNames);
-  } else {
+  } else if (authMode === "operator_secret") {
     if (!hasText(env.MCP_OPERATOR_USER_ID)) violations.push("MCP_OPERATOR_USER_ID is required while operator-secret consent is active.");
     requireStrongSecret(violations, "MCP_OPERATOR_SECRET", env.MCP_OPERATOR_SECRET);
   }

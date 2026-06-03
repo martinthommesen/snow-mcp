@@ -154,7 +154,18 @@ export interface HostSignals {
 function isPostSendUnknown(err: unknown): boolean {
   if (err instanceof McpToolError) {
     if (err.code === "budget_exceeded" && err.detail?.dimension === "outboundBytesSent") return false;
-    return !(err.code === "reauth_required" || err.code === "actor_policy_denied" || err.code === "capability_denied");
+    switch (err.code) {
+      case "reauth_required":
+      case "actor_policy_denied":
+      case "capability_denied":
+      case "table_not_found":
+      case "path_denied":
+      case "precondition_required":
+      case "code_size":
+        return false;
+      default:
+        return true;
+    }
   }
   return true; // transport error / abort / unknown — could have applied.
 }
@@ -522,13 +533,13 @@ export class ServiceNowRPC {
     if (!this.deps.signing) {
       // The executor call is ALWAYS host-signed when the executor is configured (orthogonal to
       // credential mode — see the method header). No signing config => the executor is unwired.
-      throw new Error("runServerScript requires signed-actor configuration (executor not configured).");
+      throw new McpToolError("internal_error", "runServerScript requires signed-actor configuration (executor not configured).");
     }
     // I-6: a security-critical egress target must fail CLOSED, never silently fall back to a
     // hardcoded guess. Require the configured executor path here (handlers gates executorReady on
     // SNOW_EXECUTOR_PATH, so this is set in every wired deployment).
     if (!this.deps.executorPath) {
-      throw new Error("runServerScript requires executorPath (executor not configured).");
+      throw new McpToolError("internal_error", "runServerScript requires executorPath (executor not configured).");
     }
     const executorPath = this.deps.executorPath;
     const signing = this.deps.signing;

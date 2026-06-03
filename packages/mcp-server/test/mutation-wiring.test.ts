@@ -44,6 +44,14 @@ function realLedger(runKey: string): (ordinal: number) => LedgerHandle {
   };
 }
 
+async function ledgerStatus(runKey: string, ordinal = 1): Promise<string> {
+  const ns = E.LEDGER_DO;
+  const stub = ns.get(ns.idFromName(mutationLedgerObjectName({ userId: "userA", instanceHost: INSTANCE, runKey, ordinal }))) as unknown as {
+    status(): Promise<string>;
+  };
+  return stub.status();
+}
+
 const SIGNING = {
   claims: {
     mcp_actor_user_id: "userA", mcp_actor_email: "a@x.com", snow_effective_user_sys_id: "",
@@ -232,6 +240,28 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const ok = await r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     expect(ok).toMatchObject({ updated: true });
     expect(http2.calls.filter((c) => c.method === "PATCH")).toHaveLength(1);
+  });
+
+  it("a ServiceNow 404 tableUpdate rejection is a clean failed ledger entry, not indeterminate", async () => {
+    const runKey = `clean-404-${crypto.randomUUID()}`;
+    const http = new MockHttp();
+    http.patchHandler = () => ({ status: 404, json: { error: { message: "No Record found" } } });
+    const r = rpc({ http, mutation: mutationDeps({ runContext: { requestId: "r-clean-404", runKey }, ledger: realLedger(runKey) }) });
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toMatchObject({
+      code: "table_not_found",
+    });
+    expect(await ledgerStatus(runKey)).toBe("failed");
+  });
+
+  it("a ServiceNow 400 tableUpdate rejection is a clean failed ledger entry, not indeterminate", async () => {
+    const runKey = `clean-400-${crypto.randomUUID()}`;
+    const http = new MockHttp();
+    http.patchHandler = () => ({ status: 400, json: { error: { message: "invalid query detail" } } });
+    const r = rpc({ http, mutation: mutationDeps({ runContext: { requestId: "r-clean-400", runKey }, ledger: realLedger(runKey) }) });
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toMatchObject({
+      code: "path_denied",
+    });
+    expect(await ledgerStatus(runKey)).toBe("failed");
   });
 
   it("a DIVERGENT retry under the same run key:ordinal is a conflict (blocked)", async () => {
@@ -878,6 +908,47 @@ describe("P4 — second-approval gate wired into runServerScript", () => {
     });
     await expect(r2.runServerScript({ script: SCRIPT })).resolves.toMatchObject({ ok: true });
     expect(http2.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it("treats executor code_size 413s as clean failures so the ledger is retryable", async () => {
+    const runKey = `script-code-size-${crypto.randomUUID()}`;
+    const http = new MockHttp();
+    http.postHandler = () => ({ status: 413, json: { error: "code_size" } });
+    const r = rpc({
+      http, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-script-code-size", runKey, reason: "rotate" },
+        ledger: realLedger(runKey),
+        approval: APPROVED,
+      }),
+    });
+    await expect(r.runServerScript({ script: SCRIPT })).rejects.toMatchObject({ code: "code_size" });
+    expect(await ledgerStatus(runKey)).toBe("failed");
+  });
+
+  it("raises typed internal_error when runServerScript signing is not configured", async () => {
+    const http = new MockHttp();
+    const r = rpc({
+      http, mode: "admin_script",
+      mutation: mutationDeps({ runContext: { requestId: "r-script-no-signing", runKey: "k1", reason: "rotate" } }),
+    });
+    await expect(r.runServerScript({ script: SCRIPT })).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("raises typed internal_error when runServerScript executorPath is not configured", async () => {
+    const http = new MockHttp();
+    const r = new ServiceNowRPC({
+      http,
+      instanceHost: INSTANCE,
+      effectiveMode: "admin_script",
+      actorPolicy: permissivePolicy([INSTANCE]),
+      runBudget: new RunBudget(),
+      signing: SIGNING,
+      mutation: mutationDeps({ runContext: { requestId: "r-script-no-path", runKey: "k1", reason: "rotate" } }),
+    });
+    await expect(r.runServerScript({ script: SCRIPT })).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 
   it("FAILS CLOSED with NO approval policy configured (empty policy denies admin_script)", async () => {

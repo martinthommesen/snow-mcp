@@ -219,7 +219,7 @@ describe("Phase 1B production posture", () => {
     ]));
 
     expect(collectPostureViolations(productionEnv({
-      AUTH_MODE: "oidc",
+      AUTH_MODE: "oidc ",
       MCP_OPERATOR_SECRET: undefined,
       MCP_OPERATOR_USER_ID: undefined,
       OIDC_ISSUER: "https://idp.example.com",
@@ -228,6 +228,14 @@ describe("Phase 1B production posture", () => {
       OIDC_GROUP_POLICY_MAP: "{\"admins\":{\"maxMode\":\"write\",\"policy\":\"admin\"}}",
       ACTOR_POLICIES_JSON: "{\"admin\":{\"ACTOR_POLICY_TABLE_ALLOWLIST\":\"incident\",\"ACTOR_POLICY_MAX_MODE\":\"write\"}}",
     }))).toEqual([]);
+  });
+
+  it("rejects invalid AUTH_MODE values instead of applying operator-secret defaults", () => {
+    expect(collectPostureViolations(productionEnv({
+      AUTH_MODE: "oidcish",
+      MCP_OPERATOR_SECRET: undefined,
+      MCP_OPERATOR_USER_ID: undefined,
+    }))).toContain('AUTH_MODE must be "operator_secret" or "oidc".');
   });
 
   it("validates OIDC group policy references against named ActorPolicies", () => {

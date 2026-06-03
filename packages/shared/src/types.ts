@@ -26,6 +26,15 @@ export function modeRisk(value: Mode): number {
   return isValidMode(value) ? MODE_RISK[value] : Number.POSITIVE_INFINITY;
 }
 
+export type AuthMode = "operator_secret" | "oidc";
+
+export function parseAuthMode(value: string | undefined): AuthMode {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed === "operator_secret") return "operator_secret";
+  if (trimmed === "oidc") return "oidc";
+  throw new Error('AUTH_MODE must be "operator_secret" or "oidc".');
+}
+
 /** Typed error codes surfaced to MCP clients (plan §1.6, §3.x). */
 export type ErrorCode =
   | "capability_denied"

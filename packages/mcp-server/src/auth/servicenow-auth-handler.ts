@@ -17,6 +17,7 @@ import {
   oidcEnabled,
   oidcPropsFromCode,
   oidcStateTtlMs,
+  parseAuthMode,
   type OidcEnv,
 } from "./oidc.js";
 import type {
@@ -68,26 +69,41 @@ interface AuthCorrelationNamespace {
  *  nonce. Short TTL: a consent flow that isn't completed promptly is abandoned (plan §P6a). */
 const CONSENT_KEY_PREFIX = "consent:";
 const CONSENT_TTL_SECONDS = 600; // 10 minutes to complete the operator-secret consent.
+const AUTH_BROWSER_HEADERS = {
+  "cache-control": "no-store",
+  pragma: "no-cache",
+  "referrer-policy": "no-referrer",
+  "x-content-type-options": "nosniff",
+};
 const CONSENT_HTML_HEADERS = {
+  ...AUTH_BROWSER_HEADERS,
   "content-type": "text/html; charset=utf-8",
   "content-security-policy": "frame-ancestors 'none'",
   "x-frame-options": "DENY",
 };
 
+function authText(body: string, status: number): Response {
+  return new Response(body, { status, headers: AUTH_BROWSER_HEADERS });
+}
+
+function authRedirect(location: string, status = 302): Response {
+  return new Response(null, { status, headers: { ...AUTH_BROWSER_HEADERS, location } });
+}
+
 function unsupportedScopesResponse(): Response {
-  return new Response("No supported ServiceNow OAuth scopes requested.", { status: 400 });
+  return authText("No supported ServiceNow OAuth scopes requested.", 400);
 }
 
 function requireS256Pkce(oauth: AuthRequestInfo): Response | undefined {
   if (oauth.codeChallengeMethod !== "S256" || !oauth.codeChallenge?.trim()) {
-    return new Response("PKCE S256 code_challenge is required.", { status: 400 });
+    return authText("PKCE S256 code_challenge is required.", 400);
   }
   return undefined;
 }
 
 async function consentRateLimitResponse(request: Request, env: HandlerEnv): Promise<Response | undefined> {
   if (!(await sourceIpRateLimited(request, env.CONSENT_RATE_DO, "consent-rate"))) return undefined;
-  return new Response("Too many authorization requests; try again shortly.", { status: 429 });
+  return authText("Too many authorization requests; try again shortly.", 429);
 }
 
 interface PreparedAuthorizationRequest {
@@ -110,7 +126,7 @@ async function prepareAuthorizationRequest(
   // window before any consent state is minted. Key by IP, not client_id; dynamic client
   // registration makes client_id-keyed limits bypassable and unbounded in memory.
   const client = await env.OAUTH_PROVIDER.lookupClient(oauth.clientId);
-  if (!client) return new Response("Unknown OAuth client.", { status: 400 });
+  if (!client) return authText("Unknown OAuth client.", 400);
   const limited = await consentRateLimitResponse(request, env);
   if (limited) return limited;
 
@@ -200,7 +216,7 @@ ${record.grantedScopes.map((s) => `<div class="s">${esc(s)}</div>`).join("")}
 }
 
 async function handleOidcAuthorize(request: Request, env: HandlerEnv): Promise<Response> {
-  if (!env.AUTH_DO) return new Response("AUTH_DO is required for OIDC authorization.", { status: 500 });
+  if (!env.AUTH_DO) return authText("AUTH_DO is required for OIDC authorization.", 500);
   const prepared = await prepareAuthorizationRequest(request, env);
   if (prepared instanceof Response) return prepared;
   const { oauth, scope } = prepared;
@@ -216,19 +232,19 @@ async function handleOidcAuthorize(request: Request, env: HandlerEnv): Promise<R
     expiresAt: Date.now() + oidcStateTtlMs(),
   };
   await env.AUTH_DO.get(env.AUTH_DO.idFromName(`oidc:${state}`)).createOidcRecord(state, record);
-  return Response.redirect(url, 302);
+  return authRedirect(url, 302);
 }
 
 async function handleOidcCallback(request: Request, env: HandlerEnv): Promise<Response> {
-  if (!oidcEnabled(env)) return new Response("Not found", { status: 404 });
-  if (!env.AUTH_DO) return new Response("AUTH_DO is required for OIDC authorization.", { status: 500 });
+  if (!oidcEnabled(env)) return authText("Not found", 404);
+  if (!env.AUTH_DO) return authText("AUTH_DO is required for OIDC authorization.", 500);
   const url = new URL(request.url);
   const code = url.searchParams.get("code") ?? "";
   const state = url.searchParams.get("state") ?? "";
-  if (!code || !state) return new Response("Missing code or state.", { status: 400 });
+  if (!code || !state) return authText("Missing code or state.", 400);
   const record = await env.AUTH_DO.get(env.AUTH_DO.idFromName(`oidc:${state}`)).consumeOidcRecord(state);
-  if (!record) return new Response("Invalid or already-used OIDC state.", { status: 400 });
-  if (Date.now() > record.expiresAt) return new Response("OIDC state expired.", { status: 400 });
+  if (!record) return authText("Invalid or already-used OIDC state.", 400);
+  if (Date.now() > record.expiresAt) return authText("OIDC state expired.", 400);
   const { grantProps } = await oidcPropsFromCode(
     env,
     code,
@@ -237,9 +253,9 @@ async function handleOidcCallback(request: Request, env: HandlerEnv): Promise<Re
     record.grantedScopes,
   );
   const userId = typeof grantProps.userId === "string" ? grantProps.userId : "";
-  if (!userId) return new Response("OIDC subject is missing.", { status: 400 });
+  if (!userId) return authText("OIDC subject is missing.", 400);
   const client = await env.OAUTH_PROVIDER.lookupClient(record.authRequest.clientId);
-  if (!client) return new Response("Unknown OAuth client.", { status: 400 });
+  if (!client) return authText("Unknown OAuth client.", 400);
   const consentNonce = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
   const sealed = await sealOidcGrantProps(env, userId, consentNonce, grantProps);
   const consent: OidcConsentRecord = {
@@ -256,16 +272,16 @@ async function handleOidcCallback(request: Request, env: HandlerEnv): Promise<Re
 }
 
 async function handleOidcConsent(request: Request, env: HandlerEnv): Promise<Response> {
-  if (!oidcEnabled(env)) return new Response("Not found", { status: 404 });
-  if (!env.AUTH_DO) return new Response("AUTH_DO is required for OIDC authorization.", { status: 500 });
-  if (request.method !== "POST") return new Response("Method not allowed.", { status: 405 });
+  if (!oidcEnabled(env)) return authText("Not found", 404);
+  if (!env.AUTH_DO) return authText("AUTH_DO is required for OIDC authorization.", 500);
+  if (request.method !== "POST") return authText("Method not allowed.", 405);
   const form = await request.formData();
   const nonce = String(form.get("oidc_consent") ?? "");
   const record = nonce
     ? await env.AUTH_DO.get(env.AUTH_DO.idFromName(`oidc-consent:${nonce}`)).consumeOidcConsentRecord(nonce)
     : null;
-  if (!record) return new Response("Invalid or expired OIDC consent request.", { status: 400 });
-  if (Date.now() > record.expiresAt) return new Response("OIDC consent expired.", { status: 400 });
+  if (!record) return authText("Invalid or expired OIDC consent request.", 400);
+  if (Date.now() > record.expiresAt) return authText("OIDC consent expired.", 400);
   const grantProps = await unsealOidcGrantProps(env, nonce, record);
   const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
     request: record.authRequest,
@@ -274,7 +290,7 @@ async function handleOidcConsent(request: Request, env: HandlerEnv): Promise<Res
     scope: record.grantedScopes,
     props: grantProps,
   });
-  return Response.redirect(redirectTo, 302);
+  return authRedirect(redirectTo, 302);
 }
 
 export const serviceNowAuthHandler = {
@@ -285,18 +301,27 @@ export const serviceNowAuthHandler = {
       return Response.json({ ok: true, service: "servicenow-codemode-mcp" });
     }
 
+    let authMode: "operator_secret" | "oidc";
+    try {
+      authMode = parseAuthMode(env.AUTH_MODE);
+    } catch {
+      return authText('AUTH_MODE must be "operator_secret" or "oidc".', 500);
+    }
+
     if (url.pathname === "/oidc/callback" && request.method === "GET") {
+      if (authMode !== "oidc") return authText("Not found", 404);
       return handleOidcCallback(request, env);
     }
 
     if (url.pathname === "/oidc/consent") {
+      if (authMode !== "oidc") return authText("Not found", 404);
       return handleOidcConsent(request, env);
     }
 
     if (url.pathname === "/authorize") {
-      if (oidcEnabled(env)) {
+      if (authMode === "oidc") {
         if (request.method === "GET") return handleOidcAuthorize(request, env);
-        return new Response("OIDC authorization uses a redirect flow.", { status: 405 });
+        return authText("OIDC authorization uses a redirect flow.", 405);
       }
       // OAUTH_KV holds the server-side consent state; a missing binding fails CLOSED here
       // (plan §P6a) rather than silently re-parsing a client-controlled field.
@@ -319,7 +344,7 @@ export const serviceNowAuthHandler = {
         // Look up the server-side state; a missing/expired/forged nonce fails CLOSED (never
         // trust a client-supplied auth-request). The stored object is the sole authority.
         const stored = nonce ? await kv.get(CONSENT_KEY_PREFIX + nonce) : null;
-        if (!stored) return new Response("Invalid or expired consent request.", { status: 400 });
+        if (!stored) return authText("Invalid or expired consent request.", 400);
         const oauth = JSON.parse(stored) as AuthRequestInfo;
         const scope = grantScopes(oauth.scope);
         if (scope.length === 0) return unsupportedScopesResponse();
@@ -338,7 +363,7 @@ export const serviceNowAuthHandler = {
         await kv.delete(CONSENT_KEY_PREFIX + nonce);
         const operatorUserId = env.MCP_OPERATOR_USER_ID?.trim();
         if (!operatorUserId) {
-          return new Response("MCP_OPERATOR_USER_ID is required.", { status: 500 });
+          return authText("MCP_OPERATOR_USER_ID is required.", 500);
         }
         const operatorEmail = env.MCP_OPERATOR_EMAIL?.trim();
         const props = {
@@ -354,10 +379,10 @@ export const serviceNowAuthHandler = {
           scope,
           props,
         });
-        return Response.redirect(redirectTo, 302);
+        return authRedirect(redirectTo, 302);
       }
     }
 
-    return new Response("Not found", { status: 404 });
+    return authText("Not found", 404);
   },
 };

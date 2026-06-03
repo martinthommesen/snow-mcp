@@ -3,6 +3,8 @@
 // the binding logic is unit-testable without triggering a deploy (alchemy.run.ts itself has a
 // top-level `await alchemy(...)`; importing it to test bindings would attempt to provision).
 
+import { parseAuthMode } from "@servicenow-codemode/shared";
+
 export interface TokenKekEnv {
   TOKEN_KEK?: string;
   TOKEN_KEK_CURRENT?: string;
@@ -41,7 +43,7 @@ export function parseDevVarLine(raw: string): [string, string] | undefined {
 }
 
 export function operatorSecretBindings<S>(env: OperatorSecretEnv, secret: (value: string) => S): Record<string, S> {
-  if (env.AUTH_MODE?.trim() === "oidc") return {};
+  if (parseAuthMode(env.AUTH_MODE) === "oidc") return {};
   const operatorSecret = env.MCP_OPERATOR_SECRET;
   if (!operatorSecret) throw new Error("Missing MCP_OPERATOR_SECRET in environment/.dev.vars");
   return { MCP_OPERATOR_SECRET: secret(operatorSecret) };

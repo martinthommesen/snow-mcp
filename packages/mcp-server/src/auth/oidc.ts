@@ -5,13 +5,13 @@ import {
   jwtVerify,
   type JWTPayload,
 } from "jose";
-import { isValidMode, modeRisk, type Mode } from "@servicenow-codemode/shared";
+import { isValidMode, modeRisk, parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
 import { generatePkce } from "./servicenow-oauth.js";
 import { canonicalPublicOrigin } from "./public-origin.js";
 import { maxModeFromScopes } from "./mcp-scopes.js";
 import { minByRisk } from "../authz/effective-mode.js";
 
-export type AuthMode = "operator_secret" | "oidc";
+export { parseAuthMode, type AuthMode };
 
 export interface OidcEnv {
   AUTH_MODE?: string;
@@ -59,10 +59,6 @@ const OIDC_STATE_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_OIDC_HTTP_TIMEOUT_MS = 10_000;
 const discoveryCache = new WeakMap<OidcEnv, Map<string, Promise<OidcDiscovery>>>();
 const jwksCache = new WeakMap<OidcEnv, Map<string, ReturnType<typeof createRemoteJWKSet>>>();
-
-export function parseAuthMode(value: string | undefined): AuthMode {
-  return value === "oidc" ? "oidc" : "operator_secret";
-}
 
 export function oidcEnabled(env: OidcEnv): boolean {
   return parseAuthMode(env.AUTH_MODE) === "oidc";

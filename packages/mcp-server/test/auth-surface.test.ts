@@ -201,6 +201,13 @@ function fakeRateDo(allowResults: boolean[]) {
   return { calls, ns: ns as never };
 }
 
+function expectAuthBrowserHeaders(res: Response): void {
+  expect(res.headers.get("cache-control")).toBe("no-store");
+  expect(res.headers.get("pragma")).toBe("no-cache");
+  expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+  expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+}
+
 function fakeAuthDo(seed?: Iterable<[string, OidcCorrelationRecord]>) {
   const records = new Map(seed);
   const consentRecords = new Map<string, OidcConsentRecord>();
@@ -239,6 +246,7 @@ describe("finding 4 — consent-write admission cap on GET /authorize", () => {
       consentEnv(provider, { CONSENT_RATE_DO: rate.ns }),
     );
     expect(res.status).toBe(429);
+    expectAuthBrowserHeaders(res);
     expect(await res.text()).not.toContain('name="consent"'); // no consent page minted
     expect(rate.calls).toEqual(["203.0.113.7"]); // keyed by SOURCE IP only (not client_id)
   });
@@ -251,6 +259,7 @@ describe("finding 4 — consent-write admission cap on GET /authorize", () => {
       consentEnv(provider, { CONSENT_RATE_DO: rate.ns }),
     );
     expect(res.status).toBe(200);
+    expectAuthBrowserHeaders(res);
     expect(await res.text()).toContain('name="consent"');
   });
 
@@ -306,7 +315,7 @@ describe("AUTH-002 — MCP OAuth authorization requires PKCE S256", () => {
       new Request("http://localhost/authorize?response_type=code&client_id=oidc-client"),
       {
         OAUTH_PROVIDER: provider.helper as never,
-        AUTH_MODE: "oidc",
+        AUTH_MODE: "oidc ",
         AUTH_DO: authDo.ns,
         CONSENT_RATE_DO: fakeRateDo([]).ns,
         WORKER_PUBLIC_ORIGIN: "https://worker.example.com",
@@ -341,6 +350,7 @@ describe("Phase 3 OIDC authorization surface", () => {
       },
     );
     expect(res.status).toBe(302);
+    expectAuthBrowserHeaders(res);
     const redirect = new URL(res.headers.get("location")!);
     expect(redirect.origin).toBe(OIDC_ISSUER);
     expect(redirect.searchParams.get("scope")).toBe("openid profile email offline_access");
@@ -359,6 +369,18 @@ describe("Phase 3 OIDC authorization surface", () => {
       { OAUTH_PROVIDER: provider.helper as never, AUTH_MODE: "oidc" },
     );
     expect(res.status).toBe(405);
+    expectAuthBrowserHeaders(res);
+  });
+
+  it("rejects invalid AUTH_MODE instead of falling back to operator-secret", async () => {
+    const provider = fakeProvider({ clientId: "bad-auth-mode", scope: ["servicenow:read"] });
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/authorize?response_type=code&client_id=bad-auth-mode"),
+      { OAUTH_PROVIDER: provider.helper as never, AUTH_MODE: "oidcish" },
+    );
+    expect(res.status).toBe(500);
+    expectAuthBrowserHeaders(res);
+    expect(await res.text()).toContain("AUTH_MODE");
   });
 
   it("requires local consent after /oidc/callback before completing authorization", async () => {
@@ -391,6 +413,7 @@ describe("Phase 3 OIDC authorization surface", () => {
       hEnv,
     );
     expect(res.status).toBe(200);
+    expectAuthBrowserHeaders(res);
     expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
     expect(res.headers.get("x-frame-options")).toBe("DENY");
     const html = await res.text();
@@ -420,6 +443,7 @@ describe("Phase 3 OIDC authorization surface", () => {
       hEnv,
     );
     expect(post.status).toBe(302);
+    expectAuthBrowserHeaders(post);
     expect(provider.seen.userId).not.toContain(":");
     expect(provider.seen.scope).toEqual(["servicenow:admin_script"]);
     expect(provider.seen.props).toMatchObject({
@@ -439,6 +463,7 @@ describe("Phase 3 OIDC authorization surface", () => {
       hEnv,
     );
     expect(replay.status).toBe(400);
+    expectAuthBrowserHeaders(replay);
   });
 });
 
@@ -449,6 +474,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
       new Request("http://localhost/authorize?response_type=code&client_id=c1"),
       consentEnv(provider),
     );
+    expectAuthBrowserHeaders(res);
     expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
     expect(res.headers.get("x-frame-options")).toBe("DENY");
     const html = await res.text();
@@ -463,6 +489,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
       consentEnv(provider),
     );
     expect(res.status).toBe(400);
+    expectAuthBrowserHeaders(res);
     expect(await res.text()).toContain("No supported ServiceNow OAuth scopes requested.");
     expect(provider.seen.scope).toBeUndefined();
   });
@@ -492,6 +519,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
       provider,
     );
     expect(res.status).toBe(302);
+    expectAuthBrowserHeaders(res);
     expect(provider.seen.scope).toEqual(["servicenow:read"]); // server-state scope, not the tampered one
     expect((provider.seen.props as { maxMode?: string }).maxMode).toBe("read_only");
   });
@@ -500,6 +528,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
     const provider = fakeProvider({ clientId: "c1", scope: ["servicenow:read"] });
     const res = await postConsent({ consent: "not-a-real-nonce", operator_secret: SECRET }, provider);
     expect(res.status).toBe(400);
+    expectAuthBrowserHeaders(res);
     expect(provider.seen.scope).toBeUndefined(); // completeAuthorization never called
   });
 
@@ -515,6 +544,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
       consentEnv(provider),
     );
     expect(res.status).toBe(500);
+    expectAuthBrowserHeaders(res);
     expect(provider.seen.scope).toBeUndefined();
   });
 
@@ -531,6 +561,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
       consentEnv(provider, { MCP_OPERATOR_USER_ID: OPERATOR_USER_ID, CONSENT_RATE_DO: rate.ns }),
     );
     expect(denied.status).toBe(429);
+    expectAuthBrowserHeaders(denied);
     expect(rate.calls).toEqual(["203.0.113.9"]);
     expect(provider.seen.scope).toBeUndefined();
   });
@@ -540,10 +571,12 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
     const { nonce } = await getConsent(provider);
     const bad = await postConsent({ consent: nonce, operator_secret: "wrong" }, provider);
     expect(bad.status).toBe(401);
+    expectAuthBrowserHeaders(bad);
     expect(provider.seen.scope).toBeUndefined();
     // The nonce is NOT burned on failure: a correct retry still succeeds.
     const ok = await postConsent({ consent: nonce, operator_secret: SECRET }, provider);
     expect(ok.status).toBe(302);
+    expectAuthBrowserHeaders(ok);
     expect(provider.seen.scope).toEqual(["servicenow:read"]);
   });
 
@@ -554,6 +587,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
     // Replaying the same nonce now fails closed (the KV entry was deleted).
     const replay = await postConsent({ consent: nonce, operator_secret: SECRET }, provider);
     expect(replay.status).toBe(400);
+    expectAuthBrowserHeaders(replay);
   });
 
   it("uses configured operator subject metadata without persisting authorization groups into the OAuth grant", async () => {
@@ -581,6 +615,7 @@ describe("§P6a signed/stored consent state (finding 22)", () => {
       }),
     );
     expect(post.status).toBe(302);
+    expectAuthBrowserHeaders(post);
     expect(provider.seen.userId).toBe("ada-operator");
     expect(provider.seen.props).toMatchObject({
       userId: "ada-operator",

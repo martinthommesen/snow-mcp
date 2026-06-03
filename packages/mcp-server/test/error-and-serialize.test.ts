@@ -56,11 +56,18 @@ describe("mapServiceNowError — generic client message, typed code (§P6a, find
 
   it("maps the status families to generic messages (5xx -> instance_hibernating)", () => {
     expect(mapServiceNowError(401)!.code).toBe("reauth_required");
+    expect(mapServiceNowError(404)!.code).toBe("table_not_found");
     expect(mapServiceNowError(429)!.code).toBe("budget_exceeded");
     const five = mapServiceNowError(503, { error: { message: "node 7 down" } });
     expect(five!.code).toBe("instance_hibernating");
     expect(five!.message).toBe("ServiceNow is unavailable (5xx).");
     expect(five!.message).not.toContain("node 7 down");
+  });
+
+  it("maps definitive ServiceNow 4xxs to clean typed failures instead of internal_error", () => {
+    expect(mapServiceNowError(400, { error: { message: "encoded query error on sys_user" } })!.code).toBe("path_denied");
+    expect(mapServiceNowError(413, { error: "code_size" })!.code).toBe("code_size");
+    expect(mapServiceNowError(413, { error: { message: "payload too large" } })!.code).toBe("path_denied");
   });
 
   it("maps executor-disabled 503s to a clean capability denial", () => {

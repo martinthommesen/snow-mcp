@@ -6,13 +6,13 @@
 
 import type { SnHttpClient } from "./http.js";
 import { McpToolError, throwMappedServiceNowError } from "./errors.js";
-import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
+import { requireCapability, SN_REQUEST_LIMITS, TABLE_PAGE_CAP } from "../config.js";
 import { assertActorPolicy, isFieldMasked, isTableAllowed, type ActorPolicy } from "../authz/actor-policy.js";
 import { validateDiscoveryFilter, validateTableName } from "./validate.js";
 import { utf8Len } from "../sandbox/serialize.js";
 import type { RunBudget } from "./run-budget.js";
 import type { Mode } from "@servicenow-codemode/shared";
-import { countServiceNowQueryBytes } from "./query-budget.js";
+import { countServiceNowQueryBytes, serviceNowQueryStringBytes } from "./query-budget.js";
 
 export interface FieldInfo {
   name: string;
@@ -64,6 +64,47 @@ function matchesFilter(table: TableInfo, filter: string | undefined): boolean {
   if (!filter) return true;
   const needle = filter.toLowerCase();
   return table.name.toLowerCase().includes(needle) || table.label.toLowerCase().includes(needle);
+}
+
+function tableListQuery(sysparmQuery: string): Record<string, string> {
+  return {
+    sysparm_query: sysparmQuery,
+    sysparm_fields: "name,label",
+    sysparm_exclude_reference_link: "true",
+    sysparm_limit: String(TABLE_PAGE_CAP),
+  };
+}
+
+function exactAllowlistChunks(names: readonly string[]): string[][] {
+  const chunks: string[][] = [];
+  let chunk: string[] = [];
+  for (const name of names) {
+    const candidate = [...chunk, name];
+    const q = tableListQuery(`nameIN${candidate.map(esc).join(",")}^ORDERBYname`);
+    if (chunk.length > 0 && serviceNowQueryStringBytes(q) > SN_REQUEST_LIMITS.maxQueryStringBytes) {
+      chunks.push(chunk);
+      chunk = [name];
+    } else {
+      chunk = candidate;
+    }
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
+}
+
+async function fetchTableListRows(deps: DiscoveryDeps, query: string): Promise<Record<string, unknown>[]> {
+  const q = tableListQuery(query);
+  countServiceNowQueryBytes(deps.runBudget, q);
+  deps.runBudget.countServiceNowRequest();
+  const res = await deps.http.request({
+    method: "GET",
+    path: "/api/now/table/sys_db_object",
+    query: q,
+  });
+  throwMappedServiceNowError(res);
+  const rows = ((res.json as { result?: Record<string, unknown>[] }).result ?? []);
+  deps.runBudget.countRows(rows.length);
+  return rows;
 }
 
 /** Resolve a table's inheritance chain (incident -> task -> ...) so describe_table
@@ -162,17 +203,32 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
   deps.runBudget.countRpcCall();
 
   const exactAllowlist = exactAllowlistNames(deps.actorPolicy);
+  if (exactAllowlist && exactAllowlist.length > 0) {
+    const rows: Record<string, unknown>[] = [];
+    let partial = false;
+    for (const chunk of exactAllowlistChunks(exactAllowlist)) {
+      const chunkRows = await fetchTableListRows(deps, `nameIN${chunk.map(esc).join(",")}^ORDERBYname`);
+      rows.push(...chunkRows);
+      partial ||= chunkRows.length >= TABLE_PAGE_CAP;
+    }
+    const byName = new Map<string, TableInfo>();
+    for (const row of rows) {
+      const table = { name: String(row.name ?? ""), label: String(row.label ?? "") };
+      if (table.name && isTableAllowed(deps.actorPolicy, table.name) && matchesFilter(table, validFilter)) {
+        byName.set(table.name, table);
+      }
+    }
+    const tables = [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+    deps.runBudget.countBytes(utf8Len(JSON.stringify(tables)));
+    return { tables, partial };
+  }
+
   const query = exactAllowlist && exactAllowlist.length > 0
     ? `nameIN${exactAllowlist.map(esc).join(",")}^ORDERBYname`
     : validFilter
       ? `nameLIKE${esc(validFilter)}^ORlabelLIKE${esc(validFilter)}`
       : "ORDERBYname";
-  const q = {
-    sysparm_query: query,
-    sysparm_fields: "name,label",
-    sysparm_exclude_reference_link: "true",
-    sysparm_limit: String(TABLE_PAGE_CAP),
-  };
+  const q = tableListQuery(query);
   countServiceNowQueryBytes(deps.runBudget, q);
   deps.runBudget.countServiceNowRequest();
   const res = await deps.http.request({

@@ -90,17 +90,24 @@ export function mapServiceNowError(status: number, body?: ServiceNowErrorBody): 
   // Hibernating PDIs answer with a 200 HTML splash or a gateway error; callers detect
   // the splash separately. Here we map the explicit status families.
   if (status === 401) return new McpToolError("reauth_required", "ServiceNow authentication failed (401).");
+  if (status === 404) return new McpToolError("table_not_found", "ServiceNow table or record was not found (404).");
   if (status === 403) {
     return new McpToolError("actor_policy_denied", "ServiceNow denied access (403).");
   }
   if (status === 429) {
     return new McpToolError("budget_exceeded", "ServiceNow rate limit (429).");
   }
+  if (status === 413 && raw === "code_size") {
+    return new McpToolError("code_size", "ServiceNow executor rejected the script because it is too large.");
+  }
   if (status === 503 && (raw === "executor_disabled" || raw === "run_server_script_disabled")) {
     return new McpToolError("capability_denied", "ServiceNow executor is disabled.", { executorError: raw });
   }
   if (status >= 500) {
     return new McpToolError("instance_hibernating", "ServiceNow is unavailable (5xx).");
+  }
+  if (status >= 400 && status < 500) {
+    return new McpToolError("path_denied", `ServiceNow rejected the request (${status}).`);
   }
   return new McpToolError("internal_error", `ServiceNow error ${status}.`);
 }

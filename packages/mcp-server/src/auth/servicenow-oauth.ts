@@ -18,11 +18,13 @@ export interface SnOAuthConfig {
   ropcUsername?: string;
   ropcPassword?: string;
   fetchImpl?: typeof fetch;
+  httpTimeoutMs?: number;
 }
 
 /** Re-resolve ServiceNow sys_id/roles periodically so cached schema and signed actors do not
  *  trust role/principal metadata indefinitely after OAuth callback. */
 export const SN_PRINCIPAL_TTL_MS = 5 * 60 * 1000;
+export const DEFAULT_SN_OAUTH_HTTP_TIMEOUT_MS = 30_000;
 
 interface TokenResponse {
   access_token?: string;
@@ -32,11 +34,33 @@ interface TokenResponse {
   error_description?: string;
 }
 
+function snOAuthHttpTimeoutMs(cfg: SnOAuthConfig): number {
+  return Number.isInteger(cfg.httpTimeoutMs) && cfg.httpTimeoutMs! > 0
+    ? cfg.httpTimeoutMs!
+    : DEFAULT_SN_OAUTH_HTTP_TIMEOUT_MS;
+}
+
+async function fetchWithTimeout(cfg: SnOAuthConfig, input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error("servicenow_oauth_timeout")), snOAuthHttpTimeoutMs(cfg));
+  const upstreamSignal = init.signal;
+  const abort = () => controller.abort(upstreamSignal?.reason ?? new Error("servicenow_oauth_aborted"));
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) abort();
+    else upstreamSignal.addEventListener("abort", abort, { once: true });
+  }
+  try {
+    return await (cfg.fetchImpl ?? fetch)(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+    upstreamSignal?.removeEventListener("abort", abort);
+  }
+}
+
 async function tokenRequest(cfg: SnOAuthConfig, params: Record<string, string>, now: number): Promise<SnTokens> {
-  const fetchImpl = cfg.fetchImpl ?? fetch;
   // cfg.instanceHost is the canonical, allowlisted host (canonicalized once in buildHandlers,
   // §6a), so this POST can never send the client secret off-allowlist.
-  const res = await fetchImpl(`https://${cfg.instanceHost}/oauth_token.do`, {
+  const res = await fetchWithTimeout(cfg, `https://${cfg.instanceHost}/oauth_token.do`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body: new URLSearchParams({ client_id: cfg.clientId, client_secret: cfg.clientSecret, ...params }).toString(),
@@ -165,10 +189,10 @@ function carryForwardPrincipal(target: SnTokens, source: SnTokens): void {
  * mock this boundary and cannot prove the live endpoint shape.
  */
 export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string): Promise<SnPrincipal | null> {
-  const fetchImpl = cfg.fetchImpl ?? fetch;
   const auth = { authorization: `Bearer ${accessToken}`, accept: "application/json" };
   try {
-    const meRes = await fetchImpl(
+    const meRes = await fetchWithTimeout(
+      cfg,
       `https://${cfg.instanceHost}/api/now/ui/user/current_user`,
       { headers: auth, redirect: "manual" },
     );
@@ -178,7 +202,8 @@ export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string
     if (!sys_id) return null;
     const user_name = stringClaim(me.result, ["user_name"]);
     const email = stringClaim(me.result, ["email", "user_email"]);
-    const roleRes = await fetchImpl(
+    const roleRes = await fetchWithTimeout(
+      cfg,
       `https://${cfg.instanceHost}/api/now/table/sys_user_has_role?sysparm_query=user=${encodeURIComponent(sys_id)}&sysparm_fields=role.name&sysparm_limit=200`,
       { headers: auth, redirect: "manual" },
     );

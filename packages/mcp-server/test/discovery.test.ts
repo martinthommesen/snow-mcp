@@ -5,6 +5,7 @@ import { RunBudget } from "../src/sn/run-budget.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { McpToolError } from "../src/sn/errors.js";
 import { BUDGETS, SN_REQUEST_LIMITS, TABLE_PAGE_CAP } from "../src/config.js";
+import { serviceNowQueryStringBytes } from "../src/sn/query-budget.js";
 
 const INSTANCE = "inst1.service-now.com";
 
@@ -147,6 +148,29 @@ describe("list_tables", () => {
     const out = await listTables(deps(http, policy));
     expect(http.calls[0]!.query!.sysparm_query).toBe("nameINincident,problem^ORDERBYname");
     expect(out.tables.map((t) => t.name)).toEqual(["incident", "problem"]);
+    expect(out.partial).toBe(false);
+  });
+
+  it("chunks long exact string allowlists so each ServiceNow query stays under the query-byte cap", async () => {
+    const names = Array.from({ length: 180 }, (_, i) => `u_${String(i).padStart(3, "0")}_${"x".repeat(60)}`);
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        expect(serviceNowQueryStringBytes(req.query)).toBeLessThanOrEqual(SN_REQUEST_LIMITS.maxQueryStringBytes);
+        const raw = req.query?.sysparm_query ?? "";
+        const match = /^nameIN(.+)\^ORDERBYname$/.exec(raw);
+        expect(match).toBeTruthy();
+        const requested = match![1]!.split(",");
+        return {
+          status: 200,
+          json: { result: requested.map((name) => ({ name, label: `Label ${name}` })) },
+        };
+      }
+      return { status: 200, json: { result: [] } };
+    });
+    const policy: ActorPolicy = { ...permissivePolicy([INSTANCE]), tables: { allow: names } };
+    const out = await listTables(deps(http, policy));
+    expect(http.calls.length).toBeGreaterThan(1);
+    expect(out.tables.map((t) => t.name)).toEqual(names);
     expect(out.partial).toBe(false);
   });
 

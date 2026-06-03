@@ -116,6 +116,7 @@ describe("operatorSecretBindings", () => {
 
   it("does not require or bind MCP_OPERATOR_SECRET when AUTH_MODE=oidc", () => {
     expect(operatorSecretBindings({ AUTH_MODE: "oidc" }, tag)).toEqual({});
+    expect(operatorSecretBindings({ AUTH_MODE: "oidc " }, tag)).toEqual({});
   });
 
   it("requires MCP_OPERATOR_SECRET for operator-secret mode", () => {
@@ -123,6 +124,10 @@ describe("operatorSecretBindings", () => {
     expect(operatorSecretBindings({ MCP_OPERATOR_SECRET: "operator-secret" }, tag)).toEqual({
       MCP_OPERATOR_SECRET: "secret(operator-secret)",
     });
+  });
+
+  it("rejects invalid AUTH_MODE values instead of falling back to operator-secret deploys", () => {
+    expect(() => operatorSecretBindings({ AUTH_MODE: "oidcish" }, tag)).toThrow(/AUTH_MODE/);
   });
 });
 
