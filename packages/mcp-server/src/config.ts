@@ -50,6 +50,7 @@ export const BUDGETS = {
   perRun: {
     rpcCallLimit: 200,
     serviceNowRequestLimit: 200,
+    maxOutboundBytes: 256 * 1024,
     wallClockMs: 30_000,
   },
   daily: {
@@ -58,6 +59,7 @@ export const BUDGETS = {
     serviceNowRequests: 100_000,
     rowsReturned: 5_000_000,
     bytesReturned: 1024 * 1024 * 1024,
+    outboundBytesSent: 1024 * 1024 * 1024,
   },
 } as const;
 

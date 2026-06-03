@@ -35,23 +35,101 @@ export interface SerializedResult {
   totalBytes: number;
 }
 
+interface SanitizedJson {
+  value: unknown;
+  path?: string;
+}
+
+const SANITIZE_MAX_DEPTH = 32;
+const SANITIZE_MAX_NODES = 1_000;
+
+function sanitizeForJson(value: unknown): SanitizedJson {
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+  let firstPath: string | undefined;
+  const notePath = (path: string): void => {
+    firstPath ??= path;
+  };
+
+  const visit = (v: unknown, path: string, depth: number): unknown => {
+    if (nodes++ >= SANITIZE_MAX_NODES) {
+      notePath(path);
+      return "[Truncated]";
+    }
+    if (typeof v === "bigint") {
+      notePath(path);
+      return v.toString();
+    }
+    if (typeof v === "function" || typeof v === "symbol") {
+      notePath(path);
+      return `[${typeof v}]`;
+    }
+    if (!v || typeof v !== "object") return v;
+    if (depth >= SANITIZE_MAX_DEPTH) {
+      notePath(path);
+      return "[MaxDepth]";
+    }
+    if (seen.has(v)) {
+      notePath(path);
+      return "[Circular]";
+    }
+    seen.add(v);
+    if (Array.isArray(v)) {
+      const out: unknown[] = [];
+      for (let i = 0; i < v.length; i++) {
+        if (nodes >= SANITIZE_MAX_NODES) {
+          notePath(`${path}[${i}]`);
+          out.push("[Truncated]");
+          break;
+        }
+        out.push(visit(v[i], `${path}[${i}]`, depth + 1));
+      }
+      return out;
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, item] of Object.entries(v as Record<string, unknown>)) {
+      if (nodes >= SANITIZE_MAX_NODES) {
+        notePath(`${path}.${k}`);
+        out[k] = "[Truncated]";
+        break;
+      }
+      out[k] = visit(item, `${path}.${k}`, depth + 1);
+    }
+    return out;
+  };
+
+  return { value: visit(value, "$", 0), ...(firstPath ? { path: firstPath } : {}) };
+}
+
+function cappedJsonText(json: string, maxBytes: number): SerializedResult {
+  const bytes = enc.encode(json);
+  const totalBytes = bytes.length;
+  if (totalBytes > maxBytes) {
+    return { text: truncateEncodedUtf8(bytes, maxBytes), truncated: true, totalBytes };
+  }
+  return { text: json, truncated: false, totalBytes };
+}
+
 /** Serialize a value to JSON text, truncating beyond `maxBytes`. Safe on circular/deep. */
 export function serializeResult(value: unknown, maxBytes: number): SerializedResult {
   let json: string;
   try {
     json = JSON.stringify(value === undefined ? null : value);
   } catch {
-    const fallback = JSON.stringify({ error: "result_not_serializable" });
-    return { text: fallback, truncated: false, totalBytes: utf8Len(fallback) };
+    const sanitized = sanitizeForJson(value);
+    let fallback: string;
+    try {
+      fallback = JSON.stringify({
+        error: "result_not_serializable",
+        ...(sanitized.path ? { path: sanitized.path } : {}),
+        value: sanitized.value,
+      });
+    } catch {
+      fallback = JSON.stringify({ error: "result_not_serializable", ...(sanitized.path ? { path: sanitized.path } : {}) });
+    }
+    return cappedJsonText(fallback, maxBytes);
   }
-  const bytes = enc.encode(json);
-  const totalBytes = bytes.length;
-  if (totalBytes > maxBytes) {
-    // Byte-safe truncation: cap at maxBytes UTF-8 bytes without splitting a sequence
-    // (§P2). Flag truncation (never re-parse the slice).
-    return { text: truncateEncodedUtf8(bytes, maxBytes), truncated: true, totalBytes };
-  }
-  return { text: json, truncated: false, totalBytes };
+  return cappedJsonText(json, maxBytes);
 }
 
 export interface CappedLogs {

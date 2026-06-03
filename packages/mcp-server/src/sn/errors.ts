@@ -70,13 +70,21 @@ export function parseSandboxError(message: string): { code?: ErrorCode; message:
  * Map a ServiceNow HTTP response to a typed error code. `body` is the parsed JSON
  * error payload when available. Returns null when the status is success (2xx).
  */
-export function mapServiceNowError(status: number, body?: { error?: { message?: string } }): McpToolError | null {
+type ServiceNowErrorBody = { error?: { message?: string } | string };
+
+function rawServiceNowError(body?: ServiceNowErrorBody): string | undefined {
+  const error = body?.error;
+  if (typeof error === "string") return error;
+  return error?.message;
+}
+
+export function mapServiceNowError(status: number, body?: ServiceNowErrorBody): McpToolError | null {
   if (status >= 200 && status < 300) return null;
   // The CLIENT-facing message is a GENERIC per-status string (plan §P6a): the raw ServiceNow
   // message can carry ACL/identity/schema detail (sys_ids, table/role names, emails, queries),
   // none of which the client should see. The raw message is LOGGED server-side (redacted) for
   // operator debuggability only. The typed `code` and any structured `detail` (P2) are intact.
-  const raw = body?.error?.message;
+  const raw = rawServiceNowError(body);
   if (raw !== undefined) console.error("ServiceNow error:", redactString(raw));
 
   // Hibernating PDIs answer with a 200 HTML splash or a gateway error; callers detect
@@ -88,8 +96,16 @@ export function mapServiceNowError(status: number, body?: { error?: { message?: 
   if (status === 429) {
     return new McpToolError("budget_exceeded", "ServiceNow rate limit (429).");
   }
+  if (status === 503 && (raw === "executor_disabled" || raw === "run_server_script_disabled")) {
+    return new McpToolError("capability_denied", "ServiceNow executor is disabled.", { executorError: raw });
+  }
   if (status >= 500) {
     return new McpToolError("instance_hibernating", "ServiceNow is unavailable (5xx).");
   }
   return new McpToolError("internal_error", `ServiceNow error ${status}.`);
+}
+
+export function throwMappedServiceNowError(res: { status: number; json: unknown }): void {
+  const mapped = mapServiceNowError(res.status, res.json as ServiceNowErrorBody);
+  if (mapped) throw mapped;
 }

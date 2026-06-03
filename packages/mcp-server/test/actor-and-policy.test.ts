@@ -8,6 +8,7 @@ import {
   assertQueryFieldsAllowed,
   permissivePolicy,
   loadActorPolicy,
+  loadNamedActorPolicies,
   type ActorPolicy,
   type PolicyEnv,
 } from "../src/authz/actor-policy.js";
@@ -135,6 +136,7 @@ describe("§2.12 ActorPolicy (B5)", () => {
     expect(() => assertQueryFieldsAllowed(policy, "incident", "caller_idlike5")).toThrow(McpToolError);
     expect(() => assertQueryFieldsAllowed(policy, "incident", "u_ssnin(1,2,3)")).toThrow(McpToolError);
     expect(() => assertQueryFieldsAllowed(policy, "incident", "active=true^u_ssnisnotempty")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "u_ssnfoo123")).toThrow(McpToolError);
   });
 
   it("L-3 — does NOT over-reject legit unmasked fields with operator-looking names", () => {
@@ -291,6 +293,62 @@ describe("§6b loadActorPolicy", () => {
   it("rejects a non-positive-integer ceiling at load", () => {
     expect(() => loadActorPolicy({ ACTOR_POLICY_TABLE_ALLOWLIST: "incident", ACTOR_POLICY_MAX_ROWS_PER_RUN: "0" }, INSTANCE)).toThrow();
     expect(() => loadActorPolicy({ ACTOR_POLICY_TABLE_ALLOWLIST: "incident", ACTOR_POLICY_MAX_BYTES_PER_RUN: "-5" }, INSTANCE)).toThrow();
+  });
+
+  it("loads named ActorPolicies from ACTOR_POLICIES_JSON for OIDC group selection", () => {
+    const policies = loadNamedActorPolicies(
+      {
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
+        ACTOR_POLICIES_JSON: JSON.stringify({
+          admin: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident,problem", ACTOR_POLICY_MAX_MODE: "write" },
+        }),
+      },
+      INSTANCE,
+    );
+    expect(policies.get("default")?.maxMode).toBe("read_only");
+    expect(policies.get("admin")?.maxMode).toBe("write");
+    expect(() => assertActorPolicy(policies.get("admin")!, { instance: INSTANCE, table: "problem", mode: "write" })).not.toThrow();
+  });
+
+  it("fails closed for implicit default when only named JSON policies are configured", () => {
+    const policies = loadNamedActorPolicies(
+      {
+        ACTOR_POLICIES_JSON: JSON.stringify({
+          admin: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident,problem", ACTOR_POLICY_MAX_MODE: "write" },
+        }),
+      },
+      INSTANCE,
+    );
+    expect(() => assertActorPolicy(policies.get("default")!, { instance: INSTANCE, table: "incident", mode: "read_only" })).toThrow(McpToolError);
+    expect(() => assertActorPolicy(policies.get("admin")!, { instance: INSTANCE, table: "problem", mode: "write" })).not.toThrow();
+  });
+
+  it("allows ACTOR_POLICIES_JSON to provide an explicit restrictive default policy", () => {
+    const policies = loadNamedActorPolicies(
+      {
+        ACTOR_POLICIES_JSON: JSON.stringify({
+          default: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident" },
+        }),
+      },
+      INSTANCE,
+    );
+    expect(() => assertActorPolicy(policies.get("default")!, { instance: INSTANCE, table: "incident", mode: "read_only" })).not.toThrow();
+    expect(() => assertActorPolicy(policies.get("default")!, { instance: INSTANCE, table: "sys_user", mode: "read_only" })).toThrow(McpToolError);
+  });
+
+  it("rejects malformed named ActorPolicy entries instead of loading them as permissive", () => {
+    expect(() => loadNamedActorPolicies({ ACTOR_POLICIES_JSON: JSON.stringify({ admin: "write" }) }, INSTANCE)).toThrow(
+      /ACTOR_POLICIES_JSON\.admin/,
+    );
+    expect(() => loadNamedActorPolicies({ ACTOR_POLICIES_JSON: JSON.stringify({ admin: [] }) }, INSTANCE)).toThrow(
+      /ACTOR_POLICIES_JSON\.admin/,
+    );
+    expect(() => loadNamedActorPolicies({ ACTOR_POLICIES_JSON: JSON.stringify({ admin: {} }) }, INSTANCE)).toThrow(
+      /ACTOR_POLICIES_JSON\.admin/,
+    );
+    expect(() => loadNamedActorPolicies({ ACTOR_POLICIES_JSON: JSON.stringify({ admin: { NOT_A_POLICY_KEY: "write" } }) }, INSTANCE)).toThrow(
+      /ACTOR_POLICIES_JSON\.admin/,
+    );
   });
 });
 

@@ -8,7 +8,7 @@ import type { Mode } from "@servicenow-codemode/shared";
 import { resolveEffectiveMode } from "../authz/effective-mode.js";
 import { transpileTs, TranspileFailure } from "../sandbox/transpile.js";
 import { createExecutor, executeSnippet } from "../sandbox/executor.js";
-import { serializeResult, utf8Len, capLogs } from "../sandbox/serialize.js";
+import { serializeResult, utf8Len, capLogs, type CappedLogs } from "../sandbox/serialize.js";
 import { SIZE_LIMITS } from "../config.js";
 import { McpToolError, toToolResult, parseSandboxError } from "../sn/errors.js";
 import { redactString } from "../observability/redact.js";
@@ -75,6 +75,26 @@ export interface RunCodeDeps {
   timeoutMs?: number;
 }
 
+function hostSignalResult(
+  code: "budget_exceeded" | "reauth_required",
+  text: string,
+  cappedLogs: CappedLogs,
+  budget: Record<string, number>,
+  detail?: Record<string, string>,
+): ToolTextResult {
+  return {
+    content: [{ type: "text", text }],
+    isError: true,
+    structuredContent: {
+      code,
+      logs: cappedLogs.logs,
+      ...(cappedLogs.truncated ? { logsTruncated: true } : {}),
+      budget,
+      ...(detail ? { detail } : {}),
+    },
+  };
+}
+
 export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<ToolTextResult> {
   // Held at function scope so the finally can reconcile actual spend (§P5 tier 3). Undefined
   // when an early throw (size/mode/reason/reserve/transpile) fires before the budget exists.
@@ -96,13 +116,16 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
       instanceMaxMode: deps.instanceMaxMode,
     });
     if (!resolved.ok) {
-      throw new McpToolError("mode_not_permitted", `Requested mode "${resolved.requested}" exceeds the ceiling "${resolved.ceiling}".`);
+      throw new McpToolError("mode_not_permitted", `Requested mode "${resolved.requested}" exceeds the ceiling "${resolved.ceiling}".`, {
+        ceiling: resolved.ceiling,
+        ceilingSource: resolved.ceilingSource,
+      });
     }
     const effectiveMode = resolved.effective;
 
     // admin_script requires a mandatory reason (§3.5; approval gate is layered above).
     if (effectiveMode === "admin_script" && !input.reason?.trim()) {
-      throw new McpToolError("capability_denied", "admin_script requires a non-empty `reason`.");
+      throw new McpToolError("precondition_required", "admin_script requires a non-empty `reason`.");
     }
     const reason = input.reason !== undefined ? validateReason(input.reason) : undefined;
     const runKey = input.idempotencyKey !== undefined ? validateIdempotencyKey(input.idempotencyKey) : undefined;
@@ -172,19 +195,23 @@ export async function runCode(input: RunCodeInput, deps: RunCodeDeps): Promise<T
     const signals = rpc.hostSignals;
     if (signals.budgetExceeded) {
       const dimension = signals.budgetExceeded.dimension;
-      return {
-        content: [{ type: "text", text: `[budget_exceeded] Per-run ${dimension ?? "budget"} cap exceeded.` }],
-        isError: true,
-        structuredContent: { code: "budget_exceeded", logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}), budget, ...(dimension ? { detail: { dimension } } : {}) },
-      };
+      return hostSignalResult(
+        "budget_exceeded",
+        `[budget_exceeded] Per-run ${dimension ?? "budget"} cap exceeded.`,
+        cappedLogs,
+        budget,
+        dimension ? { dimension } : undefined,
+      );
     }
     if (signals.reauthRequired) {
       const authorizeUrl = signals.reauthRequired.authorizeUrl;
-      return {
-        content: [{ type: "text", text: "[reauth_required] ServiceNow re-authentication required." }],
-        isError: true,
-        structuredContent: { code: "reauth_required", logs: cappedLogs.logs, ...(cappedLogs.truncated ? { logsTruncated: true } : {}), budget, ...(authorizeUrl ? { detail: { authorizeUrl } } : {}) },
-      };
+      return hostSignalResult(
+        "reauth_required",
+        "[reauth_required] ServiceNow re-authentication required.",
+        cappedLogs,
+        budget,
+        authorizeUrl ? { authorizeUrl } : undefined,
+      );
     }
     if (exec.error) {
       // No host signal: the host cannot vouch for any `[[code]]` in the snippet-controlled

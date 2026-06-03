@@ -31,8 +31,11 @@ export type ErrorCode =
   | "capability_denied"
   | "mode_not_permitted"
   | "actor_policy_denied"
+  | "table_not_found"
   | "budget_exceeded"
   | "path_denied"
+  | "precondition_required"
+  | "idempotency_conflict"
   | "instance_hibernating"
   | "reauth_required"
   | "executor_disabled"
@@ -53,8 +56,11 @@ export const ERROR_CODES = [
   "capability_denied",
   "mode_not_permitted",
   "actor_policy_denied",
+  "table_not_found",
   "budget_exceeded",
   "path_denied",
+  "precondition_required",
+  "idempotency_conflict",
   "instance_hibernating",
   "reauth_required",
   "executor_disabled",

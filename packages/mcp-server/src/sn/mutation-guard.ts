@@ -21,31 +21,68 @@ import type { Mode } from "@servicenow-codemode/shared";
 
 export type { AuditSink } from "../observability/audit.js";
 
+export function mutationLedgerObjectName(input: {
+  userId: string;
+  instanceHost: string;
+  runKey: string;
+  ordinal: number;
+}): string {
+  return `${input.userId}|${input.instanceHost}|${input.runKey}:${input.ordinal}`;
+}
+
 // ── Logical-effect request hashes (idempotency key, plan §P4) ──
 // The hash captures the LOGICAL EFFECT only — it EXCLUDES volatile signing fields
 // (nonce, issued_at, signature) so the SAME logical mutation retried with a fresh nonce
 // dedups, while a DIVERGENT effect (different fields/script/reason) is a conflict.
 
-/** Stable key-ordered serialization for hashing (effect fields are a flat string map). */
-function canonicalFields(fields: Record<string, unknown>): string {
-  const keys = Object.keys(fields).sort();
-  return JSON.stringify(keys.map((k) => [k, fields[k] ?? null]));
+function assertJsonSerializable(value: unknown, path: string, seen = new WeakSet<object>()): void {
+  if (value === undefined || typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") {
+    throw new Error(`tableUpdate fields must be JSON-serializable (${path}).`);
+  }
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    throw new Error(`tableUpdate fields must be JSON-serializable (${path}).`);
+  }
+  if (!value || typeof value !== "object") return;
+  if (seen.has(value)) throw new Error(`tableUpdate fields must be JSON-serializable (${path}).`);
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) assertJsonSerializable(value[i], `${path}[${i}]`, seen);
+    seen.delete(value);
+    return;
+  }
+  for (const [k, item] of Object.entries(value as Record<string, unknown>)) {
+    assertJsonSerializable(item, `${path}.${k}`, seen);
+  }
+  seen.delete(value);
 }
 
-/** tableUpdate effect hash: method, table, sys_id, canonical(fields), mode, reason. */
+/** Stable key-ordered OBJECT JSON for hashing and PATCH body serialization. */
+export function canonicalObjectJson(fields: Record<string, unknown>): string {
+  const keys = Object.keys(fields).sort();
+  const out: Record<string, unknown> = {};
+  for (const k of keys) {
+    assertJsonSerializable(fields[k], k);
+    out[k] = fields[k];
+  }
+  return JSON.stringify(out);
+}
+
+/** tableUpdate effect hash: method, table, sys_id, canonical(fields), mode, policy scope, reason. */
 export async function tableUpdateRequestHash(input: {
   table: string;
   sysId: string;
-  fields: Record<string, unknown>;
+  bodyJson: string;
   mode: Mode;
+  policyScope: string;
   reason?: string;
 }): Promise<string> {
   return hashValue([
     "tableUpdate",
     input.table,
     input.sysId,
-    canonicalFields(input.fields),
+    input.bodyJson,
     input.mode,
+    input.policyScope,
     input.reason ?? "",
   ]);
 }
@@ -132,8 +169,10 @@ export interface GuardedEffect<T> {
   reason?: string;
   /** Method-specific logical-effect hash (excludes volatile signing fields). */
   requestHash: string;
-  /** Optional gate run BEFORE the effect (approval). Throws to deny. */
+  /** Optional gate run BEFORE the effect (approval/send preflight). Throws to deny. */
   preflight?: () => void | Promise<void>;
+  /** Optional approval gate for completed idempotency replays; must not perform live send checks. */
+  replayPreflight?: () => void | Promise<void>;
   /** Optional before-state capture + durable persist; throws => DENY (fail closed). */
   snapshot?: () => Promise<void>;
   /** before/after content for audit hashing (hashes only — never raw). */
@@ -153,10 +192,25 @@ export function auditKey(utcDateKey: string, requestId: string, ordinal: number)
   return `${utcDateKey}${AUDIT_REQUEST_ID_SEP}${requestId}${AUDIT_REQUEST_ID_SEP}${ordinal}`;
 }
 
+function auditEffectInput<T>(guard: MutationGuard, eff: GuardedEffect<T>, dateKey?: string) {
+  return {
+    ts: guard.now(),
+    ...(dateKey !== undefined ? { dateKey } : {}),
+    requestId: guard.run.requestId,
+    ordinal: eff.ordinal,
+    instance: guard.instance,
+    actor: guard.identity,
+    op: eff.op,
+    ...(eff.table !== undefined ? { table: eff.table } : {}),
+    ...(eff.sysId !== undefined ? { sysId: eff.sysId } : {}),
+    ...(eff.reason !== undefined ? { reason: eff.reason } : {}),
+  };
+}
+
 /**
  * Orchestrate one guarded mutation. Order is a security property:
- *   1. ledger.begin (idempotency) — replay first re-checks the current preflight, then returns
- *      stored result; blocked throws.
+ *   1. ledger.begin (idempotency) — completed replay re-checks only the current replay approval,
+ *      then returns the stored result; blocked throws.
  *   2. preflight gate (approval) — throw => fail() (pre-send) + denial audit.
  *   3. snapshot persist — throw => fail() (pre-send) + denial audit + DENY (fail closed).
  *   4. AUDIT-BEFORE-EFFECT: write the intent row (status "intent"); if the audit WRITE
@@ -204,7 +258,7 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
     const claim = await ledger.begin(eff.requestHash);
     if (claim.state === "replay") {
       try {
-        await eff.preflight?.();
+        await eff.replayPreflight?.();
       } catch (e) {
         await emitDenial(guard, eff, e);
         throw e;
@@ -212,7 +266,7 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
       return claim.result as T;
     }
     if (claim.state === "blocked") {
-      const err = new McpToolError("capability_denied", `Idempotency conflict (${claim.status}) — retry blocked.`, {
+      const err = new McpToolError("idempotency_conflict", `Idempotency conflict (${claim.status}) — retry blocked.`, {
         idempotencyKey: guard.run.runKey,
         ordinal: eff.ordinal,
       });
@@ -251,17 +305,8 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
   if (guard.audit) {
     try {
       const intent = await buildAuditRecord({
-        ts: guard.now(),
-        dateKey: auditDateKey,
-        requestId: guard.run.requestId,
-        ordinal: eff.ordinal,
-        instance: guard.instance,
-        actor: guard.identity,
-        op: eff.op,
-        ...(eff.table !== undefined ? { table: eff.table } : {}),
-        ...(eff.sysId !== undefined ? { sysId: eff.sysId } : {}),
+        ...auditEffectInput(guard, eff, auditDateKey),
         ...(eff.before !== undefined ? { before: eff.before } : {}),
-        ...(eff.reason !== undefined ? { reason: eff.reason } : {}),
         // Distinct PRE-effect state: superseded by "ok"/"error" at the same ordinal key once
         // the effect resolves. A dropped outcome row leaves "intent" — an unresolved intent,
         // never a false success (plan §P4).
@@ -300,18 +345,9 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
   if (guard.audit) {
     try {
       const done = await buildAuditRecord({
-        ts: guard.now(),
-        dateKey: auditDateKey,
-        requestId: guard.run.requestId,
-        ordinal: eff.ordinal,
-        instance: guard.instance,
-        actor: guard.identity,
-        op: eff.op,
-        ...(eff.table !== undefined ? { table: eff.table } : {}),
-        ...(eff.sysId !== undefined ? { sysId: eff.sysId } : {}),
+        ...auditEffectInput(guard, eff, auditDateKey),
         ...(eff.before !== undefined ? { before: eff.before } : {}),
         ...(outcome.after !== undefined ? { after: outcome.after } : {}),
-        ...(eff.reason !== undefined ? { reason: eff.reason } : {}),
         status: "ok",
       });
       await emitAudit(guard.audit, done);
@@ -327,15 +363,7 @@ async function emitDenial<T>(guard: MutationGuard, eff: GuardedEffect<T>, err: u
   if (!guard.audit) return;
   try {
     const rec = await buildAuditRecord({
-      ts: guard.now(),
-      requestId: guard.run.requestId,
-      ordinal: eff.ordinal,
-      instance: guard.instance,
-      actor: guard.identity,
-      op: eff.op,
-      ...(eff.table !== undefined ? { table: eff.table } : {}),
-      ...(eff.sysId !== undefined ? { sysId: eff.sysId } : {}),
-      ...(eff.reason !== undefined ? { reason: eff.reason } : {}),
+      ...auditEffectInput(guard, eff),
       status: "denied",
       errorClass: err instanceof McpToolError ? err.code : "internal_error",
     });
@@ -353,16 +381,7 @@ async function emitOutcomeError<T>(guard: MutationGuard, eff: GuardedEffect<T>, 
   const code = err instanceof McpToolError ? err.code : "internal_error";
   try {
     const rec = await buildAuditRecord({
-      ts: guard.now(),
-      dateKey, // L-2: reuse the intent-time date so this outcome row supersedes its intent row
-      requestId: guard.run.requestId,
-      ordinal: eff.ordinal,
-      instance: guard.instance,
-      actor: guard.identity,
-      op: eff.op,
-      ...(eff.table !== undefined ? { table: eff.table } : {}),
-      ...(eff.sysId !== undefined ? { sysId: eff.sysId } : {}),
-      ...(eff.reason !== undefined ? { reason: eff.reason } : {}),
+      ...auditEffectInput(guard, eff, dateKey), // L-2: reuse the intent-time date so this outcome row supersedes its intent row
       status: "error",
       errorClass: indeterminate ? `${code}:indeterminate` : code,
     });

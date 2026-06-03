@@ -11,11 +11,14 @@ export interface SnRequest {
   path: string;
   query?: Record<string, string>;
   body?: unknown;
+  /** Pre-serialized JSON body; used when callers validate/count exact outbound bytes up front. */
+  bodyJson?: string;
 }
 
 export interface SnResponse {
   status: number;
   json: unknown;
+  headers?: Record<string, string>;
 }
 
 export interface SnHttpClient {
@@ -75,14 +78,15 @@ export class SnFetchClient implements SnHttpClient {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), this.opts.timeoutMs ?? 30_000);
     try {
+      const bodyJson = req.bodyJson ?? (req.body !== undefined ? JSON.stringify(req.body) : undefined);
       const res = await fetchImpl(url.toString(), {
         method: req.method,
         headers: {
           authorization,
           accept: "application/json",
-          ...(req.body !== undefined ? { "content-type": "application/json" } : {}),
+          ...(bodyJson !== undefined ? { "content-type": "application/json" } : {}),
         },
-        ...(req.body !== undefined ? { body: JSON.stringify(req.body) } : {}),
+        ...(bodyJson !== undefined ? { body: bodyJson } : {}),
         // M-7: never auto-follow redirects with the Authorization bearer attached. Cloudflare's
         // runtime forwards `Authorization` across cross-origin redirects (unlike browsers), and the
         // SSRF allowlist (canonicalizeInstanceHost) only validates the INITIAL host — a 3xx from the
@@ -104,7 +108,14 @@ export class SnFetchClient implements SnHttpClient {
       } catch {
         json = { raw: text };
       }
-      return { status: res.status, json };
+      // Only x-total-count is consumed (listTables pagination, discovery.ts); capture just that
+      // instead of materializing the full header map on every SN response.
+      const totalCount = res.headers.get("x-total-count");
+      return {
+        status: res.status,
+        json,
+        ...(totalCount === null ? {} : { headers: { "x-total-count": totalCount } }),
+      };
     } finally {
       clearTimeout(timer);
     }

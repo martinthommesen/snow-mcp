@@ -12,6 +12,7 @@ import { describeTable, type DiscoveryDeps } from "../src/sn/discovery.js";
 import { validateReason, validateUserQuery, assertMandatoryRowFilterSafe } from "../src/sn/validate.js";
 import { McpToolError } from "../src/sn/errors.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
+import { canonicalObjectJson } from "../src/sn/mutation-guard.js";
 
 // ─── P1 — RPC input-validation boundary (closes findings 7/8/9 + comma-injection) ──
 // transpileTs() does not type-check and the sandbox hands `unknown` values, so the RPC
@@ -81,6 +82,30 @@ describe("P1 — identifier validation rejects malformed input", () => {
     expect(http.calls[0]!.query!.sysparm_limit).toBe("1000");
   });
 
+  it("tableQuery requests limit+1 below the cap, slices returned rows, and sets partial precisely", async () => {
+    const http = new MockHttp(() => ({
+      status: 200,
+      json: { result: Array.from({ length: 6 }, (_, i) => ({ sys_id: String(i).padStart(32, "0"), number: `INC${i}` })) },
+    }));
+    const { rpc: r } = rpc({ http });
+    const out = await r.tableQuery({ table: "incident", limit: 5 });
+    expect(http.calls[0]!.query!.sysparm_limit).toBe("6");
+    expect(out.rows).toHaveLength(5);
+    expect(out.partial).toBe(true);
+  });
+
+  it("tableQuery keeps the conservative partial flag at the hard 1000-row cap", async () => {
+    const http = new MockHttp(() => ({
+      status: 200,
+      json: { result: Array.from({ length: 1000 }, (_, i) => ({ sys_id: String(i).padStart(32, "0") })) },
+    }));
+    const { rpc: r } = rpc({ http });
+    const out = await r.tableQuery({ table: "incident", limit: 1000 });
+    expect(http.calls[0]!.query!.sysparm_limit).toBe("1000");
+    expect(out.rows).toHaveLength(1000);
+    expect(out.partial).toBe(true);
+  });
+
   it("tableQuery rejects a malformed requested field name", async () => {
     const { rpc: r } = rpc();
     await expect(r.tableQuery({ table: "incident", fields: ["number", "bad field!"] })).rejects.toMatchObject({
@@ -106,6 +131,11 @@ describe("P1 — identifier validation rejects malformed input", () => {
     await expect(
       r.runServerScript({ script: 123 as unknown as string }),
     ).rejects.toMatchObject({ code: "path_denied" });
+  });
+
+  it("canonical update bodies reject undefined instead of serializing it as null", () => {
+    expect(() => canonicalObjectJson({ short_description: undefined })).toThrow(/JSON-serializable/);
+    expect(canonicalObjectJson({ short_description: null })).toBe('{"short_description":null}');
   });
 
   it("describeTable rejects a comma-injected table name", async () => {
@@ -390,6 +420,9 @@ describe("M-6 — masked fields rejected in query predicates", () => {
   it("DENIES a masked field behind a TEXT operator (salaryLIKE5) — the parser must not stop at the field run", async () => {
     const { rpc: r } = rpc({ policy: maskedPolicy() });
     await expect(r.tableQuery({ table: "incident", query: "salaryLIKE5", fields: ["number"] })).rejects.toMatchObject({
+      code: "actor_policy_denied",
+    });
+    await expect(r.tableQuery({ table: "incident", query: "salaryfoo5", fields: ["number"] })).rejects.toMatchObject({
       code: "actor_policy_denied",
     });
   });

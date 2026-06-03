@@ -8,6 +8,7 @@ import { BUDGETS } from "../config.js";
 export interface RunBudgetLimits {
   rpcCallLimit: number;
   serviceNowRequestLimit: number;
+  maxOutboundBytes: number;
 }
 
 /**
@@ -28,6 +29,7 @@ export class RunBudget {
   serviceNowRequests = 0;
   rowsReturned = 0;
   bytesReturned = 0;
+  outboundBytesSent = 0;
   private readonly limits: RunBudgetLimits;
   private readonly maxRows: number;
   private readonly maxBytes: number;
@@ -78,6 +80,16 @@ export class RunBudget {
     }
   }
 
+  /** Accrue outbound request-body bytes once the request is admitted for send. */
+  countOutboundBytes(n: number): void {
+    if (this.outboundBytesSent + n > this.limits.maxOutboundBytes) {
+      throw new McpToolError("budget_exceeded", `Per-run outbound byte limit (${this.limits.maxOutboundBytes}) exceeded.`, {
+        dimension: "outboundBytesSent",
+      });
+    }
+    this.outboundBytesSent += n;
+  }
+
   /** Snapshot for logging/metrics (plan §4.5 — emit each dimension). */
   snapshot(): Record<string, number> {
     return {
@@ -85,6 +97,7 @@ export class RunBudget {
       serviceNowRequests: this.serviceNowRequests,
       rowsReturned: this.rowsReturned,
       bytesReturned: this.bytesReturned,
+      outboundBytesSent: this.outboundBytesSent,
     };
   }
 }

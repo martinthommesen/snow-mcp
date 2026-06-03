@@ -71,4 +71,39 @@ describe("P1 — SnFetchClient rejects traversal before any fetch", () => {
     await c.request({ method: "GET", path: "/api/now/table/incident" });
     expect(fetched[0]).toContain("/api/now/table/incident");
   });
+
+  it("exposes response headers to callers", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ result: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json", "x-total-count": "42" },
+      })) as unknown as typeof fetch;
+    const c = new SnFetchClient({
+      instanceHost: "dev1.service-now.com",
+      allowlist: { allowedHostSuffixes: ["service-now.com"] },
+      getAuthorization: async () => "Bearer t",
+      fetchImpl,
+    });
+    const res = await c.request({ method: "GET", path: "/api/now/table/sys_db_object" });
+    expect(res.headers?.["x-total-count"]).toBe("42");
+  });
+
+  it("sends pre-serialized bodyJson verbatim instead of re-stringifying req.body", async () => {
+    let body: string | null | undefined;
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      body = init?.body as string | null | undefined;
+      return new Response(JSON.stringify({ result: { ok: true } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const c = new SnFetchClient({
+      instanceHost: "dev1.service-now.com",
+      allowlist: { allowedHostSuffixes: ["service-now.com"] },
+      getAuthorization: async () => "Bearer t",
+      fetchImpl,
+    });
+    await c.request({ method: "PATCH", path: "/api/now/table/incident/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", bodyJson: "{\"a\":1}" });
+    expect(body).toBe("{\"a\":1}");
+  });
 });

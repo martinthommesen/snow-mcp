@@ -5,7 +5,7 @@
 // top via SchemaCache (optional); these functions do the fetch + shaping.
 
 import type { SnHttpClient } from "./http.js";
-import { mapServiceNowError } from "./errors.js";
+import { McpToolError, throwMappedServiceNowError } from "./errors.js";
 import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
 import { assertActorPolicy, isFieldMasked, isTableAllowed, type ActorPolicy } from "../authz/actor-policy.js";
 import { validateTableName } from "./validate.js";
@@ -19,6 +19,7 @@ export interface FieldInfo {
   type: string;
   mandatory: boolean;
   maxLength?: number;
+  referenceTable?: string;
 }
 export interface TableInfo {
   name: string;
@@ -31,6 +32,13 @@ export interface DiscoveryDeps {
   effectiveMode: Mode;
   actorPolicy: ActorPolicy;
   runBudget: RunBudget;
+  credentialMode?: "integration_user" | "per_user_oauth";
+}
+
+export interface ListTablesResult {
+  tables: TableInfo[];
+  partial: boolean;
+  total?: number;
 }
 
 // Mirror of the validate.ts table-name grammar; used to gate hierarchy parents so a
@@ -46,9 +54,10 @@ function esc(v: string): string {
  *  includes inherited fields. Bounded loop; each hop is one ServiceNow request. The
  *  root is a validated table name; each super_class name is re-validated before it
  *  enters the chain so the `nameIN` join cannot be comma-injected. */
-async function tableHierarchy(deps: DiscoveryDeps, table: string): Promise<string[]> {
+async function tableHierarchy(deps: DiscoveryDeps, table: string): Promise<{ chain: string[]; rootExists: boolean }> {
   const chain: string[] = [];
   let current: string | undefined = table;
+  let rootExists = false;
   for (let i = 0; i < 10 && current; i++) {
     if (chain.includes(current)) break;
     chain.push(current);
@@ -63,15 +72,15 @@ async function tableHierarchy(deps: DiscoveryDeps, table: string): Promise<strin
         sysparm_limit: "1",
       },
     });
-    const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-    if (mapped) throw mapped;
+    throwMappedServiceNowError(res);
     const row = (res.json as { result?: Record<string, unknown>[] }).result?.[0];
+    if (i === 0) rootExists = Boolean(row);
     const superName = row ? String(row["super_class.name"] ?? "") : "";
     // Only continue if the parent name is itself a valid table identifier (defense in
     // depth: a malformed super_class.name never reaches the nameIN join).
     current = superName && TABLE_NAME_RE.test(superName) ? superName : undefined;
   }
-  return chain;
+  return { chain, rootExists };
 }
 
 /** Field schema for one table (sys_dictionary), INCLUDING inherited fields. Enforces ActorPolicy. */
@@ -81,7 +90,10 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
   requireCapability(deps.effectiveMode, "readTables");
   deps.runBudget.countRpcCall();
 
-  const chain = await tableHierarchy(deps, validTable);
+  const { chain, rootExists } = await tableHierarchy(deps, validTable);
+  if (!rootExists) {
+    throw new McpToolError("table_not_found", `Table "${validTable}" was not found.`, { table: validTable });
+  }
   const nameIn = chain.map(esc).join(",");
 
   deps.runBudget.countServiceNowRequest();
@@ -90,13 +102,12 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
     path: "/api/now/table/sys_dictionary",
     query: {
       sysparm_query: `nameIN${nameIn}^elementISNOTEMPTY`,
-      sysparm_fields: "element,column_label,internal_type,mandatory,max_length",
+      sysparm_fields: "element,column_label,internal_type,mandatory,max_length,reference,reference.name",
       sysparm_exclude_reference_link: "true",
       sysparm_limit: String(TABLE_PAGE_CAP),
     },
   });
-  const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-  if (mapped) throw mapped;
+  throwMappedServiceNowError(res);
 
   const rows = ((res.json as { result?: Record<string, unknown>[] }).result ?? []);
   deps.runBudget.countRows(rows.length);
@@ -111,6 +122,10 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
     const out: FieldInfo = { name, label: String(r.column_label ?? ""), type, mandatory: String(r.mandatory ?? "false") === "true" };
     const ml = Number(r.max_length);
     if (Number.isFinite(ml) && ml > 0) out.maxLength = ml;
+    if (type === "reference") {
+      const ref = String(r["reference.name"] ?? r.reference ?? "");
+      if (ref) out.referenceTable = ref;
+    }
     byName.set(name, out);
   }
   const fields = [...byName.values()];
@@ -121,7 +136,7 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
 }
 
 /** List tables (sys_db_object), optionally filtered. Drops tables denied by ActorPolicy. */
-export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<TableInfo[]> {
+export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<ListTablesResult> {
   requireCapability(deps.effectiveMode, "readTables");
   deps.runBudget.countRpcCall();
   deps.runBudget.countServiceNowRequest();
@@ -139,8 +154,7 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
       sysparm_limit: String(TABLE_PAGE_CAP),
     },
   });
-  const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-  if (mapped) throw mapped;
+  throwMappedServiceNowError(res);
 
   const rows = ((res.json as { result?: Record<string, unknown>[] }).result ?? []);
   deps.runBudget.countRows(rows.length);
@@ -149,5 +163,13 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
     .filter((t) => t.name && isTableAllowed(deps.actorPolicy, t.name));
   // L-5: meter returned bytes (see describeTable note).
   deps.runBudget.countBytes(utf8Len(JSON.stringify(tables)));
-  return tables;
+  const tablePolicyFilters = (deps.actorPolicy.tables.allow?.length ?? 0) > 0 || (deps.actorPolicy.tables.deny?.length ?? 0) > 0;
+  const totalHeader = res.headers?.["x-total-count"];
+  const total = !tablePolicyFilters && totalHeader !== undefined && /^\d+$/.test(totalHeader) ? Number(totalHeader) : undefined;
+  const partial = total !== undefined ? rows.length < total : rows.length >= TABLE_PAGE_CAP;
+  return {
+    tables,
+    partial,
+    ...(total !== undefined ? { total } : {}),
+  };
 }

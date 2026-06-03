@@ -4,9 +4,9 @@
 // could leak a field that user A can see but user B (same role, failing a field/scripted ACL)
 // cannot. ~24h TTL.
 
-import type { FieldInfo, TableInfo } from "../sn/discovery.js";
+import type { FieldInfo, ListTablesResult } from "../sn/discovery.js";
 
-export const SCHEMA_VERSION = "v1";
+export const SCHEMA_VERSION = "v2";
 export const DEFAULT_SCHEMA_TTL_SEC = 24 * 60 * 60;
 
 const inFlightMisses = new Map<string, Promise<unknown>>();
@@ -64,16 +64,16 @@ export class SchemaCache {
   }
 
   /** Cache-through for a table listing (user-aware; keyed by filter). */
-  async listTables(filter: string | undefined, fetcher: () => Promise<TableInfo[]>): Promise<{ tables: TableInfo[]; cached: boolean }> {
+  async listTables(filter: string | undefined, fetcher: () => Promise<ListTablesResult>): Promise<ListTablesResult & { cached: boolean }> {
     // Collision-proof key: a literal `"*"` filter must NOT alias the no-filter case. Encode
     // PRESENCE structurally — absent is the single char `"0"`, present always starts `"1:"` —
     // so no real filter value can ever collide with the no-filter marker (the old `filter ?? "*"`
     // let `listTables("*")` and `listTables(undefined)` share a key).
     const k = this.key("list", filter === undefined ? "0" : `1:${filter}`);
-    const hit = await this.kv.get<TableInfo[]>(k, "json");
-    if (hit) return { tables: hit, cached: true };
-    const tables = await this.fillMiss(k, fetcher, (value) => this.kv.put(k, JSON.stringify(value), { expirationTtl: this.ttlSec }));
-    return { tables, cached: false };
+    const hit = await this.kv.get<ListTablesResult>(k, "json");
+    if (hit) return { ...hit, cached: true };
+    const result = await this.fillMiss(k, fetcher, (value) => this.kv.put(k, JSON.stringify(value), { expirationTtl: this.ttlSec }));
+    return { ...result, cached: false };
   }
 }
 

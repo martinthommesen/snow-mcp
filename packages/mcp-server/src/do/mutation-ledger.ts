@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 
 // MutationLedgerDO (plan §2.10, §7.3) — leveled idempotency, keyed by
-// idFromName("<userId>|<instanceHost>|<idempotencyKey>"), so each (actor,instance,key)
-// has its own object. Verified locally (S17).
+// idFromName("<userId>|<instanceHost>|<idempotencyKey>:<ordinal>"), so each
+// (actor, instance, key, ordinal) has a stable object across deploys. Verified locally (S17).
 //
 //  Level 1 (host-mediated tableCreate/Update/Delete/importSet/attachment): fully
 //          ledgered — a replay returns the original result.

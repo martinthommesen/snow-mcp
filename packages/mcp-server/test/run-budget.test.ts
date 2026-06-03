@@ -45,4 +45,18 @@ describe("Phase P5 — RunBudget row/byte cap enforcement", () => {
     expect(b.rowsReturned).toBe(1_000_000);
     expect(b.bytesReturned).toBe(1_000_000_000);
   });
+
+  it("countOutboundBytes enforces the per-run outbound body cap with its own dimension", () => {
+    const b = new RunBudget({ ...BUDGETS.perRun, maxOutboundBytes: 10 });
+    b.countOutboundBytes(6);
+    expect(b.outboundBytesSent).toBe(6);
+    try {
+      b.countOutboundBytes(5);
+      throw new Error("expected budget_exceeded");
+    } catch (e) {
+      expect(e).toBeInstanceOf(McpToolError);
+      expect((e as McpToolError).code).toBe("budget_exceeded");
+      expect((e as McpToolError).detail?.dimension).toBe("outboundBytesSent");
+    }
+  });
 });

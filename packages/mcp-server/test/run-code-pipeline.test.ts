@@ -107,6 +107,7 @@ describe("Phase 4 — run_code pipeline", () => {
     );
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("mode_not_permitted");
+    expect(res.structuredContent?.detail).toMatchObject({ ceiling: "read_only", ceilingSource: "scope" });
   });
 
   it("capability gate fires INSIDE the sandbox when read_only calls a write method", async () => {
@@ -192,7 +193,7 @@ describe("Phase 4 — run_code pipeline", () => {
       deps({ scope: "admin_script", tenant: "admin_script", instance: "admin_script" }),
     );
     expect(res.isError).toBe(true);
-    expect(res.structuredContent?.code).toBe("capability_denied");
+    expect(res.structuredContent?.code).toBe("precondition_required");
   });
 
   it("rejects a malformed tool-level idempotencyKey before sandbox execution", async () => {
@@ -398,6 +399,7 @@ describe("Phase 4 — run_code pipeline", () => {
     expect(reconciled?.rowsReturned).toBe(1); // one masked row was returned to the snippet
     expect((reconciled?.bytesReturned ?? 0)).toBeGreaterThan(0); // bytes are now metered
     expect((reconciled?.serviceNowRequests ?? 0)).toBeGreaterThan(0);
+    expect(reconciled?.outboundBytesSent).toBe(0);
   });
 
   it("§P5 — post-run reconcile is STILL called on an ERROR path (finally)", async () => {
@@ -457,6 +459,31 @@ describe("Phase 4 — run_code pipeline", () => {
     );
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("mode_not_permitted");
+    expect(res.structuredContent?.detail).toMatchObject({ ceiling: "read_only", ceilingSource: "tenant" });
+  });
+
+  it("dispatch-level run_code→runServerScript honors the ActorPolicy maxMode ceiling", async () => {
+    const http = new MockHttp();
+    const res = await runCode(
+      {
+        code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')" }); return "done"; }`,
+        mode: "admin_script",
+        reason: "rotate",
+        idempotencyKey: "script-policy-cap",
+      },
+      deps({
+        http,
+        scope: "admin_script",
+        tenant: "admin_script",
+        instance: "admin_script",
+        signing: true,
+        mutation: true,
+        policy: { ...permissivePolicy([INSTANCE]), maxMode: "write" },
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain("maxMode");
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 
   // ─── Phase P5 — byte/row metering is LIVE on all four snippet-visible surfaces ────
