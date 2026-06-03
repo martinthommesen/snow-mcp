@@ -100,6 +100,8 @@ flow:
   the IdP supports it; the Worker re-evaluates group claims before renewing MCP refresh grants.
 - `OIDC_GROUP_POLICY_MAP` — JSON mapping IdP groups to `{ "maxMode": "...", "policy": "..." }`.
   The effective MCP ceiling is the minimum of the MCP client scopes and the mapped group ceiling.
+  If a user belongs to multiple equally privileged mapped groups, those groups must resolve to the
+  same policy; otherwise authorization fails closed until the mapping is unambiguous.
 - `ACTOR_POLICIES_JSON` — optional named ActorPolicies selected from the OIDC group mapping. Include
   a restrictive `"default"` entry if OIDC groups should fall back to a usable default policy. If no
   flat `ACTOR_POLICY_*` default and no JSON `"default"` are configured, the implicit default is
@@ -111,7 +113,9 @@ operator secret in OIDC mode so the shared-secret path cannot remain accidentall
 ### Origins
 - `WORKER_PUBLIC_ORIGIN` — canonical `https://<worker>` origin; required for `per_user_oauth`
   redirect/ticket URLs. (Set this after step 4 prints your Worker URL, or to your known URL.)
-- `ALLOWED_ORIGINS` — comma-separated allowed Origins for `/mcp` and the auth surface.
+- `ALLOWED_ORIGINS` — comma-separated allowed Origins for `/mcp` and the auth surface. In
+  production every entry must be a canonical public HTTPS origin; loopback/private hosts are
+  rejected even if the list is non-empty.
 - `ALLOW_LOCALHOST="true"` — dev only; permits `http://localhost` Origins.
 
 ### Executor path (set after re-scoping in step 2)
@@ -125,6 +129,8 @@ operator secret in OIDC mode so the shared-secret path cannot remain accidentall
 > empty keeps the permissive single-operator default. In `DEPLOYMENT_PROFILE=production`, configure
 > a restrictive default ActorPolicy via the flat `ACTOR_POLICY_*` vars or an explicit JSON
 > `"default"` policy, or the preflight rejects the deploy/boot.
+> If you use `ADMIN_SCRIPT_APPROVAL_TOKENS`, generate each token with `openssl rand -base64 32`;
+> production posture rejects weak approval tokens and the runtime caps incoming token length.
 
 ---
 
@@ -271,10 +277,12 @@ author's namespace GUIDs), so it deploys cleanly into *your* account.
    npm run deploy            # = copy-wasm + alchemy deploy; reads .dev.vars; prints YOUR Worker URL
    # teardown:  npm run deploy:destroy
    ```
-   `DEPLOYMENT_PROFILE` is intentionally breaking: unset/unknown fails closed. For a production
-   profile, Alchemy validates the assembled KV/DO bindings plus the raw secret/config values before
-   uploading the Worker, so the terminal reports the misconfiguration list rather than relying on a
-   later request path to discover it.
+   `DEPLOYMENT_PROFILE` is intentionally breaking: unset/unknown fails closed. Existing local or
+   PDI deployments that relied on implicit defaults should set `DEPLOYMENT_PROFILE=pilot` during
+   migration, then move to `production` after the restrictive policy, public origins, durable
+   bindings, and secrets are ready. For a production profile, Alchemy validates the assembled KV/DO
+   bindings plus the raw secret/config values before uploading the Worker, so the terminal reports
+   the misconfiguration list rather than relying on a later request path to discover it.
    The Worker URL is derived from **your** Cloudflare account subdomain
    (`servicenow-mcp.<your-subdomain>.workers.dev`) — it is not committed. If you set
    `WORKER_PUBLIC_ORIGIN` to a placeholder earlier, update it to the printed URL and redeploy.

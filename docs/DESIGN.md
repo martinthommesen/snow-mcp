@@ -204,7 +204,9 @@ type AuthMode = "operator_secret" | "oidc";
 OIDC grants persist the IdP refresh token in OAuth-provider grant props, but strip it from MCP
 access-token props. On MCP refresh-token exchange the Worker refreshes the IdP token and
 re-evaluates group-derived `maxMode` and `actorPolicyName`, so group removal downgrades both the
-capability ceiling and the table/row/field policy at the next MCP refresh.
+capability ceiling and the table/row/field policy at the next MCP refresh. Equal-risk group
+mappings must agree on the named `ActorPolicy`; conflicting policies at the same risk are rejected
+instead of depending on JSON/object iteration order.
 
 ## ServiceNow OAuth
 

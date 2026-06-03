@@ -46,7 +46,9 @@ do **not** change *who* the script runs as. State it plainly:
 The **second-approval gate** is configured via `ADMIN_SCRIPT_ALLOWLIST` /
 `ADMIN_SCRIPT_APPROVAL_TOKENS` / `ADMIN_SCRIPT_REQUIRED_GROUP`. Empty settings deny
 `admin_script`; a request passes only when the actor is allowlisted and has either a valid
-approval token or the required current access-group membership. The
+approval token or the required current access-group membership. Approval tokens must be
+CSPRNG-generated 32-byte values; production posture rejects weak token entries, and incoming
+request tokens are length-capped before comparison. The
 interactive dry-run→approve branch remains **documented-unsupported** (the stateless
 `createMcpHandler` shape cannot elicit, §3.5).
 

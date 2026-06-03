@@ -38,6 +38,8 @@ There are three independent token lifecycles:
 | OIDC IdP refresh token | OAuth-provider grant props, encrypted by the provider | Used only during MCP refresh-token exchange to re-check IdP groups and update `maxMode` / `actorPolicyName`; revoke at the IdP to stop renewal. |
 | ServiceNow user token | `TokenStoreDO`, encrypted under `TOKEN_KEK_CURRENT` | Revoked by the IdP/ServiceNow OAuth client or by deleting the per `(user, instance)` token envelope. |
 
-Group removal is bounded by the MCP token refresh window: the Worker re-evaluates OIDC claims when
-the MCP refresh token is exchanged, then writes new grant props and strips IdP secrets from the next
-MCP access token.
+Group removal is bounded by the MCP access-token lifetime and refresh cadence: the Worker
+re-evaluates OIDC claims when the MCP refresh token is exchanged, then writes new grant props and
+strips IdP secrets from the next MCP access token. For high-risk `admin_script` use, keep MCP access
+tokens short-lived and prefer the required-group approval branch so the current access token's OIDC
+group set is checked again at the executor gate.
