@@ -45,6 +45,16 @@ export const SIZE_LIMITS = {
   maxLogEntries: 1000, // max number of log entries retained
 } as const;
 
+/** Request-shaping caps for caller-controlled ServiceNow query surfaces. */
+export const SN_REQUEST_LIMITS = {
+  maxEncodedQueryChars: 4096,
+  maxDiscoveryFilterChars: 256,
+  maxFields: 100,
+  maxGroupByFields: 10,
+  maxQueryStringBytes: 8192,
+  maxApprovalTokenChars: 512,
+} as const;
+
 /** Multi-dimensional budgets (plan §2.5). Per-run trips mid-snippet; daily is the hard breaker. */
 export const BUDGETS = {
   perRun: {

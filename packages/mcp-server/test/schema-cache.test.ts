@@ -309,6 +309,62 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     expect(fetches).toBe(1);
   });
 
+  it("wraps uncached list_tables ServiceNow fetches in a daily budget reserve/reconcile", async () => {
+    const host = `inst-discovery-budget-${crypto.randomUUID()}.service-now.com`;
+    const reserves: Array<{ req: Record<string, number>; userId?: string }> = [];
+    const reconciles: Array<{ delta: Record<string, number>; userId?: string }> = [];
+    let fetches = 0;
+    vi.stubGlobal("fetch", (async () => {
+      fetches++;
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+    const budget = {
+      reserve: async (req: Record<string, number>, _cap?: Record<string, number>, userId?: string) => {
+        reserves.push({ req, userId });
+        return { ok: true };
+      },
+      reconcile: async (delta: Record<string, number>, userId?: string) => {
+        reconciles.push({ delta, userId });
+      },
+    };
+
+    const handlers = buildHandlers(
+      {
+        LOADER,
+        BUDGET_DO: {
+          idFromName: (name: string) => name,
+          get: () => budget,
+        } as unknown as DurableObjectNamespace,
+        SNOW_INSTANCE_HOST: host,
+        SNOW_DEV_ROPC: "1",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+      } as HandlerEnv,
+      {
+        userId: "discovery-budget-user",
+        scopeMaxMode: "read_only",
+        props: { userId: "discovery-budget-user", scopes: ["servicenow:read"], maxMode: "read_only" },
+      },
+    );
+
+    const res = await handlers.listTables({});
+    expect(res.isError).not.toBe(true);
+    expect(fetches).toBe(1);
+    expect(reserves).toEqual([
+      {
+        req: expect.objectContaining({ serviceNowRequests: expect.any(Number), outboundBytesSent: expect.any(Number) }) as Record<string, number>,
+        userId: "discovery-budget-user",
+      },
+    ]);
+    expect(reconciles).toHaveLength(1);
+    expect(reconciles[0]!.userId).toBe("discovery-budget-user");
+    expect(reconciles[0]!.delta.rowsReturned).toBe(1);
+    expect(reconciles[0]!.delta.bytesReturned).toBeGreaterThan(0);
+    expect(reconciles[0]!.delta.outboundBytesSent).toBeLessThan(0);
+  });
+
   it("does not serve stale broad cached schema after ActorPolicy is tightened", async () => {
     const host = `inst-policy-${crypto.randomUUID()}.service-now.com`;
     const identity = { principalId: "policy-principal", roleHash: "policy-role" };

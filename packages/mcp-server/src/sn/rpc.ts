@@ -38,10 +38,12 @@ import {
   validateSysId,
   validateLimit,
   validateFields,
+  validateGroupByFields,
   validateUpdateFields,
   validateReason,
   validateUserQuery,
 } from "./validate.js";
+import { countServiceNowQueryBytes } from "./query-budget.js";
 import {
   guardMutation,
   tableUpdateRequestHash,
@@ -241,6 +243,7 @@ export class ServiceNowRPC {
       sysparm_limit: "1",
     };
     if (fields) q.sysparm_fields = fields;
+    countServiceNowQueryBytes(this.deps.runBudget, q);
     this.deps.runBudget.countServiceNowRequest();
     const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}`, query: q });
     throwMappedServiceNowError(res);
@@ -283,6 +286,7 @@ export class ServiceNowRPC {
     if (query) q.sysparm_query = query;
     if (fields) q.sysparm_fields = fields.join(",");
 
+    countServiceNowQueryBytes(this.deps.runBudget, q);
     this.deps.runBudget.countServiceNowRequest();
     const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}`, query: q });
     throwMappedServiceNowError(res);
@@ -313,6 +317,7 @@ export class ServiceNowRPC {
     } else {
       const q: Record<string, string> = { sysparm_exclude_reference_link: "true" };
       if (fieldsParam) q.sysparm_fields = fieldsParam;
+      countServiceNowQueryBytes(this.deps.runBudget, q);
       this.deps.runBudget.countServiceNowRequest();
       const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`, query: q });
       if (res.status === 404) return null;
@@ -332,7 +337,7 @@ export class ServiceNowRPC {
     const userQuery = validateUserQuery(args.query, this.hasMandatoryFilter(table));
     // groupBy fields are field references: validate AND mask-check (no masked field may be
     // grouped on — same boundary as requested read fields).
-    const groupBy = validateFields(args.groupBy);
+    const groupBy = validateGroupByFields(args.groupBy);
     this.gateRead(table, groupBy);
     // M-6: the aggregate `query` is an equality/inference oracle if it can filter on a masked field
     // (groupBy is already mask-checked via gateRead; the predicate was not).
@@ -341,6 +346,7 @@ export class ServiceNowRPC {
     const q: Record<string, string> = { sysparm_count: "true" };
     if (query) q.sysparm_query = query;
     if (groupBy) q.sysparm_group_by = groupBy.join(",");
+    countServiceNowQueryBytes(this.deps.runBudget, q);
     this.deps.runBudget.countServiceNowRequest();
     const res = await this.deps.http.request({ method: "GET", path: `/api/now/stats/${encodeURIComponent(table)}`, query: q });
     throwMappedServiceNowError(res);
@@ -396,11 +402,13 @@ export class ServiceNowRPC {
         if (rowFilterScopeRow) {
           beforeRow = rowFilterScopeRow;
         } else {
+          const q = { sysparm_exclude_reference_link: "true" };
+          countServiceNowQueryBytes(this.deps.runBudget, q);
           this.deps.runBudget.countServiceNowRequest();
           const cur = await this.deps.http.request({
             method: "GET",
             path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`,
-            query: { sysparm_exclude_reference_link: "true" },
+            query: q,
           });
           throwMappedServiceNowError(cur);
           beforeRow = (cur.json as { result?: Record<string, unknown> }).result ?? {};
@@ -469,10 +477,12 @@ export class ServiceNowRPC {
 
   /** Issue the PATCH and map the response. Shared by the guarded + unwired paths. */
   private async patchRow(table: string, sysId: string, bodyJson: string): Promise<Record<string, unknown>> {
+    const q = { sysparm_exclude_reference_link: "true" };
+    countServiceNowQueryBytes(this.deps.runBudget, q);
     const res = await this.deps.http.request({
       method: "PATCH",
       path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`,
-      query: { sysparm_exclude_reference_link: "true" },
+      query: q,
       bodyJson,
     });
     throwMappedServiceNowError(res);

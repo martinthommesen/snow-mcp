@@ -13,6 +13,7 @@ import { validateReason, validateUserQuery, assertMandatoryRowFilterSafe } from 
 import { McpToolError } from "../src/sn/errors.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { canonicalObjectJson } from "../src/sn/mutation-guard.js";
+import { BUDGETS, SN_REQUEST_LIMITS } from "../src/config.js";
 
 // ─── P1 — RPC input-validation boundary (closes findings 7/8/9 + comma-injection) ──
 // transpileTs() does not type-check and the sandbox hands `unknown` values, so the RPC
@@ -35,16 +36,17 @@ class MockHttp implements SnHttpClient {
   }
 }
 
-function rpc(opts?: { http?: MockHttp; policy?: ActorPolicy }): { rpc: ServiceNowRPC; http: MockHttp } {
+function rpc(opts?: { http?: MockHttp; policy?: ActorPolicy; runBudget?: RunBudget }): { rpc: ServiceNowRPC; http: MockHttp; budget: RunBudget } {
   const http = opts?.http ?? new MockHttp();
+  const budget = opts?.runBudget ?? new RunBudget();
   const deps: ServiceNowRpcDeps = {
     http,
     instanceHost: INSTANCE,
     effectiveMode: "admin_script",
     actorPolicy: opts?.policy ?? permissivePolicy([INSTANCE]),
-    runBudget: new RunBudget(),
+    runBudget: budget,
   };
-  return { rpc: new ServiceNowRPC(deps), http };
+  return { rpc: new ServiceNowRPC(deps), http, budget };
 }
 
 const HEX = "0".repeat(32);
@@ -111,6 +113,34 @@ describe("P1 — identifier validation rejects malformed input", () => {
     await expect(r.tableQuery({ table: "incident", fields: ["number", "bad field!"] })).rejects.toMatchObject({
       code: "path_denied",
     });
+  });
+
+  it("caps caller-controlled read field and aggregate groupBy counts", async () => {
+    const { rpc: r, http } = rpc();
+    const tooManyFields = Array.from({ length: SN_REQUEST_LIMITS.maxFields + 1 }, (_, i) => `u_f_${i}`);
+    const tooManyGroups = Array.from({ length: SN_REQUEST_LIMITS.maxGroupByFields + 1 }, (_, i) => `u_g_${i}`);
+    await expect(r.tableQuery({ table: "incident", fields: tooManyFields })).rejects.toMatchObject({ code: "path_denied" });
+    await expect(r.aggregate({ table: "incident", groupBy: tooManyGroups })).rejects.toMatchObject({ code: "path_denied" });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it("caps encoded-query length before reaching ServiceNow", async () => {
+    const { rpc: r, http } = rpc();
+    await expect(
+      r.tableQuery({ table: "incident", query: "a".repeat(SN_REQUEST_LIMITS.maxEncodedQueryChars + 1) }),
+    ).rejects.toMatchObject({ code: "path_denied" });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it("counts final query-string bytes against outboundBytesSent before a GET leaves the host", async () => {
+    const budget = new RunBudget({ ...BUDGETS.perRun, maxOutboundBytes: 10 });
+    const { rpc: r, http } = rpc({ runBudget: budget });
+    await expect(r.tableQuery({ table: "incident", query: "active=true" })).rejects.toMatchObject({
+      code: "budget_exceeded",
+      detail: { dimension: "outboundBytesSent" },
+    });
+    expect(http.calls).toHaveLength(0);
+    expect(budget.outboundBytesSent).toBe(0);
   });
 
   it("tableUpdate rejects update keys that are not strict field names (no dot-walk)", async () => {

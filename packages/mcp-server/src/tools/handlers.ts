@@ -337,6 +337,32 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       }
     : undefined;
 
+  const reserveDiscoveryDailyBudget = budgetObj
+    ? async (): Promise<{ ok: boolean; dimension?: string }> =>
+        budgetObj().reserve(
+          {
+            serviceNowRequests: BUDGETS.perRun.serviceNowRequestLimit,
+            outboundBytesSent: BUDGETS.perRun.maxOutboundBytes,
+          },
+          undefined,
+          userId,
+        )
+    : undefined;
+
+  const reconcileDiscoveryDailyBudget = budgetObj
+    ? async (snapshot: Record<string, number>): Promise<void> => {
+        await budgetObj().reconcile(
+          {
+            serviceNowRequests: (snapshot.serviceNowRequests ?? 0) - BUDGETS.perRun.serviceNowRequestLimit,
+            rowsReturned: snapshot.rowsReturned ?? 0,
+            bytesReturned: snapshot.bytesReturned ?? 0,
+            outboundBytesSent: (snapshot.outboundBytesSent ?? 0) - BUDGETS.perRun.maxOutboundBytes,
+          },
+          userId,
+        );
+      }
+    : undefined;
+
   // §6b — resolve the per-user SN principal's sys_id, lazily, at runServerScript sign time
   // (option (b): the sys_id is consumed ONLY by the signed `snow_effective_user_sys_id` claim,
   // so resolving it here avoids a per-/mcp-request decrypt for reads/writes that never sign).
@@ -500,8 +526,43 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     ...(reconcileDailyBudget ? { reconcileDailyBudget } : {}),
   };
 
-  function discoveryDeps(): DiscoveryDeps {
-    return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget: new RunBudget(), credentialMode: serviceNowCredentialMode };
+  function makeDiscoveryRunBudget(): RunBudget {
+    return new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun });
+  }
+
+  function discoveryDeps(runBudget: RunBudget): DiscoveryDeps {
+    return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget, credentialMode: serviceNowCredentialMode };
+  }
+
+  async function runDiscoveryWithBudget<T>(runBudget: RunBudget, fn: () => Promise<T>): Promise<T> {
+    let reserved = false;
+    if (reserveDiscoveryDailyBudget) {
+      const reservation = await reserveDiscoveryDailyBudget();
+      if (!reservation.ok) {
+        throw new McpToolError("budget_exceeded", `Daily ${reservation.dimension ?? "budget"} cap exhausted.`, {
+          dimension: reservation.dimension,
+        });
+      }
+      reserved = true;
+    }
+    try {
+      return await fn();
+    } finally {
+      if (reserved && reconcileDiscoveryDailyBudget) {
+        try {
+          await reconcileDiscoveryDailyBudget(runBudget.snapshot());
+        } catch (e) {
+          console.error(
+            JSON.stringify({
+              event: "discovery_budget_reconcile_failed",
+              severity: "alert",
+              note: "daily discovery reservation not refunded; serviceNowRequests/outboundBytesSent over-count and rows/bytes may be under-accrued until BUDGET_DO recovers",
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      }
+    }
   }
 
   // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Built lazily so run_code and other
@@ -525,7 +586,10 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     describeTable: async ({ table }): Promise<ToolTextResult> => {
       try {
         const cache = await schemaCache();
-        const fetcher = () => describeTable(discoveryDeps(), table);
+        const fetcher = () => {
+          const runBudget = makeDiscoveryRunBudget();
+          return runDiscoveryWithBudget(runBudget, () => describeTable(discoveryDeps(runBudget), table));
+        };
         const { fields, cached } = cache ? await cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
         return { content: [{ type: "text", text: JSON.stringify({ table, fields }) }], isError: false, structuredContent: { table, fieldCount: fields.length, cached } };
       } catch (e) {
@@ -535,12 +599,22 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     listTables: async ({ filter }): Promise<ToolTextResult> => {
       try {
         const cache = await schemaCache();
-        const fetcher = () => listTables(discoveryDeps(), filter);
-        const { tables, partial, total, cached } = cache ? await cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
+        const fetcher = () => {
+          const runBudget = makeDiscoveryRunBudget();
+          return runDiscoveryWithBudget(runBudget, () => listTables(discoveryDeps(runBudget), filter));
+        };
+        const { tables, partial, total, policyFilteredPartial, warning, cached } = cache ? await cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
         return {
-          content: [{ type: "text", text: JSON.stringify({ tables, partial, ...(total !== undefined ? { total } : {}) }) }],
+          content: [{ type: "text", text: JSON.stringify({ tables, partial, ...(total !== undefined ? { total } : {}), ...(warning ? { warning } : {}) }) }],
           isError: false,
-          structuredContent: { count: tables.length, cached, partial, ...(total !== undefined ? { total } : {}) },
+          structuredContent: {
+            count: tables.length,
+            cached,
+            partial,
+            ...(total !== undefined ? { total } : {}),
+            ...(policyFilteredPartial ? { policyFilteredPartial } : {}),
+            ...(warning ? { warning } : {}),
+          },
         };
       } catch (e) {
         return toToolResult(e);

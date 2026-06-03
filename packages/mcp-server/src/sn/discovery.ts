@@ -8,10 +8,11 @@ import type { SnHttpClient } from "./http.js";
 import { McpToolError, throwMappedServiceNowError } from "./errors.js";
 import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
 import { assertActorPolicy, isFieldMasked, isTableAllowed, type ActorPolicy } from "../authz/actor-policy.js";
-import { validateTableName } from "./validate.js";
+import { validateDiscoveryFilter, validateTableName } from "./validate.js";
 import { utf8Len } from "../sandbox/serialize.js";
 import type { RunBudget } from "./run-budget.js";
 import type { Mode } from "@servicenow-codemode/shared";
+import { countServiceNowQueryBytes } from "./query-budget.js";
 
 export interface FieldInfo {
   name: string;
@@ -39,6 +40,8 @@ export interface ListTablesResult {
   tables: TableInfo[];
   partial: boolean;
   total?: number;
+  policyFilteredPartial?: boolean;
+  warning?: string;
 }
 
 // Mirror of the validate.ts table-name grammar; used to gate hierarchy parents so a
@@ -48,6 +51,19 @@ const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
 function esc(v: string): string {
   // Encoded-query value sanitation: strip ^ and = which would break the query grammar.
   return v.replace(/[\^=]/g, "");
+}
+
+function exactAllowlistNames(policy: ActorPolicy): string[] | undefined {
+  const allow = policy.tables.allow;
+  if (!allow || allow.length === 0) return undefined;
+  const names = allow.filter((rule): rule is string => typeof rule === "string");
+  return names.length === allow.length ? [...new Set(names)].sort() : undefined;
+}
+
+function matchesFilter(table: TableInfo, filter: string | undefined): boolean {
+  if (!filter) return true;
+  const needle = filter.toLowerCase();
+  return table.name.toLowerCase().includes(needle) || table.label.toLowerCase().includes(needle);
 }
 
 /** Resolve a table's inheritance chain (incident -> task -> ...) so describe_table
@@ -61,16 +77,18 @@ async function tableHierarchy(deps: DiscoveryDeps, table: string): Promise<{ cha
   for (let i = 0; i < 10 && current; i++) {
     if (chain.includes(current)) break;
     chain.push(current);
+    const q = {
+      sysparm_query: `name=${esc(current)}`,
+      sysparm_fields: "super_class.name",
+      sysparm_exclude_reference_link: "true",
+      sysparm_limit: "1",
+    };
+    countServiceNowQueryBytes(deps.runBudget, q);
     deps.runBudget.countServiceNowRequest();
     const res = await deps.http.request({
       method: "GET",
       path: "/api/now/table/sys_db_object",
-      query: {
-        sysparm_query: `name=${esc(current)}`,
-        sysparm_fields: "super_class.name",
-        sysparm_exclude_reference_link: "true",
-        sysparm_limit: "1",
-      },
+      query: q,
     });
     throwMappedServiceNowError(res);
     const row = (res.json as { result?: Record<string, unknown>[] }).result?.[0];
@@ -96,16 +114,18 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
   }
   const nameIn = chain.map(esc).join(",");
 
+  const q = {
+    sysparm_query: `nameIN${nameIn}^elementISNOTEMPTY`,
+    sysparm_fields: "element,column_label,internal_type,mandatory,max_length,reference,reference.name",
+    sysparm_exclude_reference_link: "true",
+    sysparm_limit: String(TABLE_PAGE_CAP),
+  };
+  countServiceNowQueryBytes(deps.runBudget, q);
   deps.runBudget.countServiceNowRequest();
   const res = await deps.http.request({
     method: "GET",
     path: "/api/now/table/sys_dictionary",
-    query: {
-      sysparm_query: `nameIN${nameIn}^elementISNOTEMPTY`,
-      sysparm_fields: "element,column_label,internal_type,mandatory,max_length,reference,reference.name",
-      sysparm_exclude_reference_link: "true",
-      sysparm_limit: String(TABLE_PAGE_CAP),
-    },
+    query: q,
   });
   throwMappedServiceNowError(res);
 
@@ -137,22 +157,28 @@ export async function describeTable(deps: DiscoveryDeps, table: string): Promise
 
 /** List tables (sys_db_object), optionally filtered. Drops tables denied by ActorPolicy. */
 export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<ListTablesResult> {
+  const validFilter = validateDiscoveryFilter(filter);
   requireCapability(deps.effectiveMode, "readTables");
   deps.runBudget.countRpcCall();
-  deps.runBudget.countServiceNowRequest();
 
-  const query = filter
-    ? `nameLIKE${esc(filter)}^ORlabelLIKE${esc(filter)}`
-    : "ORDERBYname";
+  const exactAllowlist = exactAllowlistNames(deps.actorPolicy);
+  const query = exactAllowlist && exactAllowlist.length > 0
+    ? `nameIN${exactAllowlist.map(esc).join(",")}^ORDERBYname`
+    : validFilter
+      ? `nameLIKE${esc(validFilter)}^ORlabelLIKE${esc(validFilter)}`
+      : "ORDERBYname";
+  const q = {
+    sysparm_query: query,
+    sysparm_fields: "name,label",
+    sysparm_exclude_reference_link: "true",
+    sysparm_limit: String(TABLE_PAGE_CAP),
+  };
+  countServiceNowQueryBytes(deps.runBudget, q);
+  deps.runBudget.countServiceNowRequest();
   const res = await deps.http.request({
     method: "GET",
     path: "/api/now/table/sys_db_object",
-    query: {
-      sysparm_query: query,
-      sysparm_fields: "name,label",
-      sysparm_exclude_reference_link: "true",
-      sysparm_limit: String(TABLE_PAGE_CAP),
-    },
+    query: q,
   });
   throwMappedServiceNowError(res);
 
@@ -160,16 +186,23 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
   deps.runBudget.countRows(rows.length);
   const tables = rows
     .map((r) => ({ name: String(r.name ?? ""), label: String(r.label ?? "") }))
-    .filter((t) => t.name && isTableAllowed(deps.actorPolicy, t.name));
+    .filter((t) => t.name && isTableAllowed(deps.actorPolicy, t.name) && matchesFilter(t, validFilter));
   // L-5: meter returned bytes (see describeTable note).
   deps.runBudget.countBytes(utf8Len(JSON.stringify(tables)));
   const tablePolicyFilters = (deps.actorPolicy.tables.allow?.length ?? 0) > 0 || (deps.actorPolicy.tables.deny?.length ?? 0) > 0;
   const totalHeader = res.headers?.["x-total-count"];
   const total = !tablePolicyFilters && totalHeader !== undefined && /^\d+$/.test(totalHeader) ? Number(totalHeader) : undefined;
-  const partial = total !== undefined ? rows.length < total : rows.length >= TABLE_PAGE_CAP;
+  let partial = total !== undefined ? rows.length < total : rows.length >= TABLE_PAGE_CAP;
+  if (exactAllowlist && exactAllowlist.length <= TABLE_PAGE_CAP && rows.length < TABLE_PAGE_CAP) partial = false;
+  const policyFilteredPartial = tablePolicyFilters && !exactAllowlist && partial;
+  const warning = policyFilteredPartial
+    ? "Result may omit allowed tables because the ActorPolicy contains non-exact table filters and only one ServiceNow page was fetched."
+    : undefined;
   return {
     tables,
     partial,
     ...(total !== undefined ? { total } : {}),
+    ...(policyFilteredPartial ? { policyFilteredPartial } : {}),
+    ...(warning ? { warning } : {}),
   };
 }
