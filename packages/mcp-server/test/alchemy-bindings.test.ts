@@ -12,7 +12,12 @@ describe("Alchemy deploy bindings", () => {
   });
 
   it("forwards the admin_script second-approval policy into Worker bindings", () => {
-    for (const name of ["ADMIN_SCRIPT_ALLOWLIST", "ADMIN_SCRIPT_APPROVAL_TOKENS", "ADMIN_SCRIPT_REQUIRED_GROUP"]) {
+    for (const name of [
+      "ADMIN_SCRIPT_ALLOWLIST",
+      "ADMIN_SCRIPT_APPROVAL_TOKENS",
+      "ADMIN_SCRIPT_REQUIRED_GROUP",
+      "SNOW_EXECUTOR_VERIFIER_ATTESTED",
+    ]) {
       expect(alchemySource).toContain(`process.env.${name}`);
     }
     expect(alchemySource).toMatch(

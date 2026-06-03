@@ -29,6 +29,11 @@ function reqEnv(k: string): string {
   return v;
 }
 
+const allowPilotDeploy = process.env.ALLOW_PILOT_DEPLOY === "1";
+if (process.env.DEPLOYMENT_PROFILE?.trim() !== "production" && !allowPilotDeploy) {
+  throw new Error('Alchemy deploy requires DEPLOYMENT_PROFILE="production"; use `npm run deploy:pilot` for pilot/dev profiles.');
+}
+
 const app = await alchemy("servicenow-codemode-mcp", {
   // Fail-closed (plan §P6a, finding 26): the Alchemy encrypted-state password MUST be the real
   // OAUTH_PROVIDER_SECRET — never a hardcoded dev fallback. reqEnv throws when it is unset,
@@ -62,6 +67,7 @@ const bindings = {
   SNOW_INSTANCE_HOST: reqEnv("SNOW_INSTANCE_HOST"),
   ...(process.env.DEPLOYMENT_PROFILE ? { DEPLOYMENT_PROFILE: process.env.DEPLOYMENT_PROFILE } : {}),
   ...(process.env.ALLOW_ADMIN_SCRIPT_CEILING ? { ALLOW_ADMIN_SCRIPT_CEILING: process.env.ALLOW_ADMIN_SCRIPT_CEILING } : {}),
+  ...(process.env.SNOW_EXECUTOR_VERIFIER_ATTESTED ? { SNOW_EXECUTOR_VERIFIER_ATTESTED: process.env.SNOW_EXECUTOR_VERIFIER_ATTESTED } : {}),
   ...(process.env.ALLOWED_ORIGINS ? { ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS } : {}),
   ...(process.env.WORKER_PUBLIC_ORIGIN ? { WORKER_PUBLIC_ORIGIN: process.env.WORKER_PUBLIC_ORIGIN } : {}),
   ...(process.env.SNOW_OAUTH_CLIENT_ID ? { SNOW_OAUTH_CLIENT_ID: process.env.SNOW_OAUTH_CLIENT_ID } : {}),

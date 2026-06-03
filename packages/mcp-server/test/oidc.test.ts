@@ -140,7 +140,7 @@ describe("Phase 3 OIDC identity projection", () => {
   it("mins MCP scope with group policy and selects the named ActorPolicy", () => {
     const { grantProps, accessTokenProps } = oidcPropsFromClaims(
       envWithFetch(fetch),
-      { sub: "u1", email: "ada@example.com", groups: ["admins"] },
+      { sub: "u1", email: "ada@example.com", email_verified: true, groups: ["admins"] },
       ["servicenow:write"],
       "RT1",
     );
@@ -154,6 +154,17 @@ describe("Phase 3 OIDC identity projection", () => {
       oidcRefreshToken: "RT1",
     });
     expect(accessTokenProps).not.toHaveProperty("oidcRefreshToken");
+  });
+
+  it("omits unverified OIDC email claims from grant props", () => {
+    const { grantProps, accessTokenProps } = oidcPropsFromClaims(
+      envWithFetch(fetch),
+      { sub: "u-unverified", email: "spoofable@example.com", email_verified: false, groups: ["writers"] },
+      ["servicenow:write"],
+      "RT1",
+    );
+    expect(grantProps).not.toHaveProperty("email");
+    expect(accessTokenProps).not.toHaveProperty("email");
   });
 
   it("normalizes OIDC group policy names the same way production posture does", () => {

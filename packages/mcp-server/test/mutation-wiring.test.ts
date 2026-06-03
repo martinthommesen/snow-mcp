@@ -7,6 +7,7 @@ import { permissivePolicy, type ActorPolicy } from "../src/authz/actor-policy.js
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { mutationLedgerObjectName, type LedgerHandle, type RunContext } from "../src/sn/mutation-guard.js";
 import type { AuditRecord } from "../src/observability/audit.js";
+import { MUTATION_REPLAY_MAX_BYTES } from "../src/sn/replay-payload.js";
 
 // ─── Phase P4 — the unwired safety layers, now WIRED into the live mutating path ─────
 // These exercise the real ServiceNowRPC.tableUpdate / runServerScript against a mock SN,
@@ -176,6 +177,29 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     const replay = await r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     expect(replay).toMatchObject({ updated: true });
     // Replay returns the stored result without re-sending the PATCH.
+    expect(http2.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+  });
+
+  it("returns the same capped shape it stores when a tableUpdate result exceeds the replay cap", async () => {
+    const runKey = `dedup-large-${crypto.randomUUID()}`;
+    const http1 = new MockHttp();
+    http1.patchHandler = () => ({
+      status: 200,
+      json: { result: { sys_id: SYS_ID, notes: "x".repeat(MUTATION_REPLAY_MAX_BYTES + 1024) } },
+    });
+    const r1 = rpc({ http: http1, mutation: mutationDeps({ runContext: { requestId: "r1-large", runKey }, ledger: realLedger(runKey) }) });
+    const first = await r1.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
+    expect(first).toMatchObject({
+      truncated: true,
+      totalBytes: expect.any(Number),
+      serializedResult: expect.any(String),
+    });
+    expect(String(first.serializedResult)).toHaveLength(MUTATION_REPLAY_MAX_BYTES);
+
+    const http2 = new MockHttp();
+    const r2 = rpc({ http: http2, mutation: mutationDeps({ runContext: { requestId: "r2-large", runKey }, ledger: realLedger(runKey) }) });
+    const replay = await r2.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
+    expect(replay).toEqual(first);
     expect(http2.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 
@@ -532,6 +556,50 @@ describe("Phase 1A — row filters are enforced on tableUpdate", () => {
     expect(http.calls.find((c) => c.method === "GET")!.path).toBe("/api/now/table/incident");
   });
 
+  it("stores only the masked tableUpdate result in the idempotency ledger", async () => {
+    const completed: unknown[] = [];
+    const ledger: LedgerHandle = {
+      begin: async () => ({ state: "new" }),
+      complete: async (result) => { completed.push(result); },
+      fail: async () => {},
+      markIndeterminate: async () => {},
+    };
+    const http = new MockHttp();
+    http.getHandler = () => ({ status: 200, json: { result: [{ sys_id: SYS_ID, state: "1" }] } });
+    http.patchHandler = () => ({
+      status: 200,
+      json: { result: { sys_id: SYS_ID, state: "2", caller_id: "raw-caller" } },
+    });
+    const { rpc: r } = scopedRpc({
+      http,
+      ledger: () => ledger,
+    });
+
+    const out = await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
+    expect(out).toEqual({ sys_id: SYS_ID, state: "2" });
+    expect(completed).toEqual([{ sys_id: SYS_ID, state: "2" }]);
+  });
+
+  it("masks legacy completed tableUpdate replay rows that were stored raw", async () => {
+    const ledger: LedgerHandle = {
+      begin: async () => ({ state: "replay", result: { sys_id: SYS_ID, state: "2", caller_id: "raw-caller" } }),
+      complete: async () => {},
+      fail: async () => {},
+      markIndeterminate: async () => {},
+    };
+    const http = new MockHttp();
+    const { rpc: r } = scopedRpc({
+      http,
+      ledger: () => ledger,
+    });
+
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).resolves.toEqual({
+      sys_id: SYS_ID,
+      state: "2",
+    });
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+  });
+
   it("meters the filtered scope-check GET once and does not double-count when reused for the snapshot", async () => {
     const { rpc: r, budget } = scopedRpc({
       snapshotEnabledTables: ["incident"],
@@ -752,6 +820,36 @@ describe("P4 — second-approval gate wired into runServerScript", () => {
       r2.runServerScript({ script: SCRIPT }),
     ).rejects.toMatchObject({ code: "capability_denied" });
     expect(http2.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("replays a completed runServerScript without consuming a ServiceNow request budget slot", async () => {
+    const runKey = `script-replay-budget-${crypto.randomUUID()}`;
+    const approval = { adminScriptAllowlist: ["userA"], validApprovalTokens: new Set(["token-1"]) };
+    const http1 = new MockHttp();
+    const r1 = rpc({
+      http: http1, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-script-replay-budget-1", runKey, reason: "rotate", approvalToken: "token-1" },
+        ledger: realLedger(runKey),
+        approval,
+      }),
+    });
+    await expect(r1.runServerScript({ script: SCRIPT })).resolves.toMatchObject({ ok: true });
+    expect(http1.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+
+    const replayBudget = new RunBudget();
+    const http2 = new MockHttp();
+    const r2 = rpc({
+      http: http2, mode: "admin_script", signing: true, runBudget: replayBudget,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-script-replay-budget-2", runKey, reason: "rotate", approvalToken: "token-1" },
+        ledger: realLedger(runKey),
+        approval,
+      }),
+    });
+    await expect(r2.runServerScript({ script: SCRIPT })).resolves.toMatchObject({ ok: true });
+    expect(http2.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+    expect(replayBudget.serviceNowRequests).toBe(0);
   });
 
   it("treats executor-disabled 503s as clean failures so the runKey can retry", async () => {

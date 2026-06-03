@@ -16,6 +16,7 @@ export interface PostureEnv {
   TOKEN_KEK_CURRENT?: string;
   OAUTH_PROVIDER_SECRET?: string;
   X_MCP_EXECUTOR_HMAC_KEY?: string;
+  SNOW_EXECUTOR_VERIFIER_ATTESTED?: string;
   SNAPSHOT_ENABLED_TABLES?: string;
   SNAPSHOT_KV?: unknown;
   SNAPSHOT_KEK?: string;
@@ -488,6 +489,9 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   }
 
   const allowAdminScript = env.ALLOW_ADMIN_SCRIPT_CEILING === "true";
+  if (allowAdminScript && env.SNOW_EXECUTOR_VERIFIER_ATTESTED !== "true") {
+    violations.push('SNOW_EXECUTOR_VERIFIER_ATTESTED must be "true" before ALLOW_ADMIN_SCRIPT_CEILING=true in production.');
+  }
   validateModeCeiling(violations, "TENANT_MAX_MODE", env.TENANT_MAX_MODE, allowAdminScript);
   validateModeCeiling(violations, "INSTANCE_MAX_MODE", env.INSTANCE_MAX_MODE, allowAdminScript);
 

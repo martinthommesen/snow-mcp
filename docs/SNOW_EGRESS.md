@@ -56,6 +56,9 @@ interactive dry-run→approve branch remains **documented-unsupported** (the sta
 including secret-entropy checks and `X_MCP_EXECUTOR_HMAC_KEY` length validation. Do not enable the
 executor in a pilot profile unless the environment is isolated and the HMAC key has been generated
 and reviewed out of band. Production executor use must pass the production posture preflight.
+`ALLOW_ADMIN_SCRIPT_CEILING=true` is additionally refused unless
+`SNOW_EXECUTOR_VERIFIER_ATTESTED=true`; set that attestation only after the target-family scoped
+executor build/install plus live verifier gates pass.
 
 ## Status
 

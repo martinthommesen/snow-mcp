@@ -267,6 +267,12 @@ describe("Phase 1B production posture", () => {
       TENANT_MAX_MODE: "admin_script" as Mode,
       INSTANCE_MAX_MODE: "admin_script" as Mode,
       ALLOW_ADMIN_SCRIPT_CEILING: "true",
+    }))).toContain('SNOW_EXECUTOR_VERIFIER_ATTESTED must be "true" before ALLOW_ADMIN_SCRIPT_CEILING=true in production.');
+    expect(collectPostureViolations(productionEnv({
+      TENANT_MAX_MODE: "admin_script" as Mode,
+      INSTANCE_MAX_MODE: "admin_script" as Mode,
+      ALLOW_ADMIN_SCRIPT_CEILING: "true",
+      SNOW_EXECUTOR_VERIFIER_ATTESTED: "true",
     }))).toEqual([]);
   });
 

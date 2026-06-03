@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { MUTATION_REPLAY_MAX_BYTES, replaySafeResult } from "../sn/replay-payload.js";
 
 // MutationLedgerDO (plan §2.10, §7.3) — leveled idempotency, keyed by
 // idFromName("<userId>|<instanceHost>|<idempotencyKey>:<ordinal>"), so each
@@ -12,19 +13,87 @@ import { DurableObject } from "cloudflare:workers";
 //          documented limitation, not enforced here.
 
 export type LedgerStatus = "started" | "completed" | "failed" | "indeterminate";
+export const MUTATION_LEDGER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const MUTATION_LEDGER_MAX_REPLAY_BYTES = MUTATION_REPLAY_MAX_BYTES;
 
 export type BeginResult =
   | { state: "new" } // caller should execute
   | { state: "replay"; result: unknown } // return the original result, do NOT re-execute
   | { state: "blocked"; status: LedgerStatus }; // in-flight or indeterminate — do NOT execute
 
-interface LedgerRecord {
+export interface LedgerRecord {
   status: LedgerStatus;
   requestHash: string;
+  expiresAt: number;
   result?: unknown;
 }
 
+const RECORD_KEY = "rec";
+const ledgerStatuses = new Set<LedgerStatus>(["started", "completed", "failed", "indeterminate"]);
+
+function nextExpiry(): number {
+  return Date.now() + MUTATION_LEDGER_RETENTION_MS;
+}
+
+export type NormalizedLedgerRecord =
+  | { kind: "missing" | "expired" }
+  | { kind: "active" | "migrated"; record: LedgerRecord };
+
+export function normalizeLedgerRecordForStorage(
+  rec: Partial<LedgerRecord> | undefined,
+  now: number = Date.now(),
+): NormalizedLedgerRecord {
+  if (!rec || !ledgerStatuses.has(rec.status as LedgerStatus) || typeof rec.requestHash !== "string") {
+    return { kind: "missing" };
+  }
+  if (typeof rec.expiresAt === "number") {
+    if (rec.expiresAt <= now) {
+      if (rec.status === "started" || rec.status === "indeterminate") {
+        return {
+          kind: "migrated",
+          record: {
+            status: rec.status,
+            requestHash: rec.requestHash,
+            expiresAt: now + MUTATION_LEDGER_RETENTION_MS,
+          },
+        };
+      }
+      return { kind: "expired" };
+    }
+    return { kind: "active", record: rec as LedgerRecord };
+  }
+  const record: LedgerRecord = {
+    status: rec.status as LedgerStatus,
+    requestHash: rec.requestHash,
+    expiresAt: now + MUTATION_LEDGER_RETENTION_MS,
+    ...(rec.status === "completed" && "result" in rec ? { result: replaySafeResult(rec.result) } : {}),
+  };
+  return { kind: "migrated", record };
+}
+
 export class MutationLedgerDO extends DurableObject {
+  private async getActiveRecord(): Promise<LedgerRecord | undefined> {
+    const rec = await this.ctx.storage.get<Partial<LedgerRecord>>(RECORD_KEY);
+    const normalized = normalizeLedgerRecordForStorage(rec);
+    if (normalized.kind === "missing" || normalized.kind === "expired") {
+      if (rec) await this.ctx.storage.delete(RECORD_KEY);
+      return undefined;
+    }
+    if (normalized.kind === "migrated") {
+      await this.ctx.storage.put(RECORD_KEY, normalized.record);
+      await this.ctx.storage.setAlarm(normalized.record.expiresAt);
+      return normalized.record;
+    }
+    if (normalized.kind === "active") return normalized.record;
+    return undefined;
+  }
+
+  private async putRecord(rec: Omit<LedgerRecord, "expiresAt">): Promise<void> {
+    const record = { ...rec, expiresAt: nextExpiry() } satisfies LedgerRecord;
+    await this.ctx.storage.put(RECORD_KEY, record);
+    await this.ctx.storage.setAlarm(record.expiresAt);
+  }
+
   /**
    * Claim execution for this idempotency key. Returns:
    *  - "new"     when the caller should execute (first time, or retry after a clean failure),
@@ -33,9 +102,9 @@ export class MutationLedgerDO extends DurableObject {
    * A request-hash mismatch on an existing key is treated as a conflict ("blocked").
    */
   async begin(requestHash: string): Promise<BeginResult> {
-    const rec = await this.ctx.storage.get<LedgerRecord>("rec");
+    const rec = await this.getActiveRecord();
     if (!rec) {
-      await this.ctx.storage.put("rec", { status: "started", requestHash } satisfies LedgerRecord);
+      await this.putRecord({ status: "started", requestHash });
       return { state: "new" };
     }
     if (rec.requestHash !== requestHash) return { state: "blocked", status: rec.status };
@@ -44,7 +113,7 @@ export class MutationLedgerDO extends DurableObject {
         return { state: "replay", result: rec.result };
       case "failed":
         // Clean failure — safe to retry.
-        await this.ctx.storage.put("rec", { status: "started", requestHash } satisfies LedgerRecord);
+        await this.putRecord({ status: "started", requestHash });
         return { state: "new" };
       case "started":
       case "indeterminate":
@@ -57,23 +126,28 @@ export class MutationLedgerDO extends DurableObject {
     // means complete() was called without a matching begin() — it must NOT invent a
     // record (which would stamp a result under an empty requestHash, replaying it for
     // ANY future hash). A stray complete() is a no-op (P4 fix of the :56 fabrication bug).
-    const rec = await this.ctx.storage.get<LedgerRecord>("rec");
+    const rec = await this.getActiveRecord();
     if (!rec) return;
-    await this.ctx.storage.put("rec", { ...rec, status: "completed", result } satisfies LedgerRecord);
+    await this.putRecord({ status: "completed", requestHash: rec.requestHash, result: replaySafeResult(result) });
   }
 
   async fail(): Promise<void> {
-    const rec = await this.ctx.storage.get<LedgerRecord>("rec");
-    if (rec) await this.ctx.storage.put("rec", { ...rec, status: "failed" } satisfies LedgerRecord);
+    const rec = await this.getActiveRecord();
+    if (rec) await this.putRecord({ status: "failed", requestHash: rec.requestHash });
   }
 
   /** Mark an outcome unknown (e.g. runServerScript timed out). Blocks future retries (S17). */
   async markIndeterminate(): Promise<void> {
-    const rec = await this.ctx.storage.get<LedgerRecord>("rec");
-    if (rec) await this.ctx.storage.put("rec", { ...rec, status: "indeterminate" } satisfies LedgerRecord);
+    const rec = await this.getActiveRecord();
+    if (rec) await this.putRecord({ status: "indeterminate", requestHash: rec.requestHash });
   }
 
   async status(): Promise<LedgerStatus | "none"> {
-    return (await this.ctx.storage.get<LedgerRecord>("rec"))?.status ?? "none";
+    return (await this.getActiveRecord())?.status ?? "none";
+  }
+
+  override async alarm(): Promise<void> {
+    const rec = await this.getActiveRecord();
+    if (rec) await this.ctx.storage.setAlarm(rec.expiresAt);
   }
 }

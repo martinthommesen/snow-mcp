@@ -18,7 +18,7 @@ status notes in `docs/archive/GA_CHECKLIST.md` for current production-readiness 
 | Secret scan | Gitleaks GitHub Action | Implemented in CI |
 | Static analysis | CodeQL JavaScript/TypeScript | Implemented in CI |
 | SBOM | CycloneDX npm SBOM artifact | Implemented in CI |
-| Production posture | `DEPLOYMENT_PROFILE=production` preflight passes with restrictive policy, strong secrets, pinned instance, scoped executor path, OIDC/per-user OAuth | Implemented in source; requires real env |
+| Production posture | `DEPLOYMENT_PROFILE=production` preflight passes with restrictive policy, strong secrets, pinned instance, scoped executor path, OIDC/per-user OAuth, and admin-script verifier attestation when enabled | Implemented in source; requires real env |
 | OIDC identity | IdP authorization-code + PKCE, signed ID-token validation, nonce/state replay rejection, refresh-time group/policy re-evaluation | Mock-IdP tests implemented; live IdP tenant pending |
 | Executor proof | `scripts/executor-scoped-verify.mjs` against sub-prod | CI manual-dispatch hook added; operator-run pending |
 | Deployed MCP e2e | `npm run deploy:e2e` against deployed Worker + sub-prod ServiceNow | CI manual-dispatch hook added; operator-run pending |

@@ -102,6 +102,10 @@ flow:
   The effective MCP ceiling is the minimum of the MCP client scopes and the mapped group ceiling.
   If a user belongs to multiple equally privileged mapped groups, those groups must resolve to the
   same policy; otherwise authorization fails closed until the mapping is unambiguous.
+- The Worker uses an OIDC `email` claim for first-time ServiceNow account binding only when the
+  ID token also carries `email_verified=true`. IdPs that omit verified email can still authenticate
+  the MCP user by `sub`, but first-time per-user ServiceNow linking needs an admin-seeded expected
+  ServiceNow sys_id/token or an IdP configuration change that emits a verified email.
 - `ACTOR_POLICIES_JSON` — optional named ActorPolicies selected from the OIDC group mapping. Include
   a restrictive `"default"` entry if OIDC groups should fall back to a usable default policy. If no
   flat `ACTOR_POLICY_*` default and no JSON `"default"` are configured, the implicit default is
@@ -131,6 +135,9 @@ operator secret in OIDC mode so the shared-secret path cannot remain accidentall
 > `"default"` policy, or the preflight rejects the deploy/boot.
 > If you use `ADMIN_SCRIPT_APPROVAL_TOKENS`, generate each token with `openssl rand -base64 32`;
 > production posture rejects weak approval tokens and the runtime caps incoming token length.
+> Production posture also rejects `ALLOW_ADMIN_SCRIPT_CEILING=true` unless
+> `SNOW_EXECUTOR_VERIFIER_ATTESTED=true`. Set that attestation only after the scoped executor build,
+> install, and live verifier gates have passed on the target ServiceNow family/build.
 
 ---
 

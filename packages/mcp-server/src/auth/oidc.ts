@@ -296,7 +296,7 @@ export function oidcPropsFromClaims(env: OidcEnv, claims: JWTPayload, grantedSco
   const groupPolicy = bestGroupPolicy(env, groups);
   const scopeMaxMode = maxModeFromScopes(grantedScopes);
   const maxMode = minByRisk(scopeMaxMode, groupPolicy.maxMode);
-  const email = typeof claims.email === "string" ? claims.email : undefined;
+  const email = typeof claims.email === "string" && claims.email_verified === true ? claims.email : undefined;
   const grantProps: Record<string, unknown> = {
     userId: oidcProviderUserId(sub),
     oidcSubject: sub,

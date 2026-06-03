@@ -18,8 +18,7 @@
 import type { Mode } from "@servicenow-codemode/shared";
 import type { SnHttpClient } from "./http.js";
 import { throwMappedServiceNowError, encodeSandboxError, McpToolError } from "./errors.js";
-import { requireCapability } from "../config.js";
-import { TABLE_PAGE_CAP } from "../config.js";
+import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
 import { RunBudget } from "./run-budget.js";
 import { utf8Len } from "../sandbox/serialize.js";
 import {
@@ -55,6 +54,7 @@ import {
 import type { AuditSink, AuditIdentity } from "./mutation-guard.js";
 import { assertAdminScriptApproved, type ApprovalContext } from "../authz/approval.js";
 import { recoverability } from "../recovery/policy.js";
+import { isReplaySafeWrapper, replaySafeResult } from "./replay-payload.js";
 
 export interface ServiceNowRpcDeps {
   http: SnHttpClient;
@@ -429,7 +429,7 @@ export class ServiceNowRPC {
       this.deps.runBudget.countServiceNowRequest();
     };
 
-    const result = await guardMutation<Record<string, unknown>>(
+    const result = await guardMutation<unknown>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -455,8 +455,9 @@ export class ServiceNowRPC {
           // meter runs immediately before PATCH so denied/replayed mutations do not accrue
           // "sent" bytes; an outbound cap trip is classified as a clean pre-send failure.
           this.deps.runBudget.countOutboundBytes(utf8Len(bodyJson));
-          const result = await this.patchRow(table, sysId, bodyJson);
-          return { result, after: result };
+          const rawResult = await this.patchRow(table, sysId, bodyJson);
+          const maskedResult = replaySafeResult(maskRow(this.deps.actorPolicy, table, rawResult ?? {}));
+          return { result: maskedResult, after: rawResult };
         },
         // Exactly-once (S17): a definitive PRE/at-apply server rejection (401 reauth, 403
         // ACL) means the write did NOT apply -> clean fail() (retry-safe). Anything else —
@@ -466,13 +467,15 @@ export class ServiceNowRPC {
         isIndeterminate: isPostSendUnknown,
       },
     );
+    const visibleResult = isReplaySafeWrapper(result)
+      ? result
+      : replaySafeResult(maskRow(this.deps.actorPolicy, table, (result ?? {}) as Record<string, unknown>));
     // Per-run byte enforcement (§P5): count the PATCH response AFTER guardMutation resolves.
     // Counting inside the effect closure would let a byte-cap throw classify as post-send
     // unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and poison the
     // ledger for a write that actually succeeded (same after-guard placement as runServerScript).
-    const masked = maskRow(this.deps.actorPolicy, table, result ?? {});
-    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(masked ?? null)));
-    return masked;
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(visibleResult ?? null)));
+    return visibleResult as Record<string, unknown>;
   }
 
   /** Issue the PATCH and map the response. Shared by the guarded + unwired paths. */
@@ -592,7 +595,7 @@ export class ServiceNowRPC {
     // The interactive dry-run branch is stateless-unsupported in createMcpHandler, so the
     // supported non-interactive paths are approval token or current access-group membership.
     const approval = mutation.approval ?? { adminScriptAllowlist: [] };
-    const preflight = () =>
+    const approvalPreflight = () =>
       assertAdminScriptApproved({
         ...approval,
         mode: this.deps.effectiveMode,
@@ -601,8 +604,12 @@ export class ServiceNowRPC {
         approvalToken: mutation.runContext.approvalToken,
       });
 
-    // Per-run SN-request budget for the executor POST — counted PRE-guard (clean pre-send).
-    this.deps.runBudget.countServiceNowRequest();
+    const preflight = () => {
+      approvalPreflight();
+      // Per-run SN-request budget for the executor POST — counted inside the normal preflight so
+      // completed idempotency replays re-check approval without burning a ServiceNow request slot.
+      this.deps.runBudget.countServiceNowRequest();
+    };
 
     const result = await guardMutation<unknown>(
       {
@@ -620,11 +627,11 @@ export class ServiceNowRPC {
         reason,
         requestHash,
         preflight,
-        replayPreflight: preflight,
+        replayPreflight: approvalPreflight,
         // runServerScript is NON-RECOVERABLE (recovery/policy.ts) — no snapshot.
         effect: async () => {
           this.deps.runBudget.countOutboundBytes(outboundUpperBoundBytes);
-          return { result: await sendScript(reason) };
+          return { result: replaySafeResult(await sendScript(reason)) };
         },
         isIndeterminate: isPostSendUnknown,
       },

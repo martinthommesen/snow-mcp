@@ -1,5 +1,11 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import {
+  MUTATION_LEDGER_MAX_REPLAY_BYTES,
+  MUTATION_LEDGER_RETENTION_MS,
+  normalizeLedgerRecordForStorage,
+} from "../src/do/mutation-ledger.js";
+import { replaySafeResult } from "../src/sn/replay-payload.js";
 
 // ─── Phase 0.12 — Durable Object partition proof ──────────────────────────────
 // Proves token isolation per (user,instance) and that the GLOBAL budget counter
@@ -57,6 +63,91 @@ describe("Phase 0.12 — BudgetDO global counter coordinates through ONE object"
     await a.increment({ uniqueWorkers: 7 });
     const b = ns.get(ns.idFromName("2026-06-01"));
     expect(await b.get("uniqueWorkers")).toBe(0);
+  });
+});
+
+describe("MutationLedgerDO replay storage", () => {
+  it("migrates legacy rows without expiresAt instead of deleting their idempotency state", () => {
+    const now = 1_700_000_000_000;
+
+    const indeterminate = normalizeLedgerRecordForStorage({ status: "indeterminate", requestHash: "h1" }, now);
+    expect(indeterminate).toMatchObject({
+      kind: "migrated",
+      record: { status: "indeterminate", requestHash: "h1", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
+    });
+
+    const completed = normalizeLedgerRecordForStorage({
+      status: "completed",
+      requestHash: "h2",
+      result: { ok: true },
+    }, now);
+    expect(completed).toMatchObject({
+      kind: "migrated",
+      record: { status: "completed", requestHash: "h2", result: { ok: true } },
+    });
+  });
+
+  it("keeps expired unknown outcomes blocked instead of turning them into fresh claims", () => {
+    const now = 1_700_000_000_000;
+
+    expect(normalizeLedgerRecordForStorage({
+      status: "indeterminate",
+      requestHash: "h1",
+      expiresAt: now - 1,
+    }, now)).toMatchObject({
+      kind: "migrated",
+      record: { status: "indeterminate", requestHash: "h1", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
+    });
+    expect(normalizeLedgerRecordForStorage({
+      status: "started",
+      requestHash: "h2",
+      expiresAt: now - 1,
+    }, now)).toMatchObject({
+      kind: "migrated",
+      record: { status: "started", requestHash: "h2", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
+    });
+    expect(normalizeLedgerRecordForStorage({
+      status: "completed",
+      requestHash: "h3",
+      expiresAt: now - 1,
+      result: { ok: true },
+    }, now)).toEqual({ kind: "expired" });
+  });
+
+  it("caps oversized completed replay payloads before durable storage", async () => {
+    const ns = E.LEDGER_DO;
+    const obj = ns.get(ns.idFromName(`ledger-cap-${crypto.randomUUID()}`));
+    const requestHash = "hash-1";
+
+    await expect(obj.begin(requestHash)).resolves.toEqual({ state: "new" });
+    await obj.complete({ secret: "x".repeat(MUTATION_LEDGER_MAX_REPLAY_BYTES + 1024) });
+
+    const replay = await obj.begin(requestHash);
+    expect(replay).toMatchObject({
+      state: "replay",
+      result: {
+        truncated: true,
+        totalBytes: expect.any(Number),
+        serializedResult: expect.any(String),
+      },
+    });
+    expect((replay as { result: { serializedResult: string } }).result.serializedResult).toHaveLength(
+      MUTATION_LEDGER_MAX_REPLAY_BYTES,
+    );
+  });
+
+  it("does not trust caller-shaped replay wrappers that exceed the cap", () => {
+    const out = replaySafeResult({
+      truncated: true,
+      totalBytes: 1,
+      serializedResult: "x".repeat(MUTATION_LEDGER_MAX_REPLAY_BYTES + 1024),
+    });
+    expect(out).toMatchObject({
+      truncated: true,
+      totalBytes: expect.any(Number),
+      serializedResult: expect.any(String),
+    });
+    expect((out as { serializedResult: string }).serializedResult).toHaveLength(MUTATION_LEDGER_MAX_REPLAY_BYTES);
   });
 });
 

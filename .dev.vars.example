@@ -39,6 +39,7 @@ SERVICENOW_CREDENTIAL_MODE=""        # "per_user_oauth" | "integration_user" (de
 TENANT_MAX_MODE=""                   # mode ceiling: read_only | write | admin_script (default admin_script)
 INSTANCE_MAX_MODE=""                 # mode ceiling: read_only | write | admin_script (default admin_script)
 ALLOW_ADMIN_SCRIPT_CEILING=""        # production only: "true" deliberately permits an admin_script tenant/instance ceiling
+SNOW_EXECUTOR_VERIFIER_ATTESTED=""   # production only: "true" after target-family executor verifier/live gates pass
 ALLOW_LOCALHOST=""                   # "true" to allow http://localhost Origin (dev only; default false)
 ALLOWED_ORIGINS=""                   # comma-separated allowed Origins for /mcp and auth-surface requests
 WORKER_PUBLIC_ORIGIN=""              # canonical https://<worker> origin; required for per_user_oauth redirect/ticket URLs

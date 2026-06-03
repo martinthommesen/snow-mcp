@@ -201,6 +201,11 @@ type AuthMode = "operator_secret" | "oidc";
   `min(MCP requested scopes, OIDC group policy maxMode)`, and `props.actorPolicyName` selects a
   named host-side `ActorPolicy` loaded from `ACTOR_POLICIES_JSON`.
 
+OIDC `email` is treated as a ServiceNow-linking hint only when the signed ID token also carries
+`email_verified=true`. Users whose IdP does not emit verified email can still get MCP grants keyed
+by OIDC `sub`, but first-time ServiceNow account binding needs an admin-seeded expected sys_id/token
+or an IdP-side verified-email configuration.
+
 OIDC grants persist the IdP refresh token in OAuth-provider grant props, but strip it from MCP
 access-token props. On MCP refresh-token exchange the Worker refreshes the IdP token and
 re-evaluates group-derived `maxMode` and `actorPolicyName`, so group removal downgrades both the
