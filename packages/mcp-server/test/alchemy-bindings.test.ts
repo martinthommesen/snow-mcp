@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
 import alchemySource from "../../../alchemy.run.ts?raw";
-import { tokenKekBindings } from "../../../alchemy.bindings";
+import { operatorSecretBindings, parseDevVarLine, tokenKekBindings } from "../../../alchemy.bindings";
 
 describe("Alchemy deploy bindings", () => {
   it("forwards origin config required by auth-surface and per-user OAuth", () => {
@@ -29,7 +29,36 @@ describe("Alchemy deploy bindings", () => {
       "ACTOR_POLICY_MAX_ROWS_PER_RUN",
       "ACTOR_POLICY_MAX_BYTES_PER_RUN",
       "ACTOR_POLICY_MAX_MODE",
+      "ACTOR_POLICIES_JSON",
     ]) {
+      expect(alchemySource).toContain(`process.env.${name}`);
+      expect(alchemySource).toContain(`${name}: process.env.${name}`);
+    }
+  });
+
+  it("forwards OIDC identity-provider config and keeps the client secret secret", () => {
+    for (const name of [
+      "AUTH_MODE",
+      "OIDC_ISSUER",
+      "OIDC_CLIENT_ID",
+      "OIDC_SCOPES",
+      "OIDC_GROUP_CLAIM",
+      "OIDC_GROUP_POLICY_MAP",
+      "OIDC_DEFAULT_POLICY_NAME",
+    ]) {
+      expect(alchemySource).toContain(`process.env.${name}`);
+      expect(alchemySource).toContain(`${name}: process.env.${name}`);
+    }
+    expect(alchemySource).toMatch(/OIDC_CLIENT_SECRET:\s*alchemy\.secret\(process\.env\.OIDC_CLIENT_SECRET\)/);
+  });
+
+  it("does not unconditionally require the operator secret for OIDC deployments", () => {
+    expect(alchemySource).toContain("operatorSecretBindings(process.env");
+    expect(alchemySource).not.toMatch(/MCP_OPERATOR_SECRET:\s*alchemy\.secret\(reqEnv\("MCP_OPERATOR_SECRET"\)\)/);
+  });
+
+  it("forwards optional build metadata for /health/version", () => {
+    for (const name of ["GIT_COMMIT_SHA", "BUILD_TIMESTAMP"]) {
       expect(alchemySource).toContain(`process.env.${name}`);
       expect(alchemySource).toContain(`${name}: process.env.${name}`);
     }
@@ -74,5 +103,39 @@ describe("tokenKekBindings (P2b)", () => {
     expect(() => tokenKekBindings({}, tag)).toThrow(/TOKEN_KEK_CURRENT.*TOKEN_KEK|TOKEN_KEK.*TOKEN_KEK_CURRENT/);
     // Whitespace-only values are treated as unset.
     expect(() => tokenKekBindings({ TOKEN_KEK: "   ", TOKEN_KEK_CURRENT: "" }, tag)).toThrow(/Missing token KEK/);
+  });
+});
+
+describe("operatorSecretBindings", () => {
+  const tag = (v: string) => `secret(${v})`;
+
+  it("does not require or bind MCP_OPERATOR_SECRET when AUTH_MODE=oidc", () => {
+    expect(operatorSecretBindings({ AUTH_MODE: "oidc" }, tag)).toEqual({});
+  });
+
+  it("requires MCP_OPERATOR_SECRET for operator-secret mode", () => {
+    expect(() => operatorSecretBindings({ AUTH_MODE: "operator_secret" }, tag)).toThrow(/MCP_OPERATOR_SECRET/);
+    expect(operatorSecretBindings({ MCP_OPERATOR_SECRET: "operator-secret" }, tag)).toEqual({
+      MCP_OPERATOR_SECRET: "secret(operator-secret)",
+    });
+  });
+});
+
+describe("parseDevVarLine", () => {
+  it("parses quoted values with shell-style inline comments", () => {
+    expect(parseDevVarLine('DEPLOYMENT_PROFILE="pilot" # documented default')).toEqual(["DEPLOYMENT_PROFILE", "pilot"]);
+    expect(parseDevVarLine('OIDC_SCOPES="openid profile email offline_access" # keep refresh')).toEqual([
+      "OIDC_SCOPES",
+      "openid profile email offline_access",
+    ]);
+  });
+
+  it("preserves hashes inside quoted values", () => {
+    expect(parseDevVarLine('VALUE="keep # this" # strip this')).toEqual(["VALUE", "keep # this"]);
+  });
+
+  it("skips comments and malformed lines", () => {
+    expect(parseDevVarLine("# comment")).toBeUndefined();
+    expect(parseDevVarLine("not-a-binding")).toBeUndefined();
   });
 });

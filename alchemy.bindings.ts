@@ -9,6 +9,44 @@ export interface TokenKekEnv {
   TOKEN_KEK_PREV?: string;
 }
 
+export interface OperatorSecretEnv {
+  AUTH_MODE?: string;
+  MCP_OPERATOR_SECRET?: string;
+}
+
+export function parseDevVarLine(raw: string): [string, string] | undefined {
+  const line = raw.trim();
+  if (!line || line.startsWith("#")) return undefined;
+  const eq = line.indexOf("=");
+  if (eq < 0) return undefined;
+  const key = line.slice(0, eq).trim();
+  if (!key) return undefined;
+  let value = line.slice(eq + 1).trim();
+  let quote: string | undefined;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if ((ch === '"' || ch === "'") && (i === 0 || value[i - 1] !== "\\")) {
+      quote = quote === ch ? undefined : quote ?? ch;
+      continue;
+    }
+    if (ch === "#" && quote === undefined && (i === 0 || /\s/.test(value[i - 1]!))) {
+      value = value.slice(0, i).trim();
+      break;
+    }
+  }
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1);
+  }
+  return [key, value];
+}
+
+export function operatorSecretBindings<S>(env: OperatorSecretEnv, secret: (value: string) => S): Record<string, S> {
+  if (env.AUTH_MODE?.trim() === "oidc") return {};
+  const operatorSecret = env.MCP_OPERATOR_SECRET;
+  if (!operatorSecret) throw new Error("Missing MCP_OPERATOR_SECRET in environment/.dev.vars");
+  return { MCP_OPERATOR_SECRET: secret(operatorSecret) };
+}
+
 /**
  * Build the token-KEK Worker secret bindings (P3 versioned ring). The host reads
  * `TOKEN_KEK_CURRENT ?? TOKEN_KEK`, so the deploy must accept EITHER key: require at least one

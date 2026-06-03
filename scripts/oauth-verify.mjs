@@ -5,6 +5,7 @@
 //
 //   node scripts/oauth-verify.mjs
 import { readFileSync, writeFileSync } from "node:fs";
+import { canonicalServiceNowHost } from "./servicenow-host-guard.mjs";
 
 const PATH = ".dev.vars";
 function parse() {
@@ -31,20 +32,27 @@ function setVar(key, val) {
 }
 
 const env = parse();
-const host = env.SNOW_INSTANCE_HOST;
+const host = canonicalServiceNowHost(env.SNOW_INSTANCE_HOST);
 const user = env.SNOW_DEV_ROPC_USERNAME;
 const pass = env.SNOW_DEV_ROPC_PASSWORD;
 const basic = "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
 const CLIENT_NAME = "mcp-codemode-test";
 
+async function fetchJsonNoRedirect(url, init) {
+  const res = await fetch(url, { ...init, redirect: "manual" });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`Refusing redirect from ${new URL(url).origin}`);
+  }
+  return { status: res.status, json: await res.json().catch(() => null), res };
+}
+
 async function table(method, path, body) {
-  const res = await fetch(`https://${host}${path}`, {
+  const { status, json } = await fetchJsonNoRedirect(`https://${host}${path}`, {
     method,
     headers: { authorization: basic, accept: "application/json", ...(body ? { "content-type": "application/json" } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
-  const j = await res.json().catch(() => null);
-  return { status: res.status, json: j };
+  return { status, json };
 }
 
 console.log(`OAuth verify against ${host}\n`);
@@ -81,12 +89,12 @@ console.log("saved SNOW_OAUTH_CLIENT_ID / SNOW_OAUTH_CLIENT_SECRET to .dev.vars"
 
 // 2) ROPC grant (grant_type=password) — MFA-exempt dev path (§2.8).
 async function tokenReq(params) {
-  const res = await fetch(`https://${host}/oauth_token.do`, {
+  const { status, json } = await fetchJsonNoRedirect(`https://${host}/oauth_token.do`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body: new URLSearchParams(params).toString(),
   });
-  return { status: res.status, json: await res.json().catch(() => null) };
+  return { status, json };
 }
 
 const grant = await tokenReq({ grant_type: "password", client_id: clientId, client_secret: clientSecret, username: user, password: pass });
@@ -99,11 +107,10 @@ console.log(`  token_type: ${grant.json?.token_type}, expires_in: ${grant.json?.
 if (!accessToken) { console.log("FAILED: no access_token"); process.exit(1); }
 
 // 3) Use the Bearer token against the Table API (proves the OAuth path end-to-end).
-const q = await fetch(`https://${host}/api/now/table/incident?sysparm_limit=1&sysparm_fields=number`, {
+const { status: qStatus, json: qj } = await fetchJsonNoRedirect(`https://${host}/api/now/table/incident?sysparm_limit=1&sysparm_fields=number`, {
   headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" },
 });
-const qj = await q.json().catch(() => null);
-console.log(`\nBearer query incident -> HTTP ${q.status}; rows: ${qj?.result?.length ?? 0}; sample starts INC: ${String(qj?.result?.[0]?.number ?? "").startsWith("INC")}`);
+console.log(`\nBearer query incident -> HTTP ${qStatus}; rows: ${qj?.result?.length ?? 0}; sample starts INC: ${String(qj?.result?.[0]?.number ?? "").startsWith("INC")}`);
 
 // 4) Refresh-token rotation (B9).
 if (refreshToken) {
@@ -114,6 +121,6 @@ if (refreshToken) {
   console.log(`  refresh rotated: ${Boolean(newRefresh) && newRefresh !== refreshToken}`);
 }
 
-const ok = q.status === 200 && Boolean(accessToken);
+const ok = qStatus === 200 && Boolean(accessToken);
 console.log(`\n${ok ? "OAUTH VERIFY: OK — confidential-client token flow works end-to-end." : "OAUTH VERIFY: FAILED"}`);
 process.exit(ok ? 0 : 1);

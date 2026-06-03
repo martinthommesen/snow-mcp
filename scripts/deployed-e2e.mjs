@@ -2,39 +2,21 @@
 // Proves: (a) unauthenticated /mcp -> 401; (b) full OAuth dance (DCR + PKCE + operator
 // consent) yields a token; (c) authenticated run_code -> Worker Loader sandbox ->
 // ServiceNowRPC -> LIVE ServiceNow; (d) sandbox network isolation (S1).
-import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { readDevVar, resolveDeployedE2eConfig } from "./deployed-e2e-origin.mjs";
 
-// Your deployed Worker base URL — pass as argv[2] or set WORKER_PUBLIC_ORIGIN. No author default.
-// argv > env > .dev.vars (the repo convention this script already uses for MCP_OPERATOR_SECRET).
-const BASE = process.argv[2] ?? process.env.WORKER_PUBLIC_ORIGIN ?? devVar("WORKER_PUBLIC_ORIGIN");
-if (!BASE) {
-  console.error("usage: node scripts/deployed-e2e.mjs <worker-base-url>   (or set WORKER_PUBLIC_ORIGIN in env or .dev.vars)");
+// Your deployed Worker base URL — pass argv[2] only when it matches WORKER_PUBLIC_ORIGIN.
+// The script validates the canonical HTTPS origin before reading/sending MCP_OPERATOR_SECRET.
+let config;
+try {
+  config = resolveDeployedE2eConfig({ argvBase: process.argv[2], env: process.env, devVar: readDevVar });
+} catch (e) {
+  console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);
 }
-
-function devVar(key) {
-  let text;
-  try { text = readFileSync(".dev.vars", "utf8"); } catch { return undefined; }
-  for (const raw of text.split("\n")) {
-    const l = raw.trim();
-    if (!l.startsWith(`${key}=`)) continue;
-    let v = l.slice(key.length + 1).trim();
-    if (v.startsWith('"')) {
-      // Quoted: take only the content between the quotes, ignoring any trailing `# comment`.
-      const end = v.indexOf('"', 1);
-      v = end >= 1 ? v.slice(1, end) : v.slice(1);
-    } else {
-      // Unquoted: drop an inline ` # comment`.
-      const c = v.search(/\s#/);
-      if (c >= 0) v = v.slice(0, c).trim();
-    }
-    return v === "" ? undefined : v; // an empty/blank value reads as unset (falls through to usage).
-  }
-  return undefined;
-}
-const OPERATOR_SECRET = devVar("MCP_OPERATOR_SECRET");
+const BASE = config.base;
+const OPERATOR_SECRET = config.operatorSecret;
 
 const b64url = (buf) => Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 async function pkce() {
