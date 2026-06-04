@@ -58,6 +58,12 @@ async function setProperty(name, value, type = "string") {
   if (ex) { await api("PATCH", `/api/now/table/sys_properties/${ex.sys_id}`, { value }); return "updated"; }
   await api("POST", "/api/now/table/sys_properties", { name, value, type }); return "created";
 }
+async function ensurePropertyDefault(name, value, type = "string") {
+  const ex = (await api("GET", `/api/now/table/sys_properties?sysparm_query=name=${name}&sysparm_limit=1&sysparm_fields=sys_id`)).result?.[0];
+  if (ex) return "kept";
+  await api("POST", "/api/now/table/sys_properties", { name, value, type });
+  return "created";
+}
 // NOTE: ensureTable/ensureColumn/ensureUniqueIndex are intentionally GONE — the SCOPED Fluent app
 // owns the nonce table + its UNIQUE index + the purge job (now-sdk deploys them; the Table API
 // 403s on DDL even for admin). This installer creates NO tables.
