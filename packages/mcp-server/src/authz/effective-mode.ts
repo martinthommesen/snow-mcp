@@ -36,6 +36,8 @@ export interface ModeCeilings {
   instanceMaxMode: Mode;
 }
 
+export type ModeCeilingSource = "scope" | "tenant" | "instance";
+
 /**
  * Parse an env-supplied mode ceiling (§P5). An UNSET var defaults to `admin_script`
  * to preserve "scope is the cap" when no tenant/instance ceiling is configured. A
@@ -49,7 +51,7 @@ export function parseMaxMode(value: string | undefined): Mode {
 
 export type EffectiveModeResult =
   | { ok: true; effective: Mode }
-  | { ok: false; code: "mode_not_permitted"; requested: Mode; ceiling: Mode };
+  | { ok: false; code: "mode_not_permitted"; requested: Mode; ceiling: Mode; ceilingSource: ModeCeilingSource };
 
 /**
  * Resolve the effective mode for a run_code call. `requestedMode` is what the tool
@@ -60,13 +62,22 @@ export function resolveEffectiveMode(
   ceilings: ModeCeilings,
 ): EffectiveModeResult {
   const requested = requestedMode ?? DEFAULT_MODE;
-  const ceiling = minByRisk(ceilings.scopeMaxMode, ceilings.tenantMaxMode, ceilings.instanceMaxMode);
+  const ceilingEntries: { source: ModeCeilingSource; mode: Mode }[] = [
+    { source: "scope", mode: ceilings.scopeMaxMode },
+    { source: "tenant", mode: ceilings.tenantMaxMode },
+    { source: "instance", mode: ceilings.instanceMaxMode },
+  ];
+  let ceilingEntry = ceilingEntries[0]!;
+  for (const entry of ceilingEntries.slice(1)) {
+    if (modeRisk(entry.mode) < modeRisk(ceilingEntry.mode)) ceilingEntry = entry;
+  }
+  const ceiling = ceilingEntry.mode;
 
   // requested may only narrow: if it asks for more risk than the ceiling allows, deny.
   // FAIL-CLOSED (plan §P6a): an unknown `requested` mode scores +Infinity via modeRisk, so
   // this comparison is true and the call is DENIED — never silently capped to admin_script.
   if (modeRisk(requested) > modeRisk(ceiling)) {
-    return { ok: false, code: "mode_not_permitted", requested, ceiling };
+    return { ok: false, code: "mode_not_permitted", requested, ceiling, ceilingSource: ceilingEntry.source };
   }
   return { ok: true, effective: minByRisk(requested, ceiling) };
 }

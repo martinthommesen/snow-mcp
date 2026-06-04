@@ -1,12 +1,55 @@
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import worker, { type Env } from "../src/index.js";
 import { isOriginAllowed } from "../src/observability/origin.js";
 
-describe("Phase 0.7 — /health (served by the OAuth default handler)", () => {
+describe("Phase 0.7 / 1B — health endpoints", () => {
   it("returns ok", async () => {
     const res = await SELF.fetch("http://localhost/health");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, service: "servicenow-codemode-mcp" });
+  });
+
+  it("serves liveness before the OAuth provider", async () => {
+    const res = await SELF.fetch("http://localhost/health/live");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, service: "servicenow-codemode-mcp" });
+  });
+
+  it("serves readiness from the non-throwing posture collector", async () => {
+    const res = await SELF.fetch("http://localhost/health/ready");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      service: "servicenow-codemode-mcp",
+      profile: "pilot",
+      violations: [],
+    });
+  });
+
+  it("redacts public readiness posture details when production config is invalid", async () => {
+    const res = await worker.fetch(
+      new Request("http://localhost/health/ready"),
+      { DEPLOYMENT_PROFILE: "production" } as Env,
+      {} as ExecutionContext,
+    );
+    expect(res.status).toBe(503);
+    const body = await res.json() as { violationCount?: number; violations?: unknown };
+    expect(body.violationCount).toBeGreaterThan(0);
+    expect(body).not.toHaveProperty("violations");
+  });
+
+  it("serves static version metadata without requiring auth", async () => {
+    const res = await SELF.fetch("http://localhost/health/version");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      service: "servicenow-codemode-mcp",
+      appVersion: "0.1.0",
+      compatibilityDate: "2026-05-13",
+      commitSha: null,
+      buildTimestamp: null,
+    });
   });
 });
 

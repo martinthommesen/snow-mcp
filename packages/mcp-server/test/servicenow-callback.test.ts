@@ -23,7 +23,12 @@ const KEK = "token-kek-passphrase";
 const ORIGIN = "https://mcp.example.workers.dev";
 
 /** Mock upstream SN: oauth_token.do (code exchange) + the current_user / role principal fetches. */
-function mockSn(opts: { token?: Record<string, unknown>; failExchange?: boolean; failPrincipal?: boolean } = {}) {
+function mockSn(opts: {
+  token?: Record<string, unknown>;
+  failExchange?: boolean;
+  failPrincipal?: boolean;
+  principal?: Record<string, unknown>;
+} = {}) {
   const calls: { url: string; grant?: string }[] = [];
   const fetchImpl = (async (url: string, init?: RequestInit) => {
     if (url.includes("/oauth_token.do")) {
@@ -37,7 +42,9 @@ function mockSn(opts: { token?: Record<string, unknown>; failExchange?: boolean;
       if (opts.failPrincipal) {
         return new Response(JSON.stringify({ result: {} }), { headers: { "content-type": "application/json" } });
       }
-      return new Response(JSON.stringify({ result: { user_sys_id: "EFF_SYS_ID", user_name: "alice" } }), { headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({
+        result: opts.principal ?? { user_sys_id: "EFF_SYS_ID", user_name: "alice@example.com", email: "alice@example.com" },
+      }), { headers: { "content-type": "application/json" } });
     }
     if (url.includes("/api/now/table/sys_user_has_role")) {
       calls.push({ url });
@@ -64,13 +71,29 @@ function handlerEnv(fetchImpl: typeof fetch): CallbackHandlerEnv {
   };
 }
 
-async function authorize(userId: string, hEnv: CallbackHandlerEnv, instanceHost = HOST, requestOrigin = ORIGIN): Promise<string> {
-  const ticket = await mintTicket({ userId, instanceHost, nonce: crypto.randomUUID(), exp: Date.now() + 60_000 }, SECRET);
+async function authorize(
+  userId: string,
+  hEnv: CallbackHandlerEnv,
+  instanceHost = HOST,
+  requestOrigin = ORIGIN,
+  actorEmail: string | undefined = "alice@example.com",
+  expectedSnSysId?: string,
+): Promise<string> {
+  const ticket = await mintTicket({
+    userId,
+    ...(actorEmail ? { actorEmail } : {}),
+    instanceHost,
+    nonce: crypto.randomUUID(),
+    ...(expectedSnSysId ? { expectedSnSysId } : {}),
+    exp: Date.now() + 60_000,
+  }, SECRET);
   const res = await serviceNowCallbackHandler(
     new Request(`${requestOrigin}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
     hEnv,
   );
   expect(res!.status).toBe(302);
+  expect(res!.headers.get("cache-control")).toBe("no-store");
+  expect(res!.headers.get("referrer-policy")).toBe("no-referrer");
   const location = new URL(res!.headers.get("location")!);
   expect(location.host).toBe(HOST);
   expect(location.searchParams.get("code_challenge_method")).toBe("S256");
@@ -99,6 +122,8 @@ describe("§6b authorize → callback stores a per-user token", () => {
     const state = await authorize("userDance", hEnv);
     const res = await callback(state, hEnv);
     expect(res!.status).toBe(200);
+    expect(res!.headers.get("cache-control")).toBe("no-store");
+    expect(res!.headers.get("referrer-policy")).toBe("no-referrer");
     // The exchange was an authorization_code grant (NOT ROPC), then the principal was resolved.
     expect(calls.some((c) => c.grant === "authorization_code")).toBe(true);
     expect(calls.some((c) => c.grant === "password")).toBe(false);
@@ -106,7 +131,33 @@ describe("§6b authorize → callback stores a per-user token", () => {
     expect(tok?.access_token).toBe("AT");
     expect(tok?.sys_id).toBe("EFF_SYS_ID"); // principal persisted alongside the token
     expect(tok?.roles).toEqual(["itil"]);
+    expect(tok?.user_name).toBe("alice@example.com");
+    expect(tok?.email).toBe("alice@example.com");
     expect(tok?.principal_resolved_at).toEqual(expect.any(Number));
+  });
+
+  it("rejects a first-time binding when neither actor email nor expected sys_id is available", async () => {
+    const { fetchImpl } = mockSn({
+      principal: { user_sys_id: "EMAILLESS_SYS", user_name: "sn-user", email: "" },
+    });
+    const hEnv = handlerEnv(fetchImpl);
+    const state = await authorize("userNoEmailClaim", hEnv, HOST, ORIGIN, "");
+    const res = await callback(state, hEnv);
+    expect(res!.status).toBe(403);
+    expect(await storedTokenFor("userNoEmailClaim")).toBeNull();
+  });
+
+  it("allows no-email reauth when the ticket is pinned to an expected ServiceNow sys_id", async () => {
+    const { fetchImpl } = mockSn({
+      principal: { user_sys_id: "EMAILLESS_SYS", user_name: "sn-user", email: "" },
+    });
+    const hEnv = handlerEnv(fetchImpl);
+    const state = await authorize("userNoEmailReauth", hEnv, HOST, ORIGIN, "", "EMAILLESS_SYS");
+    const res = await callback(state, hEnv);
+    expect(res!.status).toBe(200);
+    const tok = await storedTokenFor("userNoEmailReauth");
+    expect(tok?.sys_id).toBe("EMAILLESS_SYS");
+    expect(tok?.user_name).toBe("sn-user");
   });
 
   it("pins redirect_uri to WORKER_PUBLIC_ORIGIN instead of the request host", async () => {
@@ -117,7 +168,7 @@ describe("§6b authorize → callback stores a per-user token", () => {
   it("consumes each reauth ticket once before creating OAuth state", async () => {
     const { fetchImpl } = mockSn();
     const ticket = await mintTicket(
-      { userId: "userTicketReplay", instanceHost: HOST, nonce: crypto.randomUUID(), exp: Date.now() + 60_000 },
+      { userId: "userTicketReplay", actorEmail: "alice@example.com", instanceHost: HOST, nonce: crypto.randomUUID(), exp: Date.now() + 60_000 },
       SECRET,
     );
     const first = await serviceNowCallbackHandler(
@@ -136,7 +187,7 @@ describe("§6b authorize → callback stores a per-user token", () => {
 describe("§6b callback fails closed", () => {
   it("requires explicit per_user_oauth mode and a configured public origin", async () => {
     const { fetchImpl } = mockSn();
-    const ticket = await mintTicket({ userId: "userNoOrigin", instanceHost: HOST, nonce: "n", exp: Date.now() + 60_000 }, SECRET);
+    const ticket = await mintTicket({ userId: "userNoOrigin", actorEmail: "alice@example.com", instanceHost: HOST, nonce: "n", exp: Date.now() + 60_000 }, SECRET);
 
     const missingOrigin = await serviceNowCallbackHandler(
       new Request(`${ORIGIN}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
@@ -173,7 +224,7 @@ describe("§6b callback fails closed", () => {
     // Authorize with a ticket for a DIFFERENT instance: /authorize itself rejects the mismatch,
     // so no record is ever created — a callback can never use a wrong-instance state.
     const ticket = await mintTicket(
-      { userId: "userWrongInst", instanceHost: "other.service-now.com", nonce: "n", exp: Date.now() + 60_000 },
+      { userId: "userWrongInst", actorEmail: "alice@example.com", instanceHost: "other.service-now.com", nonce: "n", exp: Date.now() + 60_000 },
       SECRET,
     );
     const res = await serviceNowCallbackHandler(
@@ -201,6 +252,45 @@ describe("§6b callback fails closed", () => {
     expect(await storedTokenFor("userPrincipalFail")).toBeNull();
   });
 
+  it("a ServiceNow principal whose email/user_name does not match the MCP actor issues no token", async () => {
+    const { fetchImpl } = mockSn({
+      principal: { user_sys_id: "VICTIM_SYS", user_name: "victim@example.com", email: "victim@example.com" },
+    });
+    const hEnv = handlerEnv(fetchImpl);
+    const state = await authorize("attackerUser", hEnv, HOST, ORIGIN, "attacker@example.com");
+    const res = await callback(state, hEnv);
+    expect(res!.status).toBe(403);
+    expect(await storedTokenFor("attackerUser")).toBeNull();
+  });
+
+  it("an expected ServiceNow sys_id binding cannot be swapped even when email matches", async () => {
+    const { fetchImpl } = mockSn({
+      principal: { user_sys_id: "NEW_SYS", user_name: "alice@example.com", email: "alice@example.com" },
+    });
+    const hEnv = handlerEnv(fetchImpl);
+    const state = await authorize("userBound", hEnv, HOST, ORIGIN, "alice@example.com", "OLD_SYS");
+    const res = await callback(state, hEnv);
+    expect(res!.status).toBe(403);
+    expect(await storedTokenFor("userBound")).toBeNull();
+  });
+
+  it("allows reauth to replace an unreadable stored token while preserving actor-email binding", async () => {
+    const { fetchImpl } = mockSn({
+      principal: { user_sys_id: "REPLACEMENT_SYS", user_name: "alice@example.com", email: "alice@example.com" },
+    });
+    const userId = "userUnreadableReauth";
+    const hEnv = handlerEnv(fetchImpl);
+    const corruptBackend = E.TOKEN_DO.get(E.TOKEN_DO.idFromName(`${userId}|${HOST}`));
+    await corruptBackend.putToken("servicenow", "not-json-not-decryptable");
+
+    const state = await authorize(userId, hEnv);
+    const res = await callback(state, hEnv);
+    expect(res!.status).toBe(200);
+    const tok = await storedTokenFor(userId);
+    expect(tok?.access_token).toBe("AT");
+    expect(tok?.sys_id).toBe("REPLACEMENT_SYS");
+  });
+
   it("/servicenow/authorize with an invalid ticket → 401, no flow started", async () => {
     const { fetchImpl } = mockSn();
     const res = await serviceNowCallbackHandler(
@@ -217,6 +307,7 @@ describe("§6b AuthCorrelationDO expiry cleanup", () => {
     const stub = E.AUTH_DO.get(E.AUTH_DO.idFromName(`state:${state}`));
     await stub.createRecord(state, {
       userId: "abandonedUser",
+      actorEmail: "alice@example.com",
       instanceHost: HOST,
       pkceVerifier: "verifier",
       expiresAt: Date.now() - 1,
@@ -231,6 +322,7 @@ describe("§6b AuthCorrelationDO expiry cleanup", () => {
     const stub = E.AUTH_DO.get(E.AUTH_DO.idFromName(`state:${state}`));
     const record = {
       userId: "futureUser",
+      actorEmail: "alice@example.com",
       instanceHost: HOST,
       pkceVerifier: "verifier",
       expiresAt: Date.now() + 60_000,

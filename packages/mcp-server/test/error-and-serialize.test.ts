@@ -26,6 +26,9 @@ describe("parseSandboxError — membership-checked code (§P2)", () => {
   it("ERROR_CODES contains run_error and is otherwise complete", () => {
     expect(ERROR_CODES).toContain("run_error");
     expect(ERROR_CODES).toContain("budget_exceeded");
+    expect(ERROR_CODES).toContain("table_not_found");
+    expect(ERROR_CODES).toContain("precondition_required");
+    expect(ERROR_CODES).toContain("idempotency_conflict");
     expect(new Set(ERROR_CODES).size).toBe(ERROR_CODES.length);
   });
 });
@@ -53,11 +56,25 @@ describe("mapServiceNowError — generic client message, typed code (§P6a, find
 
   it("maps the status families to generic messages (5xx -> instance_hibernating)", () => {
     expect(mapServiceNowError(401)!.code).toBe("reauth_required");
+    expect(mapServiceNowError(404)!.code).toBe("table_not_found");
     expect(mapServiceNowError(429)!.code).toBe("budget_exceeded");
     const five = mapServiceNowError(503, { error: { message: "node 7 down" } });
     expect(five!.code).toBe("instance_hibernating");
     expect(five!.message).toBe("ServiceNow is unavailable (5xx).");
     expect(five!.message).not.toContain("node 7 down");
+  });
+
+  it("maps definitive ServiceNow 4xxs to clean typed failures instead of internal_error", () => {
+    expect(mapServiceNowError(400, { error: { message: "encoded query error on sys_user" } })!.code).toBe("path_denied");
+    expect(mapServiceNowError(413, { error: "code_size" })!.code).toBe("code_size");
+    expect(mapServiceNowError(413, { error: { message: "payload too large" } })!.code).toBe("path_denied");
+  });
+
+  it("maps executor-disabled 503s to a clean capability denial", () => {
+    const disabled = mapServiceNowError(503, { error: "executor_disabled" });
+    expect(disabled).toBeInstanceOf(McpToolError);
+    expect(disabled!.code).toBe("capability_denied");
+    expect(disabled!.message).toMatch(/executor is disabled/i);
   });
 
   it("the generic message survives through toToolResult with the typed code (discovery path)", () => {
@@ -117,5 +134,25 @@ describe("truncateUtf8 / serializeResult — byte-safe truncation (§P2)", () =>
     expect(utf8Len(ser.text)).toBeLessThanOrEqual(200);
     expect(ser.text).not.toContain("�");
     expect(ser.totalBytes).toBe(utf8Len(JSON.stringify(value)));
+  });
+
+  it("serializeResult reports the first non-JSON path and includes a sanitized value", () => {
+    const value: { count: bigint; nested?: unknown } = { count: 1n };
+    value.nested = { self: value };
+    const ser = serializeResult(value, 10_000);
+    expect(ser.truncated).toBe(false);
+    const parsed = JSON.parse(ser.text) as { error: string; path: string; value: { count: string; nested: { self: string } } };
+    expect(parsed.error).toBe("result_not_serializable");
+    expect(parsed.path).toBe("$.count");
+    expect(parsed.value.count).toBe("1");
+    expect(parsed.value.nested.self).toBe("[Circular]");
+  });
+
+  it("serializeResult truncates the sanitized fallback within the byte cap", () => {
+    const value = { count: 1n, payload: "x".repeat(1000) };
+    const ser = serializeResult(value, 80);
+    expect(ser.truncated).toBe(true);
+    expect(utf8Len(ser.text)).toBeLessThanOrEqual(80);
+    expect(ser.totalBytes).toBeGreaterThan(80);
   });
 });

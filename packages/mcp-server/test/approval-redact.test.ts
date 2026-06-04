@@ -48,15 +48,20 @@ describe("§7.1 redaction", () => {
     expect(redactString("authorization: Bearer abcdef1234567890")).toContain(REDACTED);
     expect(redactString("Basic dXNlcjpwYXNzd29yZA==")).toContain(REDACTED);
     expect(redactString("client_secret=supersecretvalue here")).toContain(REDACTED);
+    expect(redactString("OIDC_CLIENT_SECRET=oidc-secret-value")).toContain(REDACTED);
+    expect(redactString("accessToken=access-secret-value")).toContain(REDACTED);
+    expect(redactString("approvalToken=approval-secret-value")).toContain(REDACTED);
+    expect(redactString("operator_secret=operator-secret-value")).toContain(REDACTED);
     expect(redactString("nothing sensitive here")).toBe("nothing sensitive here");
   });
 
   it("deep-redacts denylisted fields in objects", () => {
-    const obj = { user: "ada", password: "p@ss", nested: { refresh_token: "rt", ok: "keep" }, authorization: "Bearer x" };
+    const obj = { user: "ada", password: "p@ss", nested: { refresh_token: "rt", accessToken: "at", ok: "keep" }, authorization: "Bearer x" };
     const r = redactValue(obj) as Record<string, unknown>;
     expect(r.user).toBe("ada");
     expect(r.password).toBe(REDACTED);
     expect((r.nested as Record<string, unknown>).refresh_token).toBe(REDACTED);
+    expect((r.nested as Record<string, unknown>).accessToken).toBe(REDACTED);
     expect((r.nested as Record<string, unknown>).ok).toBe("keep");
     expect(r.authorization).toBe(REDACTED);
   });

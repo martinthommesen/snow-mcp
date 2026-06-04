@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runCode, type RunCodeDeps } from "../src/tools/run_code.js";
 import { ServiceNowRPC } from "../src/sn/rpc.js";
 import { RunBudget } from "../src/sn/run-budget.js";
-import { BUDGETS } from "../src/config.js";
+import { BUDGETS, SN_REQUEST_LIMITS } from "../src/config.js";
 import { permissivePolicy, type ActorPolicy } from "../src/authz/actor-policy.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { McpToolError } from "../src/sn/errors.js";
@@ -107,6 +107,7 @@ describe("Phase 4 — run_code pipeline", () => {
     );
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("mode_not_permitted");
+    expect(res.structuredContent?.detail).toMatchObject({ ceiling: "read_only", ceilingSource: "scope" });
   });
 
   it("capability gate fires INSIDE the sandbox when read_only calls a write method", async () => {
@@ -192,7 +193,7 @@ describe("Phase 4 — run_code pipeline", () => {
       deps({ scope: "admin_script", tenant: "admin_script", instance: "admin_script" }),
     );
     expect(res.isError).toBe(true);
-    expect(res.structuredContent?.code).toBe("capability_denied");
+    expect(res.structuredContent?.code).toBe("precondition_required");
   });
 
   it("rejects a malformed tool-level idempotencyKey before sandbox execution", async () => {
@@ -202,6 +203,29 @@ describe("Phase 4 — run_code pipeline", () => {
     );
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("path_denied");
+  });
+
+  it("rejects an oversized tool-level approvalToken before sandbox execution", async () => {
+    let buildRpcCalled = false;
+    const base = deps({ scope: "admin_script", tenant: "admin_script", instance: "admin_script" });
+    const res = await runCode(
+      {
+        code: `async () => 1`,
+        mode: "admin_script",
+        reason: "approve",
+        approvalToken: "x".repeat(SN_REQUEST_LIMITS.maxApprovalTokenChars + 1),
+      },
+      {
+        ...base,
+        buildRpc: (...args) => {
+          buildRpcCalled = true;
+          return base.buildRpc(...args);
+        },
+      },
+    );
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent?.code).toBe("path_denied");
+    expect(buildRpcCalled).toBe(false);
   });
 
   it("daily budget reserve-before-load blocks BEFORE transpile (no billable Worker)", async () => {
@@ -398,6 +422,7 @@ describe("Phase 4 — run_code pipeline", () => {
     expect(reconciled?.rowsReturned).toBe(1); // one masked row was returned to the snippet
     expect((reconciled?.bytesReturned ?? 0)).toBeGreaterThan(0); // bytes are now metered
     expect((reconciled?.serviceNowRequests ?? 0)).toBeGreaterThan(0);
+    expect((reconciled?.outboundBytesSent ?? 0)).toBeGreaterThan(0); // query strings are outbound bytes
   });
 
   it("§P5 — post-run reconcile is STILL called on an ERROR path (finally)", async () => {
@@ -457,6 +482,31 @@ describe("Phase 4 — run_code pipeline", () => {
     );
     expect(res.isError).toBe(true);
     expect(res.structuredContent?.code).toBe("mode_not_permitted");
+    expect(res.structuredContent?.detail).toMatchObject({ ceiling: "read_only", ceilingSource: "tenant" });
+  });
+
+  it("dispatch-level run_code→runServerScript honors the ActorPolicy maxMode ceiling", async () => {
+    const http = new MockHttp();
+    const res = await runCode(
+      {
+        code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')" }); return "done"; }`,
+        mode: "admin_script",
+        reason: "rotate",
+        idempotencyKey: "script-policy-cap",
+      },
+      deps({
+        http,
+        scope: "admin_script",
+        tenant: "admin_script",
+        instance: "admin_script",
+        signing: true,
+        mutation: true,
+        policy: { ...permissivePolicy([INSTANCE]), maxMode: "write" },
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain("maxMode");
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 
   // ─── Phase P5 — byte/row metering is LIVE on all four snippet-visible surfaces ────

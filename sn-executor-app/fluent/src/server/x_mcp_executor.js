@@ -67,11 +67,12 @@ function utf8Slice(s, maxBytes) {
     // scoped vendor prefix x_1793136_mcp.executor.* (plan §P7 item 5). Finding 7: ALSO honor the
     // LEGACY x_mcp.executor.* namespace so an operator who disabled the executor BEFORE upgrading
     // keeps it disabled — fail-closed if EITHER namespace is explicitly off. gs.getProperty
-    // returns the 'true' default when a name is absent/unreadable, so a fresh scoped install (no
-    // legacy property) is unaffected and only an explicit legacy 'false' disables. NOTE: the
+    // returns the fail-closed 'false' default for the scoped properties when a fresh install has
+    // not enabled them yet. The legacy namespace remains neutral: only an explicit legacy 'false'
+    // disables, so upgrades from pre-scoped installs preserve an operator's prior disable. NOTE: the
     // cross-scope read of the legacy global property is pending live P8 confirmation; if blocked,
     // the default makes the legacy check a no-op — never LESS safe than the prior code.
-    if (gs.getProperty('x_1793136_mcp.executor.enabled', 'true') !== 'true' ||
+    if (gs.getProperty('x_1793136_mcp.executor.enabled', 'false') !== 'true' ||
         gs.getProperty('x_mcp.executor.enabled', 'true') !== 'true') {
         audit.status = 'killed'
         audit.update()
@@ -79,7 +80,7 @@ function utf8Slice(s, maxBytes) {
         response.setBody({ error: 'executor_disabled', audit_id: auditId + '' })
         return
     }
-    if (gs.getProperty('x_1793136_mcp.executor.run_server_script_enabled', 'true') !== 'true' ||
+    if (gs.getProperty('x_1793136_mcp.executor.run_server_script_enabled', 'false') !== 'true' ||
         gs.getProperty('x_mcp.executor.run_server_script_enabled', 'true') !== 'true') {
         audit.status = 'killed'
         audit.error_class = 'egress_disabled'

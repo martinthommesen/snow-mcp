@@ -1,0 +1,11 @@
+# Security-sensitive connector code needs an explicit owner review before merge.
+* @t979259
+
+/.github/ @t979259
+/alchemy.run.ts @t979259
+/packages/mcp-server/src/auth/ @t979259
+/packages/mcp-server/src/authz/ @t979259
+/packages/mcp-server/src/do/ @t979259
+/packages/mcp-server/src/sn/ @t979259
+/sn-executor-app/ @t979259
+/scripts/ @t979259

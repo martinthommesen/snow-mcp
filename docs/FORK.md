@@ -45,6 +45,13 @@ cp .dev.vars.example .dev.vars     # .dev.vars is git-ignored — NEVER commit i
 
 Then edit `.dev.vars`. The load-bearing variables:
 
+### Deployment profile
+- `DEPLOYMENT_PROFILE` — must be explicit. Use `pilot` for local/dev/PDI-style bring-up where the
+  historical permissive single-operator defaults are acceptable. Use `production` to enable the
+  fail-closed preflight: restrictive ActorPolicy, `per_user_oauth`, strong secrets, durable
+  bindings, pinned instance host, non-admin ceilings, and the scoped executor path are all checked
+  before deploy/runtime traffic proceeds. Leaving this unset now fails closed.
+
 ### ServiceNow connection
 - `SNOW_INSTANCE_HOST` — your instance FQDN, e.g. `dev12345.service-now.com`. The host canonicalizes
   this against the `service-now.com` allowlist before any credentialed fetch.
@@ -84,10 +91,35 @@ Generate every one of these with `openssl rand -base64 32`:
 - `MCP_OPERATOR_ACCESS_GROUPS` (optional) — comma-separated groups for the admin_script second
   approval.
 
+For enterprise identity, set `AUTH_MODE=oidc` instead of using the shared operator-secret consent
+flow:
+
+- `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` — OIDC confidential client for the Worker
+  as a relying party. The Worker validates issuer, audience, signature algorithm, and nonce.
+- `OIDC_SCOPES` — defaults to `openid profile email offline_access`. Keep `offline_access` when
+  the IdP supports it; the Worker re-evaluates group claims before renewing MCP refresh grants.
+- `OIDC_GROUP_POLICY_MAP` — JSON mapping IdP groups to `{ "maxMode": "...", "policy": "..." }`.
+  The effective MCP ceiling is the minimum of the MCP client scopes and the mapped group ceiling.
+  If a user belongs to multiple equally privileged mapped groups, those groups must resolve to the
+  same policy; otherwise authorization fails closed until the mapping is unambiguous.
+- The Worker uses an OIDC `email` claim for first-time ServiceNow account binding only when the
+  ID token also carries `email_verified=true`. IdPs that omit verified email can still authenticate
+  the MCP user by `sub`, but first-time per-user ServiceNow linking needs an admin-seeded expected
+  ServiceNow sys_id/token or an IdP configuration change that emits a verified email.
+- `ACTOR_POLICIES_JSON` — optional named ActorPolicies selected from the OIDC group mapping. Include
+  a restrictive `"default"` entry if OIDC groups should fall back to a usable default policy. If no
+  flat `ACTOR_POLICY_*` default and no JSON `"default"` are configured, the implicit default is
+  deny-all; a grant naming any other missing policy is also deny-all.
+
+When `AUTH_MODE=oidc`, leave `MCP_OPERATOR_SECRET` unset. The production preflight rejects an
+operator secret in OIDC mode so the shared-secret path cannot remain accidentally enabled.
+
 ### Origins
 - `WORKER_PUBLIC_ORIGIN` — canonical `https://<worker>` origin; required for `per_user_oauth`
   redirect/ticket URLs. (Set this after step 4 prints your Worker URL, or to your known URL.)
-- `ALLOWED_ORIGINS` — comma-separated allowed Origins for `/mcp` and the auth surface.
+- `ALLOWED_ORIGINS` — comma-separated allowed Origins for `/mcp` and the auth surface. In
+  production every entry must be a canonical public HTTPS origin; loopback/private hosts are
+  rejected even if the list is non-empty.
 - `ALLOW_LOCALHOST="true"` — dev only; permits `http://localhost` Origins.
 
 ### Executor path (set after re-scoping in step 2)
@@ -97,8 +129,15 @@ Generate every one of these with `openssl rand -base64 32`:
 
 > `admin_script` is **default-deny**. `run_code` in `admin_script` mode is rejected
 > (`capability_denied`) unless the acting MCP user is in `ADMIN_SCRIPT_ALLOWLIST`. `read_only` and
-> `write` modes are unaffected. Leave the `ACTOR_POLICY_*` vars empty to keep the permissive
-> single-operator default, or set any of them to build a restrictive host-side policy.
+> `write` modes are unaffected. In `DEPLOYMENT_PROFILE=pilot`, leaving the `ACTOR_POLICY_*` vars
+> empty keeps the permissive single-operator default. In `DEPLOYMENT_PROFILE=production`, configure
+> a restrictive default ActorPolicy via the flat `ACTOR_POLICY_*` vars or an explicit JSON
+> `"default"` policy, or the preflight rejects the deploy/boot.
+> If you use `ADMIN_SCRIPT_APPROVAL_TOKENS`, generate each token with `openssl rand -base64 32`;
+> production posture rejects weak approval tokens and the runtime caps incoming token length.
+> Production posture also rejects `ALLOW_ADMIN_SCRIPT_CEILING=true` unless
+> `SNOW_EXECUTOR_VERIFIER_ATTESTED=true`. Set that attestation only after the scoped executor build,
+> install, and live verifier gates have passed on the target ServiceNow family/build.
 
 ---
 
@@ -185,8 +224,12 @@ After installing, in ServiceNow:
 
 - **Set the property `<scope>.executor.hmac_secret`** = the exact `X_MCP_EXECUTOR_HMAC_KEY` value
   from your `.dev.vars`. (`executor-install.mjs`, now re-scoped, writes the `<scope>.executor.*`
-  namespace; confirm `hmac_secret` matches the host secret.)
+  namespace and creates the break-glass toggles disabled if they do not already exist; confirm
+  `hmac_secret` matches the host secret.)
 - **Assign the `<scope>.executor` role** to your integration user (e.g. `mcp_integration_user`).
+- **Enable the break-glass executor deliberately** only after the role and HMAC are correct:
+  set `<scope>.executor.enabled=true` and `<scope>.executor.run_server_script_enabled=true`.
+  Fresh installs default both to `false`; upgrades preserve any existing operator-set value.
 
 > **Architecture note (why the global core exists).** `new Function` (eval) and
 > `GlideCertificateEncryption` (HMAC) are global-only — not permitted in scoped apps. So the scoped
@@ -241,6 +284,12 @@ author's namespace GUIDs), so it deploys cleanly into *your* account.
    npm run deploy            # = copy-wasm + alchemy deploy; reads .dev.vars; prints YOUR Worker URL
    # teardown:  npm run deploy:destroy
    ```
+   `DEPLOYMENT_PROFILE` is intentionally breaking: unset/unknown fails closed. Existing local or
+   PDI deployments that relied on implicit defaults should set `DEPLOYMENT_PROFILE=pilot` during
+   migration, then move to `production` after the restrictive policy, public origins, durable
+   bindings, and secrets are ready. For a production profile, Alchemy validates the assembled KV/DO
+   bindings plus the raw secret/config values before uploading the Worker, so the terminal reports
+   the misconfiguration list rather than relying on a later request path to discover it.
    The Worker URL is derived from **your** Cloudflare account subdomain
    (`servicenow-mcp.<your-subdomain>.workers.dev`) — it is not committed. If you set
    `WORKER_PUBLIC_ORIGIN` to a placeholder earlier, update it to the printed URL and redeploy.

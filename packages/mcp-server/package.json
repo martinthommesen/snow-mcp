@@ -12,6 +12,7 @@
     "agents": "0.13.3",
     "alchemy": "0.87.0",
     "esbuild-wasm": "0.28.0",
+    "jose": "6.2.3",
     "zod": "4.4.3"
   },
   "devDependencies": {

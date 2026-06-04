@@ -9,6 +9,22 @@ declare global {
                         table: 'sys_security_acl'
                         id: '7f3d6f66f3b14376b166cfbdd7883d13'
                     }
+                    acl_audit_table_create: {
+                        table: 'sys_security_acl'
+                        id: '14648789d37840978e00141fdd4e1085'
+                    }
+                    acl_audit_table_delete: {
+                        table: 'sys_security_acl'
+                        id: 'acab6a78a1504bb59e5cdc6324c90d70'
+                    }
+                    acl_audit_table_read: {
+                        table: 'sys_security_acl'
+                        id: '11779e2603014db09ae47660835317d7'
+                    }
+                    acl_audit_table_write: {
+                        table: 'sys_security_acl'
+                        id: 'a094fb38129c44cf86798cca0cf379f7'
+                    }
                     acl_audit_write: {
                         table: 'sys_security_acl'
                         id: '1d5af512b8ff40d298db336ef79c60f0'
@@ -362,12 +378,38 @@ declare global {
                         }
                     },
                     {
+                        table: 'sys_security_acl_role'
+                        id: 'b7a0867c95c94e3a98612ec4379408c0'
+                        key: {
+                            sys_security_acl: '11779e2603014db09ae47660835317d7'
+                            sys_user_role: {
+                                id: '2cd1043150cc40da97b3dd4dae45f3ae'
+                                key: {
+                                    name: 'x_1793136_mcp.admin'
+                                }
+                            }
+                        }
+                    },
+                    {
                         table: 'sys_documentation'
                         id: 'bb9dfe244bcd417980fd02a638f155d9'
                         key: {
                             name: 'x_1793136_mcp_audit_log'
                             element: 'output_size'
                             language: 'en'
+                        }
+                    },
+                    {
+                        table: 'sys_security_acl_role'
+                        id: 'bd57f447ac864f60a5ba8bb0d85f083f'
+                        key: {
+                            sys_security_acl: '14648789d37840978e00141fdd4e1085'
+                            sys_user_role: {
+                                id: '2cd1043150cc40da97b3dd4dae45f3ae'
+                                key: {
+                                    name: 'x_1793136_mcp.admin'
+                                }
+                            }
                         }
                     },
                     {
@@ -451,6 +493,32 @@ declare global {
                         key: {
                             name: 'x_1793136_mcp_audit_log'
                             element: 'duration'
+                        }
+                    },
+                    {
+                        table: 'sys_security_acl_role'
+                        id: 'f015562946ef48e1a6d644ee46e14914'
+                        key: {
+                            sys_security_acl: 'a094fb38129c44cf86798cca0cf379f7'
+                            sys_user_role: {
+                                id: '2cd1043150cc40da97b3dd4dae45f3ae'
+                                key: {
+                                    name: 'x_1793136_mcp.admin'
+                                }
+                            }
+                        }
+                    },
+                    {
+                        table: 'sys_security_acl_role'
+                        id: 'f466cc882204493883a054d462b2c4b7'
+                        key: {
+                            sys_security_acl: 'acab6a78a1504bb59e5cdc6324c90d70'
+                            sys_user_role: {
+                                id: '2cd1043150cc40da97b3dd4dae45f3ae'
+                                key: {
+                                    name: 'x_1793136_mcp.admin'
+                                }
+                            }
                         }
                     },
                     {

@@ -67,4 +67,80 @@ describe("admin_script group approval uses current env config", () => {
     expect(res.content[0]!.text).toContain("second approval");
     expect(executorPosts).toBe(0);
   });
+
+  it("does not honor static operator groups for an OIDC actor", async () => {
+    let executorPosts = 0;
+    vi.stubGlobal("fetch", (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/api/x_1793136_mcp/x_mcp/executor/run")) executorPosts++;
+      return new Response(JSON.stringify({ result: { ok: true } }), { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(executorEnv({ MCP_OPERATOR_ACCESS_GROUPS: "mcp-admins" }), {
+      userId: "operator",
+      scopeMaxMode: "admin_script",
+      props: {
+        userId: "operator",
+        authMode: "oidc",
+        scopes: ["servicenow:admin_script"],
+        maxMode: "admin_script",
+        oidcGroups: [],
+      },
+    });
+    const res = await handlers.runCode({
+      code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')" }); return "done"; }`,
+      mode: "admin_script",
+      reason: "rotate",
+      idempotencyKey: "k-oidc-static",
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain("second approval");
+    expect(executorPosts).toBe(0);
+  });
+
+  it("uses OIDC grant groups for the admin_script second-approval group branch", async () => {
+    let executorPosts = 0;
+    vi.stubGlobal("fetch", (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/api/x_1793136_mcp/x_mcp/executor/run")) executorPosts++;
+      return new Response(JSON.stringify({ result: { ok: true } }), { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(executorEnv({ SNOW_DEV_ROPC: "1" }), {
+      userId: "operator",
+      scopeMaxMode: "admin_script",
+      props: {
+        userId: "operator",
+        authMode: "oidc",
+        scopes: ["servicenow:admin_script"],
+        maxMode: "admin_script",
+        oidcGroups: ["mcp-admins"],
+      },
+    });
+    const res = await handlers.runCode({
+      code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')" }); return "done"; }`,
+      mode: "admin_script",
+      reason: "rotate",
+      idempotencyKey: "k-oidc-groups",
+    });
+
+    expect(res.isError).toBe(false);
+    expect(executorPosts).toBe(1);
+  });
+
+  it("warns when auth props request an unknown ActorPolicy name", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      buildHandlers(executorEnv(), {
+        userId: "operator",
+        scopeMaxMode: "read_only",
+        props: { userId: "operator", scopes: ["servicenow:read"], maxMode: "read_only", actorPolicyName: "missing" },
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('"event":"actor_policy_missing"'));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('"requestedPolicyName":"missing"'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });

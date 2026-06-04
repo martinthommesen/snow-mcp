@@ -31,6 +31,21 @@ function mockFetch(responses: Record<string, unknown>) {
   return { fetchImpl, calls };
 }
 
+function hangingFetch() {
+  let aborted = false;
+  const fetchImpl = (async (_url: string, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      const onAbort = () => {
+        aborted = true;
+        reject(signal?.reason instanceof Error ? signal.reason : new Error(String(signal?.reason ?? "aborted")));
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+    })) as unknown as typeof fetch;
+  return { fetchImpl, aborted: () => aborted };
+}
+
 const baseCfg = (fetchImpl: typeof fetch): SnOAuthConfig => ({
   instanceHost: "inst1", clientId: "cid", clientSecret: "sec", ropcUsername: "u", ropcPassword: "p", fetchImpl,
 });
@@ -69,6 +84,14 @@ describe("§2.8 getServiceNowBearer", () => {
     const tok = await authorizationCodeGrant(baseCfg(fetchImpl), "code-1", "verifier-1", "https://worker/cb", 1000);
     expect(tok.access_token).toBe("AT-CODE");
     expect(calls).toEqual([{ grant: "authorization_code", redirect: "manual" }]);
+  });
+
+  it("aborts a hung token endpoint instead of waiting forever", async () => {
+    const { fetchImpl, aborted } = hangingFetch();
+    await expect(
+      authorizationCodeGrant({ ...baseCfg(fetchImpl), httpTimeoutMs: 1 }, "code-1", "verifier-1", "https://worker/cb", 1000),
+    ).rejects.toThrow("servicenow_oauth_timeout");
+    expect(aborted()).toBe(true);
   });
 });
 
@@ -254,7 +277,7 @@ describe("§6b resolveSnPrincipal", () => {
     }) as unknown as typeof fetch;
     const cfg: SnOAuthConfig = { instanceHost: "inst1", clientId: "c", clientSecret: "s", fetchImpl };
     const principal = await resolveSnPrincipal(cfg, "BEARER");
-    expect(principal).toEqual({ sys_id: "SYS123", roles: ["itil", "admin"] });
+    expect(principal).toEqual({ sys_id: "SYS123", roles: ["itil", "admin"], user_name: "alice" });
     expect(calls).toEqual([
       expect.objectContaining({ redirect: "manual", authorization: "Bearer BEARER" }),
       expect.objectContaining({ redirect: "manual", authorization: "Bearer BEARER" }),
@@ -291,6 +314,13 @@ describe("§6b resolveSnPrincipal", () => {
     const fetchImpl = (async () => new Response(JSON.stringify({ result: {} }), { headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
     const cfg: SnOAuthConfig = { instanceHost: "inst1", clientId: "c", clientSecret: "s", fetchImpl };
     expect(await resolveSnPrincipal(cfg, "BEARER")).toBeNull();
+  });
+
+  it("aborts a hung current-user fetch and returns null", async () => {
+    const { fetchImpl, aborted } = hangingFetch();
+    const cfg: SnOAuthConfig = { instanceHost: "inst1", clientId: "c", clientSecret: "s", fetchImpl, httpTimeoutMs: 1 };
+    expect(await resolveSnPrincipal(cfg, "BEARER")).toBeNull();
+    expect(aborted()).toBe(true);
   });
 });
 

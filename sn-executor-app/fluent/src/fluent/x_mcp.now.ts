@@ -80,6 +80,46 @@ export const x_1793136_mcp_nonce = Table({
 // silently editable. (The executor REST script writes its row server-side regardless of the
 // caller's record ACLs.)
 Acl({
+    $id: Now.ID['acl_audit_table_create'],
+    operation: 'create',
+    type: 'record',
+    table: 'x_1793136_mcp_audit_log',
+    active: true,
+    adminOverrides: false,
+    roles: [adminRole],
+    description: 'Create x_1793136_mcp_audit_log -> x_1793136_mcp.admin only.',
+})
+Acl({
+    $id: Now.ID['acl_audit_table_read'],
+    operation: 'read',
+    type: 'record',
+    table: 'x_1793136_mcp_audit_log',
+    active: true,
+    adminOverrides: false,
+    roles: [adminRole],
+    description: 'Table read x_1793136_mcp_audit_log -> x_1793136_mcp.admin only.',
+})
+Acl({
+    $id: Now.ID['acl_audit_table_write'],
+    operation: 'write',
+    type: 'record',
+    table: 'x_1793136_mcp_audit_log',
+    active: true,
+    adminOverrides: false,
+    roles: [adminRole],
+    description: 'Table write x_1793136_mcp_audit_log -> x_1793136_mcp.admin only.',
+})
+Acl({
+    $id: Now.ID['acl_audit_table_delete'],
+    operation: 'delete',
+    type: 'record',
+    table: 'x_1793136_mcp_audit_log',
+    active: true,
+    adminOverrides: false,
+    roles: [adminRole],
+    description: 'Delete x_1793136_mcp_audit_log -> x_1793136_mcp.admin only.',
+})
+Acl({
     $id: Now.ID['acl_audit_read'],
     operation: 'read',
     type: 'record',
@@ -163,8 +203,22 @@ RestApi({
 // Set hmac_secret to the Cloudflare X_MCP_EXECUTOR_HMAC_KEY; hmac_secret_prev holds the
 // previous key during a rotation window. Both are password2 — set on the instance, never in
 // source control (no `value` here so deploy does not overwrite an instance-set secret).
-Property({ $id: Now.ID['p_enabled'], name: 'x_1793136_mcp.executor.enabled', type: 'boolean', value: true })
-Property({ $id: Now.ID['p_egress'], name: 'x_1793136_mcp.executor.run_server_script_enabled', type: 'boolean', value: true })
+// The break-glass executor toggles are disabled for fresh installs only; upgrades preserve any
+// operator-set value already present on the instance.
+Property({
+    $id: Now.ID['p_enabled'],
+    name: 'x_1793136_mcp.executor.enabled',
+    type: 'boolean',
+    $meta: { installMethod: 'first install' },
+    value: false,
+})
+Property({
+    $id: Now.ID['p_egress'],
+    name: 'x_1793136_mcp.executor.run_server_script_enabled',
+    type: 'boolean',
+    $meta: { installMethod: 'first install' },
+    value: false,
+})
 Property({ $id: Now.ID['p_maxb'], name: 'x_1793136_mcp.executor.max_bytes', type: 'integer', value: 32768 })
 Property({ $id: Now.ID['p_maxout'], name: 'x_1793136_mcp.executor.max_output_bytes', type: 'integer', value: 65536 })
 Property({ $id: Now.ID['p_timeout'], name: 'x_1793136_mcp.executor.timeout_ms', type: 'integer', value: 30000 })

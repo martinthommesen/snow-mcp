@@ -15,6 +15,8 @@ export interface SnTokens {
    *  ride the same AAD-bound encrypted envelope as the tokens (tamper-evident, no extra store). */
   sys_id?: string;
   roles?: string[];
+  user_name?: string;
+  email?: string;
   /** epoch ms when sys_id/roles were last resolved from ServiceNow. */
   principal_resolved_at?: number;
 }

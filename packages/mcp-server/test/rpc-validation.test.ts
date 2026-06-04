@@ -12,6 +12,8 @@ import { describeTable, type DiscoveryDeps } from "../src/sn/discovery.js";
 import { validateReason, validateUserQuery, assertMandatoryRowFilterSafe } from "../src/sn/validate.js";
 import { McpToolError } from "../src/sn/errors.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
+import { canonicalObjectJson } from "../src/sn/mutation-guard.js";
+import { BUDGETS, SN_REQUEST_LIMITS } from "../src/config.js";
 
 // ─── P1 — RPC input-validation boundary (closes findings 7/8/9 + comma-injection) ──
 // transpileTs() does not type-check and the sandbox hands `unknown` values, so the RPC
@@ -34,16 +36,17 @@ class MockHttp implements SnHttpClient {
   }
 }
 
-function rpc(opts?: { http?: MockHttp; policy?: ActorPolicy }): { rpc: ServiceNowRPC; http: MockHttp } {
+function rpc(opts?: { http?: MockHttp; policy?: ActorPolicy; runBudget?: RunBudget }): { rpc: ServiceNowRPC; http: MockHttp; budget: RunBudget } {
   const http = opts?.http ?? new MockHttp();
+  const budget = opts?.runBudget ?? new RunBudget();
   const deps: ServiceNowRpcDeps = {
     http,
     instanceHost: INSTANCE,
     effectiveMode: "admin_script",
     actorPolicy: opts?.policy ?? permissivePolicy([INSTANCE]),
-    runBudget: new RunBudget(),
+    runBudget: budget,
   };
-  return { rpc: new ServiceNowRPC(deps), http };
+  return { rpc: new ServiceNowRPC(deps), http, budget };
 }
 
 const HEX = "0".repeat(32);
@@ -81,11 +84,63 @@ describe("P1 — identifier validation rejects malformed input", () => {
     expect(http.calls[0]!.query!.sysparm_limit).toBe("1000");
   });
 
+  it("tableQuery requests limit+1 below the cap, slices returned rows, and sets partial precisely", async () => {
+    const http = new MockHttp(() => ({
+      status: 200,
+      json: { result: Array.from({ length: 6 }, (_, i) => ({ sys_id: String(i).padStart(32, "0"), number: `INC${i}` })) },
+    }));
+    const { rpc: r } = rpc({ http });
+    const out = await r.tableQuery({ table: "incident", limit: 5 });
+    expect(http.calls[0]!.query!.sysparm_limit).toBe("6");
+    expect(out.rows).toHaveLength(5);
+    expect(out.partial).toBe(true);
+  });
+
+  it("tableQuery keeps the conservative partial flag at the hard 1000-row cap", async () => {
+    const http = new MockHttp(() => ({
+      status: 200,
+      json: { result: Array.from({ length: 1000 }, (_, i) => ({ sys_id: String(i).padStart(32, "0") })) },
+    }));
+    const { rpc: r } = rpc({ http });
+    const out = await r.tableQuery({ table: "incident", limit: 1000 });
+    expect(http.calls[0]!.query!.sysparm_limit).toBe("1000");
+    expect(out.rows).toHaveLength(1000);
+    expect(out.partial).toBe(true);
+  });
+
   it("tableQuery rejects a malformed requested field name", async () => {
     const { rpc: r } = rpc();
     await expect(r.tableQuery({ table: "incident", fields: ["number", "bad field!"] })).rejects.toMatchObject({
       code: "path_denied",
     });
+  });
+
+  it("caps caller-controlled read field and aggregate groupBy counts", async () => {
+    const { rpc: r, http } = rpc();
+    const tooManyFields = Array.from({ length: SN_REQUEST_LIMITS.maxFields + 1 }, (_, i) => `u_f_${i}`);
+    const tooManyGroups = Array.from({ length: SN_REQUEST_LIMITS.maxGroupByFields + 1 }, (_, i) => `u_g_${i}`);
+    await expect(r.tableQuery({ table: "incident", fields: tooManyFields })).rejects.toMatchObject({ code: "path_denied" });
+    await expect(r.aggregate({ table: "incident", groupBy: tooManyGroups })).rejects.toMatchObject({ code: "path_denied" });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it("caps encoded-query length before reaching ServiceNow", async () => {
+    const { rpc: r, http } = rpc();
+    await expect(
+      r.tableQuery({ table: "incident", query: "a".repeat(SN_REQUEST_LIMITS.maxEncodedQueryChars + 1) }),
+    ).rejects.toMatchObject({ code: "path_denied" });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it("counts final query-string bytes against outboundBytesSent before a GET leaves the host", async () => {
+    const budget = new RunBudget({ ...BUDGETS.perRun, maxOutboundBytes: 10 });
+    const { rpc: r, http } = rpc({ runBudget: budget });
+    await expect(r.tableQuery({ table: "incident", query: "active=true" })).rejects.toMatchObject({
+      code: "budget_exceeded",
+      detail: { dimension: "outboundBytesSent" },
+    });
+    expect(http.calls).toHaveLength(0);
+    expect(budget.outboundBytesSent).toBe(0);
   });
 
   it("tableUpdate rejects update keys that are not strict field names (no dot-walk)", async () => {
@@ -106,6 +161,11 @@ describe("P1 — identifier validation rejects malformed input", () => {
     await expect(
       r.runServerScript({ script: 123 as unknown as string }),
     ).rejects.toMatchObject({ code: "path_denied" });
+  });
+
+  it("canonical update bodies reject undefined instead of serializing it as null", () => {
+    expect(() => canonicalObjectJson({ short_description: undefined })).toThrow(/JSON-serializable/);
+    expect(canonicalObjectJson({ short_description: null })).toBe('{"short_description":null}');
   });
 
   it("describeTable rejects a comma-injected table name", async () => {
@@ -390,6 +450,9 @@ describe("M-6 — masked fields rejected in query predicates", () => {
   it("DENIES a masked field behind a TEXT operator (salaryLIKE5) — the parser must not stop at the field run", async () => {
     const { rpc: r } = rpc({ policy: maskedPolicy() });
     await expect(r.tableQuery({ table: "incident", query: "salaryLIKE5", fields: ["number"] })).rejects.toMatchObject({
+      code: "actor_policy_denied",
+    });
+    await expect(r.tableQuery({ table: "incident", query: "salaryfoo5", fields: ["number"] })).rejects.toMatchObject({
       code: "actor_policy_denied",
     });
   });

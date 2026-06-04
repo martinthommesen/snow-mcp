@@ -18,11 +18,13 @@ export interface SnOAuthConfig {
   ropcUsername?: string;
   ropcPassword?: string;
   fetchImpl?: typeof fetch;
+  httpTimeoutMs?: number;
 }
 
 /** Re-resolve ServiceNow sys_id/roles periodically so cached schema and signed actors do not
  *  trust role/principal metadata indefinitely after OAuth callback. */
 export const SN_PRINCIPAL_TTL_MS = 5 * 60 * 1000;
+export const DEFAULT_SN_OAUTH_HTTP_TIMEOUT_MS = 30_000;
 
 interface TokenResponse {
   access_token?: string;
@@ -32,11 +34,33 @@ interface TokenResponse {
   error_description?: string;
 }
 
+function snOAuthHttpTimeoutMs(cfg: SnOAuthConfig): number {
+  return Number.isInteger(cfg.httpTimeoutMs) && cfg.httpTimeoutMs! > 0
+    ? cfg.httpTimeoutMs!
+    : DEFAULT_SN_OAUTH_HTTP_TIMEOUT_MS;
+}
+
+async function fetchWithTimeout(cfg: SnOAuthConfig, input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error("servicenow_oauth_timeout")), snOAuthHttpTimeoutMs(cfg));
+  const upstreamSignal = init.signal;
+  const abort = () => controller.abort(upstreamSignal?.reason ?? new Error("servicenow_oauth_aborted"));
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) abort();
+    else upstreamSignal.addEventListener("abort", abort, { once: true });
+  }
+  try {
+    return await (cfg.fetchImpl ?? fetch)(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+    upstreamSignal?.removeEventListener("abort", abort);
+  }
+}
+
 async function tokenRequest(cfg: SnOAuthConfig, params: Record<string, string>, now: number): Promise<SnTokens> {
-  const fetchImpl = cfg.fetchImpl ?? fetch;
   // cfg.instanceHost is the canonical, allowlisted host (canonicalized once in buildHandlers,
   // §6a), so this POST can never send the client secret off-allowlist.
-  const res = await fetchImpl(`https://${cfg.instanceHost}/oauth_token.do`, {
+  const res = await fetchWithTimeout(cfg, `https://${cfg.instanceHost}/oauth_token.do`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body: new URLSearchParams({ client_id: cfg.clientId, client_secret: cfg.clientSecret, ...params }).toString(),
@@ -98,6 +122,8 @@ export async function generatePkce(): Promise<{ verifier: string; challenge: str
 export interface SnPrincipal {
   sys_id: string;
   roles: string[];
+  user_name?: string;
+  email?: string;
 }
 
 function hasFreshPrincipal(tokens: SnTokens | null, now: number): tokens is SnTokens & { sys_id: string } {
@@ -112,7 +138,37 @@ function hasFreshPrincipal(tokens: SnTokens | null, now: number): tokens is SnTo
 function stampPrincipal(tokens: SnTokens, principal: SnPrincipal, now: number): void {
   tokens.sys_id = principal.sys_id;
   tokens.roles = principal.roles;
+  copyPrincipalIdentity(tokens, principal);
   tokens.principal_resolved_at = now;
+}
+
+function stringClaim(record: Record<string, unknown> | undefined, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function copyPrincipalIdentity(target: Pick<SnTokens, "user_name" | "email">, source: Pick<SnPrincipal, "user_name" | "email">): void {
+  if (source.user_name) target.user_name = source.user_name;
+  if (source.email) target.email = source.email;
+}
+
+function buildPrincipal(sys_id: string, roles: string[], identity: Pick<SnPrincipal, "user_name" | "email"> = {}): SnPrincipal {
+  return {
+    sys_id,
+    roles,
+    ...(identity.user_name ? { user_name: identity.user_name } : {}),
+    ...(identity.email ? { email: identity.email } : {}),
+  };
+}
+
+function carryForwardPrincipal(target: SnTokens, source: SnTokens): void {
+  if (source.sys_id) target.sys_id = source.sys_id;
+  if (source.roles) target.roles = source.roles;
+  copyPrincipalIdentity(target, source);
+  if (source.principal_resolved_at !== undefined) target.principal_resolved_at = source.principal_resolved_at;
 }
 
 /**
@@ -133,27 +189,30 @@ function stampPrincipal(tokens: SnTokens, principal: SnPrincipal, now: number): 
  * mock this boundary and cannot prove the live endpoint shape.
  */
 export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string): Promise<SnPrincipal | null> {
-  const fetchImpl = cfg.fetchImpl ?? fetch;
   const auth = { authorization: `Bearer ${accessToken}`, accept: "application/json" };
   try {
-    const meRes = await fetchImpl(
+    const meRes = await fetchWithTimeout(
+      cfg,
       `https://${cfg.instanceHost}/api/now/ui/user/current_user`,
       { headers: auth, redirect: "manual" },
     );
     if (meRes.status >= 300 && meRes.status < 400) return null;
-    const me = (await meRes.json().catch(() => ({}))) as { result?: { user_sys_id?: string } };
-    const sys_id = me.result?.user_sys_id;
+    const me = (await meRes.json().catch(() => ({}))) as { result?: Record<string, unknown> };
+    const sys_id = stringClaim(me.result, ["user_sys_id", "sys_id"]);
     if (!sys_id) return null;
-    const roleRes = await fetchImpl(
+    const user_name = stringClaim(me.result, ["user_name"]);
+    const email = stringClaim(me.result, ["email", "user_email"]);
+    const roleRes = await fetchWithTimeout(
+      cfg,
       `https://${cfg.instanceHost}/api/now/table/sys_user_has_role?sysparm_query=user=${encodeURIComponent(sys_id)}&sysparm_fields=role.name&sysparm_limit=200`,
       { headers: auth, redirect: "manual" },
     );
-    if (roleRes.status >= 300 && roleRes.status < 400) return { sys_id, roles: [] };
+    if (roleRes.status >= 300 && roleRes.status < 400) return buildPrincipal(sys_id, [], { user_name, email });
     const rolesJson = (await roleRes.json().catch(() => ({}))) as { result?: Record<string, unknown>[] };
     const roles = (rolesJson.result ?? [])
       .map((r) => String(r["role.name"] ?? ""))
       .filter(Boolean);
-    return { sys_id, roles };
+    return buildPrincipal(sys_id, roles, { user_name, email });
   } catch {
     return null; // principal resolution is best-effort; token is still usable.
   }
@@ -172,7 +231,7 @@ export async function resolveStoredSnPrincipal(
 ): Promise<SnPrincipal | null> {
   const existing = await store.get("servicenow").catch(() => null);
   if (hasFreshPrincipal(existing, now)) {
-    return { sys_id: existing.sys_id, roles: existing.roles ?? [] };
+    return buildPrincipal(existing.sys_id, existing.roles ?? [], existing);
   }
 
   const accessToken = opts.accessToken ?? await getServiceNowBearer(cfg, store, now, "per_user_oauth", opts.authorizeUrl);
@@ -240,9 +299,7 @@ export async function getServiceNowBearer(
       // Carry forward the refresh token if the server didn't return a new one (B9), and the
       // resolved principal (sys_id/roles) so a refresh never drops the effective user.
       if (!refreshed.refresh_token && existing.refresh_token) refreshed.refresh_token = existing.refresh_token;
-      if (existing.sys_id) refreshed.sys_id = existing.sys_id;
-      if (existing.roles) refreshed.roles = existing.roles;
-      if (existing.principal_resolved_at !== undefined) refreshed.principal_resolved_at = existing.principal_resolved_at;
+      carryForwardPrincipal(refreshed, existing);
       await store.rotate("servicenow", refreshed);
       return refreshed.access_token;
     } catch {

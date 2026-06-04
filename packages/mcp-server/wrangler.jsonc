@@ -56,7 +56,13 @@
       "tag": "v2",
       "new_sqlite_classes": ["ConsentRateDO"]
     }
-  ]
+  ],
+
+  "vars": {
+    // Local dev + vitest preserve the permissive single-operator posture explicitly.
+    // Production deploys must choose `pilot` or `production` in alchemy.run.ts / .dev.vars.
+    "DEPLOYMENT_PROFILE": "pilot"
+  }
 
   // Secret bindings (§2.11: SNOW_*, OAUTH_PROVIDER_SECRET, TOKEN_KEK,
   // X_MCP_EXECUTOR_HMAC_KEY, SNAPSHOT_KEK) are provided via .dev.vars / `wrangler

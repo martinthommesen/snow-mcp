@@ -38,8 +38,14 @@ export function bytesToBase64Url(bytes: Uint8Array): string {
   return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+export function base64UrlToBytes(value: string): Uint8Array {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4)) % 4, "=");
+  return base64ToBytes(padded);
+}
+
 export function base64UrlToString(value: string): string {
-  return textDecoder.decode(base64ToBytes(value.replace(/-/g, "+").replace(/_/g, "/")));
+  return textDecoder.decode(base64UrlToBytes(value));
 }
 
 export function bytesToHex(bytes: Uint8Array): string {

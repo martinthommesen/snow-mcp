@@ -21,7 +21,8 @@ export type BudgetDimension =
   | "sandboxRpcCalls"
   | "serviceNowRequests"
   | "rowsReturned"
-  | "bytesReturned";
+  | "bytesReturned"
+  | "outboundBytesSent";
 
 export type ReserveRequest = Partial<Record<BudgetDimension, number>>;
 export type ReserveResult = { ok: true } | { ok: false; dimension: BudgetDimension; cap: number; would: number };
@@ -32,6 +33,7 @@ const DIMENSIONS: readonly BudgetDimension[] = [
   "serviceNowRequests",
   "rowsReturned",
   "bytesReturned",
+  "outboundBytesSent",
 ];
 
 function dimensionKey(dimension: BudgetDimension): string {
@@ -51,6 +53,7 @@ export class BudgetDO extends DurableObject {
       serviceNowRequests: BUDGETS.daily.serviceNowRequests,
       rowsReturned: BUDGETS.daily.rowsReturned,
       bytesReturned: BUDGETS.daily.bytesReturned,
+      outboundBytesSent: BUDGETS.daily.outboundBytesSent,
     };
   }
 
@@ -105,7 +108,7 @@ export class BudgetDO extends DurableObject {
     // at/over cap. Unconditional — independent of `req`. M-1: sandboxRpcCalls is accrued post-run
     // too (handlers maps snapshot.rpcCalls -> sandboxRpcCalls) and was previously enforced NOWHERE
     // — the configured cap was dead. It is now an admission dimension alongside rows/bytes.
-    for (const d of ["rowsReturned", "bytesReturned", "sandboxRpcCalls"] as const) {
+    for (const d of ["rowsReturned", "bytesReturned", "outboundBytesSent", "sandboxRpcCalls"] as const) {
       if (current[d] >= caps[d]) return { ok: false, dimension: d, cap: caps[d], would: current[d] };
     }
 

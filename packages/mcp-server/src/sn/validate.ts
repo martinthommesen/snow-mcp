@@ -12,7 +12,7 @@
 // the existing `path_denied` member with a descriptive message + structured detail.
 
 import { McpToolError } from "./errors.js";
-import { TABLE_PAGE_CAP } from "../config.js";
+import { SN_REQUEST_LIMITS, TABLE_PAGE_CAP } from "../config.js";
 
 // Identifier grammars (ServiceNow names are lowercase alnum + underscore).
 const TABLE_NAME = /^[a-z0-9_]{1,80}$/;
@@ -71,15 +71,27 @@ export function validateLimit(limit: unknown): number | undefined {
   return Math.min(limit as number, TABLE_PAGE_CAP);
 }
 
-export function validateFields(fields: unknown): string[] | undefined {
+export function validateFields(
+  fields: unknown,
+  opts: { maxFields?: number; label?: string } = {},
+): string[] | undefined {
   if (fields === undefined) return undefined;
-  if (!Array.isArray(fields)) deny(`Invalid fields (expected an array of field names).`);
+  const label = opts.label ?? "fields";
+  const maxFields = opts.maxFields ?? SN_REQUEST_LIMITS.maxFields;
+  if (!Array.isArray(fields)) deny(`Invalid ${label} (expected an array of field names).`);
+  if (fields.length > maxFields) {
+    deny(`${label} exceeds the maximum of ${maxFields} field names.`, { count: fields.length, maxFields });
+  }
   for (const f of fields) {
     if (typeof f !== "string" || !FIELD_NAME.test(f)) {
       deny(`Invalid field name.`, { field: String(f) });
     }
   }
   return fields as string[];
+}
+
+export function validateGroupByFields(fields: unknown): string[] | undefined {
+  return validateFields(fields, { maxFields: SN_REQUEST_LIMITS.maxGroupByFields, label: "groupBy" });
 }
 
 /** Validate an update body: keys are strict field names (no dot-walk) and present. */
@@ -115,6 +127,25 @@ export function validateReason(reason: unknown): string {
   return s;
 }
 
+export function validateApprovalToken(token: unknown): string {
+  if (typeof token !== "string" || token.length === 0 || token.length > SN_REQUEST_LIMITS.maxApprovalTokenChars) {
+    deny(`Invalid approvalToken (1..${SN_REQUEST_LIMITS.maxApprovalTokenChars} chars required).`);
+  }
+  return token;
+}
+
+export function validateDiscoveryFilter(filter: unknown): string | undefined {
+  if (filter === undefined) return undefined;
+  if (typeof filter !== "string") deny(`Invalid filter (expected a string).`);
+  if (filter.length > SN_REQUEST_LIMITS.maxDiscoveryFilterChars) {
+    deny(`Discovery filter exceeds ${SN_REQUEST_LIMITS.maxDiscoveryFilterChars} characters.`, {
+      length: filter.length,
+      maxLength: SN_REQUEST_LIMITS.maxDiscoveryFilterChars,
+    });
+  }
+  return filter;
+}
+
 /**
  * Reject a caller-supplied encoded query that smuggles a structural operator
  * (`^NQ`/`^OR`/`^EQ`) when a restrictive mandatory `rowFilters[table]` is active — such
@@ -125,6 +156,12 @@ export function validateReason(reason: unknown): string {
 export function validateUserQuery(query: unknown, hasMandatoryFilter: boolean): string {
   if (query === undefined) return "";
   if (typeof query !== "string") deny(`Invalid query (expected a string).`);
+  if (query.length > SN_REQUEST_LIMITS.maxEncodedQueryChars) {
+    deny(`Encoded query exceeds ${SN_REQUEST_LIMITS.maxEncodedQueryChars} characters.`, {
+      length: query.length,
+      maxLength: SN_REQUEST_LIMITS.maxEncodedQueryChars,
+    });
+  }
   if (hasMandatoryFilter && hasStructuralOperator(query as string)) {
     deny(`Query may not contain a structural operator (^NQ/^OR/^EQ) under a restrictive row filter.`);
   }

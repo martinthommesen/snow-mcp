@@ -1,18 +1,24 @@
 // Builds the injected ServerHandlers (plan §3.2).
 //
 // Two modes:
-//  - CONNECTED dev path: when Basic-Auth dev creds are present, run_code reaches the
-//    real instance via ServiceNowRPC and describe_table/list_tables use the discovery
-//    module. (OAuth consent/PKCE is the production path; not wired yet.)
+//  - CONNECTED path: run_code reaches the real instance via ServiceNowRPC and
+//    describe_table/list_tables use the discovery module. ServiceNow credentials
+//    come from per-user OAuth or the explicit dev ROPC fallback.
 //  - NOT-CONNECTED: fail closed with `reauth_required` until creds exist.
 
 import type { ServerHandlers, ToolTextResult } from "../server.js";
 import { runCode, type RunCodeDeps } from "./run_code.js";
 import { ServiceNowRPC } from "../sn/rpc.js";
 import { SnFetchClient, type SnHttpClient } from "../sn/http.js";
-import { canonicalizeInstanceHost } from "../sn/url-allowlist.js";
+import { canonicalizeInstanceHost, type InstanceAllowlist } from "../sn/url-allowlist.js";
 import { describeTable, listTables, type DiscoveryDeps } from "../sn/discovery.js";
-import { actorPolicyHash, loadActorPolicy, type ActorPolicy, type PolicyEnv } from "../authz/actor-policy.js";
+import {
+  actorPolicyHash,
+  denyAllPolicy,
+  loadNamedActorPolicies,
+  type ActorPolicy,
+  type PolicyEnv,
+} from "../authz/actor-policy.js";
 import { McpToolError, toToolResult } from "../sn/errors.js";
 import { RunBudget } from "../sn/run-budget.js";
 import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
@@ -25,11 +31,11 @@ import {
   type CredentialMode,
   type SnOAuthConfig,
 } from "../auth/servicenow-oauth.js";
-import { mintTicket } from "../auth/servicenow-ticket.js";
+import { mintTicket, normalizeIdentityEmail } from "../auth/servicenow-ticket.js";
 import { buildKekRing, warnIfWeakSecretOnce } from "../auth/crypto.js";
 import { decodeFixedBase64Secret } from "../auth/encoding.js";
 import type { MutationDeps } from "../sn/rpc.js";
-import { auditKey, type RunContext, type AuditIdentity, type LedgerHandle } from "../sn/mutation-guard.js";
+import { auditKey, mutationLedgerObjectName, type RunContext, type AuditIdentity, type LedgerHandle } from "../sn/mutation-guard.js";
 import type { AuditRecord } from "../observability/audit.js";
 import { takeSnapshot, type SnapshotConfig } from "../recovery/snapshots.js";
 import type { ApprovalContext } from "../authz/approval.js";
@@ -75,6 +81,7 @@ export interface HandlerEnv extends PolicyEnv {
   SNAPSHOT_KEK_PREV?: string;
   // Credential mode (P6) + mode ceilings (P5). All optional in P0.
   SERVICENOW_CREDENTIAL_MODE?: string;
+  DEPLOYMENT_PROFILE?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
   // Dev Basic-Auth fallback + ROPC creds, enabled only by explicit SNOW_DEV_ROPC=1.
@@ -102,6 +109,10 @@ function csv(value: string | undefined): string[] {
   return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+function stringArrayProp(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.trim() !== "") : [];
+}
+
 function utcDateKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -112,6 +123,14 @@ function parseCredentialMode(value: string | undefined): ParsedCredentialMode {
   if (value === undefined || value.trim() === "") return "integration_user";
   if (value === "integration_user" || value === "per_user_oauth") return value;
   return "invalid";
+}
+
+const defaultInstanceAllowlist = { allowedHostSuffixes: DEFAULT_ALLOWED_HOST_SUFFIXES } satisfies InstanceAllowlist;
+
+function instanceAllowlistForProfile(env: Pick<HandlerEnv, "DEPLOYMENT_PROFILE">, instanceHost: string): InstanceAllowlist {
+  return env.DEPLOYMENT_PROFILE === "production"
+    ? { allowedHostSuffixes: [instanceHost] }
+    : defaultInstanceAllowlist;
 }
 
 export interface AuthContext {
@@ -142,15 +161,28 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // binding can never send credentials off-allowlist. When the host is unset we keep the
   // sentinel (no connection is attempted — devConnected/oauthReady both require the host).
   const instanceHost = env.SNOW_INSTANCE_HOST
-    ? canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST, { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] })
+    ? canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST, defaultInstanceAllowlist)
     : "unconfigured.invalid";
+  const instanceAllowlist = instanceAllowlistForProfile(env, instanceHost);
   const userId = auth.userId;
   // §6b: configurable RESTRICTIVE ActorPolicy. NON-BREAKING — with NO policy config set this
   // returns the permissive single-operator policy (live deployment unchanged). When policy vars
   // ARE set it builds a restrictive policy (table allowlist + field masks + row filters + per-run
   // row/byte ceilings) and validates the configured rowFilters at load (fail-closed). The dead
   // maxRowsPerRun/maxBytesPerRun fields now bite via makeRunBudget below under a restrictive policy.
-  const policy: ActorPolicy = loadActorPolicy(env, instanceHost);
+  const actorPolicies = loadNamedActorPolicies(env, instanceHost);
+  const requestedPolicyName = typeof auth.props.actorPolicyName === "string" ? auth.props.actorPolicyName : "default";
+  const selectedPolicy = actorPolicies.get(requestedPolicyName);
+  if (!selectedPolicy) {
+    console.warn(JSON.stringify({
+      event: "actor_policy_missing",
+      requestedPolicyName,
+      userId,
+      availablePolicyNames: [...actorPolicies.keys()],
+    }));
+  }
+  const policy: ActorPolicy = selectedPolicy ?? denyAllPolicy(instanceHost);
+  const actorEmail = normalizeIdentityEmail(auth.props.email);
 
   // Authorization header strategy (preference order):
   //  1. Per-user ServiceNow OAuth Bearer — tokens minted/refreshed and stored encrypted in
@@ -171,14 +203,28 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // authenticated /mcp request. Absent secret (or integration_user) ⇒ undefined URL (the
   // reauth_required still fires, just without a link). Missing origin is a per_user_oauth
   // configuration error handled before this helper. The ticket is short-lived (10 min).
+  let http: SnHttpClient;
+  let oauthStore: (() => Promise<TokenStore>) | undefined;
+  let oauthCfg: SnOAuthConfig | undefined;
+  let requestAuthorization: (() => Promise<string>) | undefined;
+  let perUserConfigurationError: string | undefined;
   let authorizeUrlPromise: Promise<string | undefined> | undefined;
   const reauthAuthorizeUrl = (): Promise<string | undefined> => {
     if (credentialMode !== "per_user_oauth" || !auth.workerOrigin || !env.OAUTH_PROVIDER_SECRET) {
       return Promise.resolve(undefined);
     }
     authorizeUrlPromise ??= (async () => {
+      const existing = oauthStore ? await (await oauthStore()).get("servicenow").catch(() => null) : null;
+      if (!actorEmail && !existing?.sys_id) return undefined;
       const ticket = await mintTicket(
-        { userId, instanceHost, nonce: crypto.randomUUID(), exp: Date.now() + 10 * 60 * 1000 },
+        {
+          userId,
+          ...(actorEmail ? { actorEmail } : {}),
+          instanceHost,
+          nonce: crypto.randomUUID(),
+          ...(existing?.sys_id ? { expectedSnSysId: existing.sys_id } : {}),
+          exp: Date.now() + 10 * 60 * 1000,
+        },
         env.OAUTH_PROVIDER_SECRET!,
       );
       return `${auth.workerOrigin}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`;
@@ -186,11 +232,6 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     return authorizeUrlPromise;
   };
 
-  let http: SnHttpClient;
-  let oauthStore: (() => Promise<TokenStore>) | undefined;
-  let oauthCfg: SnOAuthConfig | undefined;
-  let requestAuthorization: (() => Promise<string>) | undefined;
-  let perUserConfigurationError: string | undefined;
   if (credentialMode === "invalid") {
     http = new NotConnectedHttpClient("Invalid SERVICENOW_CREDENTIAL_MODE; expected integration_user or per_user_oauth.");
   } else if (credentialMode === "per_user_oauth" && !auth.workerOrigin) {
@@ -228,14 +269,14 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       return authorizationPromise;
     };
     http = new SnFetchClient({
-      instanceHost, allowlist: { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] },
+      instanceHost, allowlist: instanceAllowlist,
       // Request-local cache: one buildHandlers instance serves one authenticated /mcp request, so
       // every ServiceNow call in that request can reuse the same decrypted/refreshed bearer.
       getAuthorization: requestAuthorization,
     });
   } else if (devConnected) {
     http = new SnFetchClient({
-      instanceHost, allowlist: { allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES] },
+      instanceHost, allowlist: instanceAllowlist,
       getAuthorization: async () => "Basic " + btoa(`${env.SNOW_DEV_ROPC_USERNAME}:${env.SNOW_DEV_ROPC_PASSWORD}`),
     });
   } else {
@@ -256,7 +297,8 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     : undefined;
 
   // PRE-RUN reserve (§P5 tier 1 / finding 5): reserve a unique Worker AND the PER-RUN MAXIMUMS
-  // for the two dimensions a single run can spend many of (serviceNowRequests, sandboxRpcCalls),
+  // for dimensions a single run can spend many of (serviceNowRequests, sandboxRpcCalls,
+  // outboundBytesSent),
   // so concurrent runs admission-check at the true ceiling and cannot collectively overshoot the
   // daily cap. Also runs the daily rows/bytes/sandboxRpcCalls ADMISSION check (deny-next-run when
   // already at/over cap). Per-user tally updated in the same gate via `userId`. The unused
@@ -268,6 +310,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
             uniqueWorkers: 1,
             serviceNowRequests: BUDGETS.perRun.serviceNowRequestLimit,
             sandboxRpcCalls: BUDGETS.perRun.rpcCallLimit,
+            outboundBytesSent: BUDGETS.perRun.maxOutboundBytes,
           },
           undefined,
           userId,
@@ -287,6 +330,33 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
             sandboxRpcCalls: (snapshot?.rpcCalls ?? 0) - BUDGETS.perRun.rpcCallLimit,
             rowsReturned: snapshot?.rowsReturned ?? 0,
             bytesReturned: snapshot?.bytesReturned ?? 0,
+            outboundBytesSent: (snapshot?.outboundBytesSent ?? 0) - BUDGETS.perRun.maxOutboundBytes,
+          },
+          userId,
+        );
+      }
+    : undefined;
+
+  const reserveDiscoveryDailyBudget = budgetObj
+    ? async (): Promise<{ ok: boolean; dimension?: string }> =>
+        budgetObj().reserve(
+          {
+            serviceNowRequests: BUDGETS.perRun.serviceNowRequestLimit,
+            outboundBytesSent: BUDGETS.perRun.maxOutboundBytes,
+          },
+          undefined,
+          userId,
+        )
+    : undefined;
+
+  const reconcileDiscoveryDailyBudget = budgetObj
+    ? async (snapshot: Record<string, number>): Promise<void> => {
+        await budgetObj().reconcile(
+          {
+            serviceNowRequests: (snapshot.serviceNowRequests ?? 0) - BUDGETS.perRun.serviceNowRequestLimit,
+            rowsReturned: snapshot.rowsReturned ?? 0,
+            bytesReturned: snapshot.bytesReturned ?? 0,
+            outboundBytesSent: (snapshot.outboundBytesSent ?? 0) - BUDGETS.perRun.maxOutboundBytes,
           },
           userId,
         );
@@ -338,12 +408,12 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     ...(auth.props.email ? { mcpActorEmail: auth.props.email as string } : {}),
   };
 
-  // Idempotency ledger (§7.3): one DO per (userId|instanceHost|runKey:ordinal).
+  // Idempotency ledger (§7.3): one DO per (userId|instanceHost|version:runKey:ordinal).
   const ledgerFactory = env.LEDGER_DO
     ? (runKey: string) =>
         (ordinal: number): LedgerHandle => {
           const ns = env.LEDGER_DO!;
-          return ns.get(ns.idFromName(`${userId}|${instanceHost}|${runKey}:${ordinal}`)) as unknown as LedgerHandle;
+          return ns.get(ns.idFromName(mutationLedgerObjectName({ userId, instanceHost, runKey, ordinal }))) as unknown as LedgerHandle;
         }
     : undefined;
 
@@ -399,8 +469,11 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   const adminScriptAllowlist = csv(env.ADMIN_SCRIPT_ALLOWLIST);
   const validApprovalTokens = csv(env.ADMIN_SCRIPT_APPROVAL_TOKENS);
   const requiredAccessGroup = env.ADMIN_SCRIPT_REQUIRED_GROUP?.trim();
-  // Current env only: OAuth grant props can outlive group-based approval changes.
-  const actorAccessGroups = csv(env.MCP_OPERATOR_ACCESS_GROUPS);
+  // Current env only for operator-secret auth; in OIDC, group membership must come from the
+  // current IdP-derived grant props, never the static operator-secret binding.
+  const actorAccessGroups = auth.props.authMode === "oidc"
+    ? stringArrayProp(auth.props.oidcGroups)
+    : csv(env.MCP_OPERATOR_ACCESS_GROUPS);
   const approval: Omit<ApprovalContext, "mode" | "actorUserId" | "reason"> = {
     adminScriptAllowlist,
     ...(validApprovalTokens.length > 0 ? { validApprovalTokens: new Set(validApprovalTokens) } : {}),
@@ -453,8 +526,43 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     ...(reconcileDailyBudget ? { reconcileDailyBudget } : {}),
   };
 
-  function discoveryDeps(): DiscoveryDeps {
-    return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget: new RunBudget() };
+  function makeDiscoveryRunBudget(): RunBudget {
+    return new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun });
+  }
+
+  function discoveryDeps(runBudget: RunBudget): DiscoveryDeps {
+    return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget, credentialMode: serviceNowCredentialMode };
+  }
+
+  async function runDiscoveryWithBudget<T>(runBudget: RunBudget, fn: () => Promise<T>): Promise<T> {
+    let reserved = false;
+    if (reserveDiscoveryDailyBudget) {
+      const reservation = await reserveDiscoveryDailyBudget();
+      if (!reservation.ok) {
+        throw new McpToolError("budget_exceeded", `Daily ${reservation.dimension ?? "budget"} cap exhausted.`, {
+          dimension: reservation.dimension,
+        });
+      }
+      reserved = true;
+    }
+    try {
+      return await fn();
+    } finally {
+      if (reserved && reconcileDiscoveryDailyBudget) {
+        try {
+          await reconcileDiscoveryDailyBudget(runBudget.snapshot());
+        } catch (e) {
+          console.error(
+            JSON.stringify({
+              event: "discovery_budget_reconcile_failed",
+              severity: "alert",
+              note: "daily discovery reservation not refunded; serviceNowRequests/outboundBytesSent over-count and rows/bytes may be under-accrued until BUDGET_DO recovers",
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
+      }
+    }
   }
 
   // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Built lazily so run_code and other
@@ -478,7 +586,10 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     describeTable: async ({ table }): Promise<ToolTextResult> => {
       try {
         const cache = await schemaCache();
-        const fetcher = () => describeTable(discoveryDeps(), table);
+        const fetcher = () => {
+          const runBudget = makeDiscoveryRunBudget();
+          return runDiscoveryWithBudget(runBudget, () => describeTable(discoveryDeps(runBudget), table));
+        };
         const { fields, cached } = cache ? await cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
         return { content: [{ type: "text", text: JSON.stringify({ table, fields }) }], isError: false, structuredContent: { table, fieldCount: fields.length, cached } };
       } catch (e) {
@@ -488,9 +599,23 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     listTables: async ({ filter }): Promise<ToolTextResult> => {
       try {
         const cache = await schemaCache();
-        const fetcher = () => listTables(discoveryDeps(), filter);
-        const { tables, cached } = cache ? await cache.listTables(filter, fetcher) : { tables: await fetcher(), cached: false };
-        return { content: [{ type: "text", text: JSON.stringify({ tables }) }], isError: false, structuredContent: { count: tables.length, cached } };
+        const fetcher = () => {
+          const runBudget = makeDiscoveryRunBudget();
+          return runDiscoveryWithBudget(runBudget, () => listTables(discoveryDeps(runBudget), filter));
+        };
+        const { tables, partial, total, policyFilteredPartial, warning, cached } = cache ? await cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
+        return {
+          content: [{ type: "text", text: JSON.stringify({ tables, partial, ...(total !== undefined ? { total } : {}), ...(warning ? { warning } : {}) }) }],
+          isError: false,
+          structuredContent: {
+            count: tables.length,
+            cached,
+            partial,
+            ...(total !== undefined ? { total } : {}),
+            ...(policyFilteredPartial ? { policyFilteredPartial } : {}),
+            ...(warning ? { warning } : {}),
+          },
+        };
       } catch (e) {
         return toToolResult(e);
       }
@@ -516,9 +641,12 @@ export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Pr
   if (credentialMode !== "per_user_oauth") return { principalId: userId, roleHash: "default" };
   if (!oauthReady) return undefined;
   try {
-    const instanceHost = canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST!, {
-      allowedHostSuffixes: [...DEFAULT_ALLOWED_HOST_SUFFIXES],
-    });
+    // Intentional two-step guard: normalize the configured ServiceNow host under the default
+    // service-now.com suffix allowlist, then re-check the canonical host against the active profile
+    // allowlist (production pins it to this exact instance).
+    const instanceHost = canonicalizeInstanceHost(env.SNOW_INSTANCE_HOST!, defaultInstanceAllowlist);
+    const instanceAllowlist = instanceAllowlistForProfile(env, instanceHost);
+    canonicalizeInstanceHost(instanceHost, instanceAllowlist);
     const stub = env.TOKEN_DO!.get(env.TOKEN_DO!.idFromName(`${userId}|${instanceHost}`)) as unknown as {
       putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>;
     };

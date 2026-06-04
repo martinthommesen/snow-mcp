@@ -42,7 +42,7 @@ function perUserEnv(): HandlerEnv {
 const auth = {
   userId: "reauthUser",
   scopeMaxMode: "admin_script" as const,
-  props: { userId: "reauthUser", scopes: ["servicenow:read"], maxMode: "admin_script" },
+  props: { userId: "reauthUser", email: "reauth@example.com", scopes: ["servicenow:read"], maxMode: "admin_script" },
   workerOrigin: "https://mcp.example.workers.dev",
 };
 
@@ -56,6 +56,14 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
     expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
     const detail = (res.structuredContent as { detail?: { authorizeUrl?: string } }).detail;
     expect(detail?.authorizeUrl).toContain("/servicenow/authorize?ticket=");
+  });
+
+  it("run_code omits authorizeUrl for a first-time actor with no email claim", async () => {
+    const handlers = buildHandlers(perUserEnv(), { ...auth, props: { ...auth.props, email: undefined } });
+    const res = await handlers.runCode({ code: "async () => 1" });
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect((res.structuredContent as { detail?: { authorizeUrl?: string } }).detail?.authorizeUrl).toBeUndefined();
   });
 
   it("run_code fails closed when per_user_oauth lacks a configured public worker origin", async () => {
@@ -289,7 +297,7 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
       {
         userId: USER,
         scopeMaxMode: "read_only",
-        props: { userId: USER, scopes: ["servicenow:read"], maxMode: "read_only" },
+        props: { userId: USER, email: "bearer-cache@example.com", scopes: ["servicenow:read"], maxMode: "read_only" },
         workerOrigin: "https://mcp.example.workers.dev",
       },
     );
@@ -338,7 +346,7 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
   const resolveAuth = {
     userId: RESOLVE_USER,
     scopeMaxMode: "admin_script" as const,
-    props: { userId: RESOLVE_USER, scopes: ["servicenow:admin_script"], maxMode: "admin_script" },
+    props: { userId: RESOLVE_USER, email: "resolve@example.com", scopes: ["servicenow:admin_script"], maxMode: "admin_script" },
     workerOrigin: "https://mcp.example.workers.dev",
   };
 

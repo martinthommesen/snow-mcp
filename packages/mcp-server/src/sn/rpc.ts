@@ -16,19 +16,19 @@
 // over Workers RPC — so extending RpcTarget here is unnecessary (recorded in DELTAS).
 
 import type { Mode } from "@servicenow-codemode/shared";
-import { modeRisk } from "@servicenow-codemode/shared";
 import type { SnHttpClient } from "./http.js";
-import { mapServiceNowError, encodeSandboxError, McpToolError } from "./errors.js";
-import { requireCapability } from "../config.js";
-import { TABLE_PAGE_CAP } from "../config.js";
+import { throwMappedServiceNowError, encodeSandboxError, McpToolError } from "./errors.js";
+import { requireCapability, TABLE_PAGE_CAP } from "../config.js";
 import { RunBudget } from "./run-budget.js";
 import { utf8Len } from "../sandbox/serialize.js";
 import {
   assertActorPolicy,
+  assertModeWithinPolicy,
   applyRowFilter,
   assertRequestedFieldsAllowed,
   assertQueryFieldsAllowed,
   maskRow,
+  actorPolicyScopeFingerprint,
   type ActorPolicy,
 } from "../authz/actor-policy.js";
 import { signActor, type ActorClaims } from "../auth/actor.js";
@@ -37,20 +37,24 @@ import {
   validateSysId,
   validateLimit,
   validateFields,
+  validateGroupByFields,
   validateUpdateFields,
   validateReason,
   validateUserQuery,
 } from "./validate.js";
+import { countServiceNowQueryBytes } from "./query-budget.js";
 import {
   guardMutation,
   tableUpdateRequestHash,
   runServerScriptRequestHash,
+  canonicalObjectJson,
   type RunContext,
   type LedgerHandle,
 } from "./mutation-guard.js";
 import type { AuditSink, AuditIdentity } from "./mutation-guard.js";
 import { assertAdminScriptApproved, type ApprovalContext } from "../authz/approval.js";
 import { recoverability } from "../recovery/policy.js";
+import { isReplaySafeWrapper, replaySafeResult } from "./replay-payload.js";
 
 export interface ServiceNowRpcDeps {
   http: SnHttpClient;
@@ -141,17 +145,63 @@ export interface HostSignals {
 
 /**
  * Exactly-once classifier for a mutation/executor effect throw (S17, plan §P4). A
- * DEFINITIVE server rejection (401 reauth, 403 ACL) means the effect did NOT apply — a
- * clean failure that is safe to retry. Anything else — a raw transport error (no
- * response), a 5xx (`instance_hibernating`), or a 429 (`budget_exceeded`) — is POST-SEND
- * UNKNOWN: the effect MAY have applied, so the ledger must mark it indeterminate and block
- * any retry rather than risk a double-apply.
+ * DEFINITIVE server rejection (401 reauth, 403 ACL, executor disabled) means the effect did
+ * NOT apply — a clean failure that is safe to retry. Anything else — a raw transport error
+ * (no response), a 5xx (`instance_hibernating`), or a 429 (`budget_exceeded`) — is
+ * POST-SEND UNKNOWN: the effect MAY have applied, so the ledger must mark it indeterminate
+ * and block any retry rather than risk a double-apply.
  */
 function isPostSendUnknown(err: unknown): boolean {
   if (err instanceof McpToolError) {
-    return !(err.code === "reauth_required" || err.code === "actor_policy_denied");
+    if (err.code === "budget_exceeded" && err.detail?.dimension === "outboundBytesSent") return false;
+    switch (err.code) {
+      case "reauth_required":
+      case "actor_policy_denied":
+      case "capability_denied":
+      case "table_not_found":
+      case "path_denied":
+      case "precondition_required":
+      case "code_size":
+        return false;
+      default:
+        return true;
+    }
   }
   return true; // transport error / abort / unknown — could have applied.
+}
+
+function normalizeReferenceLinks(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      "value" in value &&
+      "link" in value
+    ) {
+      out[key] = (value as { value?: unknown }).value;
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function runServerScriptBodyUpperBoundBytes(input: {
+  script: string;
+  claims: ActorClaims;
+  reason: string;
+}): number {
+  const actor = {
+    ...input.claims,
+    snow_effective_user_sys_id: input.claims.snow_effective_user_sys_id || "x".repeat(32),
+    script_sha256: "x".repeat(44),
+    issued_at: Number.MAX_SAFE_INTEGER,
+    nonce: "x".repeat(36),
+    reason: input.reason,
+  };
+  return utf8Len(JSON.stringify({ script: input.script, actor, actor_sig: "x".repeat(44) }));
 }
 
 export class ServiceNowRPC {
@@ -185,6 +235,45 @@ export class ServiceNowRPC {
     return Boolean(this.deps.actorPolicy.rowFilters?.[table]);
   }
 
+  /**
+   * Fetch a single row by sys_id THROUGH the actor's mandatory row filter (AND-ed in via
+   * applyRowFilter), so a record outside the actor's scope — or absent — comes back as undefined.
+   * Shared by the pre-write scope check and the filtered tableGet path so the row-filter-scoped
+   * lookup is constructed in exactly one place. Counts one ServiceNow request. sysId is
+   * 32-hex-validated by callers, safe to embed.
+   */
+  private async fetchRowInFilterScope(
+    table: string,
+    sysId: string,
+    fields?: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    const query = applyRowFilter(this.deps.actorPolicy, table, `sys_id=${sysId}`);
+    const q: Record<string, string> = {
+      sysparm_exclude_reference_link: "true",
+      sysparm_query: query,
+      sysparm_limit: "1",
+    };
+    if (fields) q.sysparm_fields = fields;
+    countServiceNowQueryBytes(this.deps.runBudget, q);
+    this.deps.runBudget.countServiceNowRequest();
+    const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}`, query: q });
+    throwMappedServiceNowError(res);
+    return ((res.json as { result?: Record<string, unknown>[] }).result ?? [])[0];
+  }
+
+  /**
+   * Enforce mandatory row filters before a write by proving the target sys_id appears in the
+   * actor-filtered list endpoint. Returns the raw row so recovery snapshots can reuse it.
+   */
+  private async assertSysIdInRowFilterScope(table: string, sysId: string): Promise<Record<string, unknown> | undefined> {
+    if (!this.hasMandatoryFilter(table)) return undefined;
+    const row = await this.fetchRowInFilterScope(table, sysId);
+    if (!row) {
+      throw new McpToolError("actor_policy_denied", `Row "${sysId}" is not allowed for this actor on "${table}".`, { table });
+    }
+    return row;
+  }
+
   async tableQuery(args: TableQueryArgs): Promise<TableRowsResult> {
     // Validate untrusted sandbox input BEFORE the gate / any path interpolation (P1).
     const table = validateTableName(args.table);
@@ -197,27 +286,29 @@ export class ServiceNowRPC {
     assertQueryFieldsAllowed(this.deps.actorPolicy, table, userQuery);
     const query = applyRowFilter(this.deps.actorPolicy, table, userQuery);
     const limit = reqLimit ?? TABLE_PAGE_CAP;
+    const requestLimit = limit < TABLE_PAGE_CAP ? limit + 1 : TABLE_PAGE_CAP;
 
     // sys_id is always fetched internally so row identity remains available after field selection.
     const fields = reqFields ? Array.from(new Set(["sys_id", ...reqFields])) : undefined;
     const q: Record<string, string> = {
-      sysparm_limit: String(limit),
+      sysparm_limit: String(requestLimit),
       sysparm_exclude_reference_link: "true",
     };
     if (query) q.sysparm_query = query;
     if (fields) q.sysparm_fields = fields.join(",");
 
+    countServiceNowQueryBytes(this.deps.runBudget, q);
     this.deps.runBudget.countServiceNowRequest();
     const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}`, query: q });
-    const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-    if (mapped) throw mapped;
+    throwMappedServiceNowError(res);
 
     const raw = ((res.json as { result?: unknown[] }).result ?? []) as Record<string, unknown>[];
-    const rows = raw.map((r) => maskRow(this.deps.actorPolicy, table, r));
+    const visibleRaw = raw.slice(0, limit);
+    const rows = visibleRaw.map((r) => maskRow(this.deps.actorPolicy, table, r));
     // Per-run row + byte enforcement (§P5): measure the MASKED payload the snippet sees.
     this.deps.runBudget.countRows(rows.length);
     this.deps.runBudget.countBytes(utf8Len(JSON.stringify(rows)));
-    return { rows, partial: rows.length >= limit };
+    return { rows, partial: limit < TABLE_PAGE_CAP ? raw.length > limit : raw.length >= TABLE_PAGE_CAP };
   }
 
   async tableGet(args: { table: string; sys_id: string; fields?: string[] }): Promise<Record<string, unknown> | null> {
@@ -231,24 +322,17 @@ export class ServiceNowRPC {
     if (this.hasMandatoryFilter(table)) {
       // Finding 8a: a direct /table/{table}/{sysId} GET ignores the mandatory row filter that
       // tableQuery/aggregate enforce. Route the single-record lookup through the filtered list
-      // endpoint so the configured rowFilter is AND-ed in (sysId is 32-hex-validated, safe to
-      // embed). A record outside the filter — or absent — returns null with no existence leak.
-      const query = applyRowFilter(this.deps.actorPolicy, table, `sys_id=${sysId}`);
-      const q: Record<string, string> = { sysparm_exclude_reference_link: "true", sysparm_query: query, sysparm_limit: "1" };
-      if (fieldsParam) q.sysparm_fields = fieldsParam;
-      this.deps.runBudget.countServiceNowRequest();
-      const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}`, query: q });
-      const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-      if (mapped) throw mapped;
-      row = ((res.json as { result?: Record<string, unknown>[] }).result ?? [])[0];
+      // endpoint so the configured rowFilter is AND-ed in. A record outside the filter — or
+      // absent — returns null with no existence leak.
+      row = await this.fetchRowInFilterScope(table, sysId, fieldsParam);
     } else {
       const q: Record<string, string> = { sysparm_exclude_reference_link: "true" };
       if (fieldsParam) q.sysparm_fields = fieldsParam;
+      countServiceNowQueryBytes(this.deps.runBudget, q);
       this.deps.runBudget.countServiceNowRequest();
       const res = await this.deps.http.request({ method: "GET", path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`, query: q });
       if (res.status === 404) return null;
-      const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-      if (mapped) throw mapped;
+      throwMappedServiceNowError(res);
       row = (res.json as { result?: Record<string, unknown> }).result;
     }
     if (!row) return null;
@@ -264,7 +348,7 @@ export class ServiceNowRPC {
     const userQuery = validateUserQuery(args.query, this.hasMandatoryFilter(table));
     // groupBy fields are field references: validate AND mask-check (no masked field may be
     // grouped on — same boundary as requested read fields).
-    const groupBy = validateFields(args.groupBy);
+    const groupBy = validateGroupByFields(args.groupBy);
     this.gateRead(table, groupBy);
     // M-6: the aggregate `query` is an equality/inference oracle if it can filter on a masked field
     // (groupBy is already mask-checked via gateRead; the predicate was not).
@@ -273,10 +357,10 @@ export class ServiceNowRPC {
     const q: Record<string, string> = { sysparm_count: "true" };
     if (query) q.sysparm_query = query;
     if (groupBy) q.sysparm_group_by = groupBy.join(",");
+    countServiceNowQueryBytes(this.deps.runBudget, q);
     this.deps.runBudget.countServiceNowRequest();
     const res = await this.deps.http.request({ method: "GET", path: `/api/now/stats/${encodeURIComponent(table)}`, query: q });
-    const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-    if (mapped) throw mapped;
+    throwMappedServiceNowError(res);
     const result = (res.json as { result?: unknown }).result ?? null;
     // Per-run byte enforcement (§P5): the serialized aggregate payload the snippet sees.
     this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result)));
@@ -299,12 +383,26 @@ export class ServiceNowRPC {
 
     const ordinal = ++this.ordinal;
     const reason = mutation.runContext.reason;
-    const requestHash = await tableUpdateRequestHash({ table, sysId, fields, mode: this.deps.effectiveMode, reason });
+    let bodyJson: string;
+    try {
+      bodyJson = canonicalObjectJson(fields);
+    } catch {
+      throw new McpToolError("precondition_required", "tableUpdate fields must be JSON-serializable.");
+    }
+    const requestHash = await tableUpdateRequestHash({
+      table,
+      sysId,
+      bodyJson,
+      mode: this.deps.effectiveMode,
+      policyScope: actorPolicyScopeFingerprint(this.deps.actorPolicy),
+      reason,
+    });
 
     // Classify recoverability via the named policy module (recovery/policy.ts): an `update`
     // on a snapshot-enabled table is `reversible_from_snapshot` and captures a before-state
     // snapshot; otherwise it is `non_recoverable` (no snapshot). runServerScript is always
     // non-recoverable (handled in that method — no snapshot).
+    let rowFilterScopeRow: Record<string, unknown> | undefined;
     let beforeRow: Record<string, unknown> | undefined;
     let snapshotStep: (() => Promise<void>) | undefined;
     const snapshotConfig = { enabledTables: mutation.snapshotEnabledTables ?? [] };
@@ -312,15 +410,20 @@ export class ServiceNowRPC {
     if (reversible) {
       snapshotStep = async () => {
         // Capture the real (unmasked) before-state for recovery; never reaches the snippet.
-        this.deps.runBudget.countServiceNowRequest();
-        const cur = await this.deps.http.request({
-          method: "GET",
-          path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`,
-          query: { sysparm_exclude_reference_link: "true" },
-        });
-        const curMapped = mapServiceNowError(cur.status, cur.json as { error?: { message?: string } });
-        if (curMapped) throw curMapped;
-        beforeRow = (cur.json as { result?: Record<string, unknown> }).result ?? {};
+        if (rowFilterScopeRow) {
+          beforeRow = rowFilterScopeRow;
+        } else {
+          const q = { sysparm_exclude_reference_link: "true" };
+          countServiceNowQueryBytes(this.deps.runBudget, q);
+          this.deps.runBudget.countServiceNowRequest();
+          const cur = await this.deps.http.request({
+            method: "GET",
+            path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`,
+            query: q,
+          });
+          throwMappedServiceNowError(cur);
+          beforeRow = (cur.json as { result?: Record<string, unknown> }).result ?? {};
+        }
         // captureSnapshot owns encryption + persist; a throw fails the mutation CLOSED
         // (no recovery row => no mutate). false => the table is opted out (claim narrowed).
         await mutation.captureSnapshot!({
@@ -330,11 +433,14 @@ export class ServiceNowRPC {
       };
     }
 
-    // Per-run SN-request budget for the PATCH — counted PRE-guard so a budget trip is a
-    // clean pre-send `budget_exceeded` (never misclassified as a post-send indeterminate).
-    this.deps.runBudget.countServiceNowRequest();
+    const preflight = async () => {
+      rowFilterScopeRow = await this.assertSysIdInRowFilterScope(table, sysId);
+      // Per-run SN-request budget for the PATCH — counted inside guard preflight so a budget trip
+      // is audited as a clean pre-send denial and never reaches the indeterminate classifier.
+      this.deps.runBudget.countServiceNowRequest();
+    };
 
-    const result = await guardMutation<Record<string, unknown>>(
+    const result = await guardMutation<unknown>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -351,14 +457,18 @@ export class ServiceNowRPC {
         sysId,
         requestHash,
         ...(reason !== undefined ? { reason } : {}),
+        preflight,
         ...(snapshotStep ? { snapshot: snapshotStep } : {}),
         get before() { return beforeRow; },
         effect: async () => {
-          // The SN-request meter was consulted PRE-guard (above) so a budget trip is a clean
-          // pre-send error, never reaching the indeterminate classifier. The effect is the
-          // network PATCH only.
-          const result = await this.patchRow(table, sysId, fields);
-          return { result, after: result };
+          // The SN-request meter was consulted in preflight so a budget trip is a clean
+          // pre-send error, never reaching the indeterminate classifier. The outbound-byte
+          // meter runs immediately before PATCH so denied/replayed mutations do not accrue
+          // "sent" bytes; an outbound cap trip is classified as a clean pre-send failure.
+          this.deps.runBudget.countOutboundBytes(utf8Len(bodyJson));
+          const rawResult = await this.patchRow(table, sysId, bodyJson);
+          const maskedResult = replaySafeResult(maskRow(this.deps.actorPolicy, table, rawResult ?? {}));
+          return { result: maskedResult, after: rawResult };
         },
         // Exactly-once (S17): a definitive PRE/at-apply server rejection (401 reauth, 403
         // ACL) means the write did NOT apply -> clean fail() (retry-safe). Anything else —
@@ -368,20 +478,29 @@ export class ServiceNowRPC {
         isIndeterminate: isPostSendUnknown,
       },
     );
+    const visibleResult = isReplaySafeWrapper(result)
+      ? result
+      : replaySafeResult(maskRow(this.deps.actorPolicy, table, (result ?? {}) as Record<string, unknown>));
     // Per-run byte enforcement (§P5): count the PATCH response AFTER guardMutation resolves.
     // Counting inside the effect closure would let a byte-cap throw classify as post-send
     // unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and poison the
     // ledger for a write that actually succeeded (same after-guard placement as runServerScript).
-    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result ?? null)));
-    return result;
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(visibleResult ?? null)));
+    return visibleResult as Record<string, unknown>;
   }
 
   /** Issue the PATCH and map the response. Shared by the guarded + unwired paths. */
-  private async patchRow(table: string, sysId: string, fields: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const res = await this.deps.http.request({ method: "PATCH", path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`, body: fields });
-    const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-    if (mapped) throw mapped;
-    return (res.json as { result?: Record<string, unknown> }).result ?? {};
+  private async patchRow(table: string, sysId: string, bodyJson: string): Promise<Record<string, unknown>> {
+    const q = { sysparm_exclude_reference_link: "true" };
+    countServiceNowQueryBytes(this.deps.runBudget, q);
+    const res = await this.deps.http.request({
+      method: "PATCH",
+      path: `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`,
+      query: q,
+      bodyJson,
+    });
+    throwMappedServiceNowError(res);
+    return normalizeReferenceLinks((res.json as { result?: Record<string, unknown> }).result ?? {});
   }
 
   /** Arbitrary server-side script via the x_mcp executor (admin_script only). Builds
@@ -407,25 +526,20 @@ export class ServiceNowRPC {
     // failed OPEN on the single most dangerous capability — an actor pinned to `write` could still
     // run arbitrary admin script. In integration_user mode (SN ACLs don't bound the shared
     // identity) this host-side cap is the bound, so enforce it explicitly BEFORE the capability
-    // gate, matching the documented ActorPolicy→capability order. modeRisk scores any non-Mode as
-    // +Infinity, so it fails closed.
-    if (modeRisk(this.deps.effectiveMode) > modeRisk(this.deps.actorPolicy.maxMode)) {
-      throw new McpToolError(
-        "actor_policy_denied",
-        `Mode "${this.deps.effectiveMode}" exceeds this actor's maxMode "${this.deps.actorPolicy.maxMode}".`,
-      );
-    }
+    // gate, matching the documented ActorPolicy→capability order. assertModeWithinPolicy fails
+    // closed (modeRisk scores any non-Mode as +Infinity).
+    assertModeWithinPolicy(this.deps.actorPolicy, this.deps.effectiveMode);
     requireCapability(this.deps.effectiveMode, "runServerScript");
     if (!this.deps.signing) {
       // The executor call is ALWAYS host-signed when the executor is configured (orthogonal to
       // credential mode — see the method header). No signing config => the executor is unwired.
-      throw new Error("runServerScript requires signed-actor configuration (executor not configured).");
+      throw new McpToolError("internal_error", "runServerScript requires signed-actor configuration (executor not configured).");
     }
     // I-6: a security-critical egress target must fail CLOSED, never silently fall back to a
     // hardcoded guess. Require the configured executor path here (handlers gates executorReady on
     // SNOW_EXECUTOR_PATH, so this is set in every wired deployment).
     if (!this.deps.executorPath) {
-      throw new Error("runServerScript requires executorPath (executor not configured).");
+      throw new McpToolError("internal_error", "runServerScript requires executorPath (executor not configured).");
     }
     const executorPath = this.deps.executorPath;
     const signing = this.deps.signing;
@@ -456,11 +570,10 @@ export class ServiceNowRPC {
       const res = await this.deps.http.request({
         method: "POST",
         path: executorPath,
-        body: { script: args.script, actor: signed.actor, actor_sig: signed.actor_sig },
+        bodyJson: JSON.stringify({ script: args.script, actor: signed.actor, actor_sig: signed.actor_sig }),
       });
       // Executor surfaces 503 (disabled) / 401 (bad signature) as typed conditions.
-      const mapped = mapServiceNowError(res.status, res.json as { error?: { message?: string } });
-      if (mapped) throw mapped;
+      throwMappedServiceNowError(res);
       return res.json;
     };
 
@@ -487,12 +600,13 @@ export class ServiceNowRPC {
     const requestHash = await runServerScriptRequestHash({
       script: args.script, reason, mode: this.deps.effectiveMode, instance: this.deps.instanceHost, actorUserId,
     });
+    const outboundUpperBoundBytes = runServerScriptBodyUpperBoundBytes({ script: args.script, claims: signing.claims, reason });
 
     // Second-approval gate (§7.9). Empty/unconfigured policy denies admin_script by default.
     // The interactive dry-run branch is stateless-unsupported in createMcpHandler, so the
     // supported non-interactive paths are approval token or current access-group membership.
     const approval = mutation.approval ?? { adminScriptAllowlist: [] };
-    const preflight = () =>
+    const approvalPreflight = () =>
       assertAdminScriptApproved({
         ...approval,
         mode: this.deps.effectiveMode,
@@ -501,8 +615,12 @@ export class ServiceNowRPC {
         approvalToken: mutation.runContext.approvalToken,
       });
 
-    // Per-run SN-request budget for the executor POST — counted PRE-guard (clean pre-send).
-    this.deps.runBudget.countServiceNowRequest();
+    const preflight = () => {
+      approvalPreflight();
+      // Per-run SN-request budget for the executor POST — counted inside the normal preflight so
+      // completed idempotency replays re-check approval without burning a ServiceNow request slot.
+      this.deps.runBudget.countServiceNowRequest();
+    };
 
     const result = await guardMutation<unknown>(
       {
@@ -520,8 +638,12 @@ export class ServiceNowRPC {
         reason,
         requestHash,
         preflight,
+        replayPreflight: approvalPreflight,
         // runServerScript is NON-RECOVERABLE (recovery/policy.ts) — no snapshot.
-        effect: async () => ({ result: await sendScript(reason) }),
+        effect: async () => {
+          this.deps.runBudget.countOutboundBytes(outboundUpperBoundBytes);
+          return { result: replaySafeResult(await sendScript(reason)) };
+        },
         isIndeterminate: isPostSendUnknown,
       },
     );

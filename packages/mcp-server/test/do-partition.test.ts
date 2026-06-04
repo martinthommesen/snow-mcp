@@ -1,5 +1,11 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import {
+  MUTATION_LEDGER_MAX_REPLAY_BYTES,
+  MUTATION_LEDGER_RETENTION_MS,
+  normalizeLedgerRecordForStorage,
+} from "../src/do/mutation-ledger.js";
+import { replaySafeResult } from "../src/sn/replay-payload.js";
 
 // ─── Phase 0.12 — Durable Object partition proof ──────────────────────────────
 // Proves token isolation per (user,instance) and that the GLOBAL budget counter
@@ -57,6 +63,91 @@ describe("Phase 0.12 — BudgetDO global counter coordinates through ONE object"
     await a.increment({ uniqueWorkers: 7 });
     const b = ns.get(ns.idFromName("2026-06-01"));
     expect(await b.get("uniqueWorkers")).toBe(0);
+  });
+});
+
+describe("MutationLedgerDO replay storage", () => {
+  it("migrates legacy rows without expiresAt instead of deleting their idempotency state", () => {
+    const now = 1_700_000_000_000;
+
+    const indeterminate = normalizeLedgerRecordForStorage({ status: "indeterminate", requestHash: "h1" }, now);
+    expect(indeterminate).toMatchObject({
+      kind: "migrated",
+      record: { status: "indeterminate", requestHash: "h1", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
+    });
+
+    const completed = normalizeLedgerRecordForStorage({
+      status: "completed",
+      requestHash: "h2",
+      result: { ok: true },
+    }, now);
+    expect(completed).toMatchObject({
+      kind: "migrated",
+      record: { status: "completed", requestHash: "h2", result: { ok: true } },
+    });
+  });
+
+  it("keeps expired unknown outcomes blocked instead of turning them into fresh claims", () => {
+    const now = 1_700_000_000_000;
+
+    expect(normalizeLedgerRecordForStorage({
+      status: "indeterminate",
+      requestHash: "h1",
+      expiresAt: now - 1,
+    }, now)).toMatchObject({
+      kind: "migrated",
+      record: { status: "indeterminate", requestHash: "h1", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
+    });
+    expect(normalizeLedgerRecordForStorage({
+      status: "started",
+      requestHash: "h2",
+      expiresAt: now - 1,
+    }, now)).toMatchObject({
+      kind: "migrated",
+      record: { status: "started", requestHash: "h2", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
+    });
+    expect(normalizeLedgerRecordForStorage({
+      status: "completed",
+      requestHash: "h3",
+      expiresAt: now - 1,
+      result: { ok: true },
+    }, now)).toEqual({ kind: "expired" });
+  });
+
+  it("caps oversized completed replay payloads before durable storage", async () => {
+    const ns = E.LEDGER_DO;
+    const obj = ns.get(ns.idFromName(`ledger-cap-${crypto.randomUUID()}`));
+    const requestHash = "hash-1";
+
+    await expect(obj.begin(requestHash)).resolves.toEqual({ state: "new" });
+    await obj.complete({ secret: "x".repeat(MUTATION_LEDGER_MAX_REPLAY_BYTES + 1024) });
+
+    const replay = await obj.begin(requestHash);
+    expect(replay).toMatchObject({
+      state: "replay",
+      result: {
+        truncated: true,
+        totalBytes: expect.any(Number),
+        serializedResult: expect.any(String),
+      },
+    });
+    expect((replay as { result: { serializedResult: string } }).result.serializedResult).toHaveLength(
+      MUTATION_LEDGER_MAX_REPLAY_BYTES,
+    );
+  });
+
+  it("does not trust caller-shaped replay wrappers that exceed the cap", () => {
+    const out = replaySafeResult({
+      truncated: true,
+      totalBytes: 1,
+      serializedResult: "x".repeat(MUTATION_LEDGER_MAX_REPLAY_BYTES + 1024),
+    });
+    expect(out).toMatchObject({
+      truncated: true,
+      totalBytes: expect.any(Number),
+      serializedResult: expect.any(String),
+    });
+    expect((out as { serializedResult: string }).serializedResult).toHaveLength(MUTATION_LEDGER_MAX_REPLAY_BYTES);
   });
 });
 
@@ -118,14 +209,21 @@ describe("Finding 5 — BudgetDO reserve-max + reconcile (refund) bounds concurr
   it("refunds the unused reservation: reserve max, reconcile to a smaller actual", async () => {
     const ns = E.BUDGET_DO;
     const obj = ns.get(ns.idFromName("2026-09-01"));
-    const cap = { serviceNowRequests: 1_000_000, sandboxRpcCalls: 1_000_000 };
-    // Reserve the per-run MAX (200 each), then reconcile to the ACTUAL spend (3 SN reqs, 5 rpc).
-    await obj.reserve({ serviceNowRequests: 200, sandboxRpcCalls: 200 }, cap, "userR");
-    await obj.reconcile({ serviceNowRequests: 3 - 200, sandboxRpcCalls: 5 - 200, rowsReturned: 7 }, "userR");
+    const cap = { serviceNowRequests: 1_000_000, sandboxRpcCalls: 1_000_000, outboundBytesSent: 1_000_000 };
+    // Reserve the per-run MAX, then reconcile to the ACTUAL spend.
+    await obj.reserve({ serviceNowRequests: 200, sandboxRpcCalls: 200, outboundBytesSent: 1000 }, cap, "userR");
+    await obj.reconcile({
+      serviceNowRequests: 3 - 200,
+      sandboxRpcCalls: 5 - 200,
+      outboundBytesSent: 70 - 1000,
+      rowsReturned: 7,
+    }, "userR");
     expect(await obj.get("serviceNowRequests")).toBe(3); // 200 reserved − 197 refunded
     expect(await obj.get("sandboxRpcCalls")).toBe(5);
+    expect(await obj.get("outboundBytesSent")).toBe(70);
     expect(await obj.get("rowsReturned")).toBe(7); // unreserved dimension accrues positively
     expect(await obj.getUser("userR", "serviceNowRequests")).toBe(3);
+    expect(await obj.getUser("userR", "outboundBytesSent")).toBe(70);
   });
 
   it("clamps a counter at >= 0 (a refund larger than the stored value cannot go negative)", async () => {
@@ -147,6 +245,19 @@ describe("Finding 5 — BudgetDO reserve-max + reconcile (refund) bounds concurr
     expect(r2.ok).toBe(true);
     expect(r3.ok).toBe(false); // 3×200 = 600 > 500 cap — concurrent overshoot is bounded
     if (!r3.ok) expect(r3.dimension).toBe("serviceNowRequests");
+  });
+
+  it("denies the (N+1)th outbound reserve once N×maxOutboundBytes would exceed the daily cap", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-09-04"));
+    const cap = { outboundBytesSent: 500 };
+    const r1 = await obj.reserve({ uniqueWorkers: 1, outboundBytesSent: 200 }, cap);
+    const r2 = await obj.reserve({ uniqueWorkers: 1, outboundBytesSent: 200 }, cap);
+    const r3 = await obj.reserve({ uniqueWorkers: 1, outboundBytesSent: 200 }, cap);
+    expect(r1.ok).toBe(true);
+    expect(r2.ok).toBe(true);
+    expect(r3.ok).toBe(false);
+    if (!r3.ok) expect(r3.dimension).toBe("outboundBytesSent");
   });
 });
 
@@ -192,15 +303,17 @@ describe("Phase P5 — BudgetDO per-user isolation (global = sum of users)", () 
   it("per-user tallies are isolated and the global counter is their sum", async () => {
     const ns = E.BUDGET_DO;
     const obj = ns.get(ns.idFromName("2026-08-03"));
-    await obj.increment({ rowsReturned: 30, bytesReturned: 300 }, "userA");
-    await obj.increment({ rowsReturned: 12, bytesReturned: 120 }, "userB");
+    await obj.increment({ rowsReturned: 30, bytesReturned: 300, outboundBytesSent: 50 }, "userA");
+    await obj.increment({ rowsReturned: 12, bytesReturned: 120, outboundBytesSent: 25 }, "userB");
     // Per-user views are isolated.
     expect(await obj.getUser("userA", "rowsReturned")).toBe(30);
     expect(await obj.getUser("userB", "rowsReturned")).toBe(12);
     expect(await obj.getUser("userA", "bytesReturned")).toBe(300);
+    expect(await obj.getUser("userA", "outboundBytesSent")).toBe(50);
     // The GLOBAL counter is the enforced ceiling = sum across users (shared-fate).
     expect(await obj.get("rowsReturned")).toBe(42);
     expect(await obj.get("bytesReturned")).toBe(420);
+    expect(await obj.get("outboundBytesSent")).toBe(75);
   });
 
   it("reserve() also updates the per-user view in the same gate", async () => {
@@ -222,6 +335,7 @@ describe("Phase P5 — BudgetDO per-user isolation (global = sum of users)", () 
       serviceNowRequests: 3,
       rowsReturned: 30,
       bytesReturned: 0,
+      outboundBytesSent: 0,
       sandboxRpcCalls: 0,
     });
   });
@@ -266,6 +380,17 @@ describe("Phase P5 — BudgetDO daily rows/bytes admission check (tier 1)", () =
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.dimension).toBe("sandboxRpcCalls");
     expect(await obj.get("uniqueWorkers")).toBe(0); // nothing committed by the denied reserve
+  });
+
+  it("denies the next run when the day's accrued outboundBytesSent is already at/over cap", async () => {
+    const ns = E.BUDGET_DO;
+    const obj = ns.get(ns.idFromName("2026-08-09"));
+    const cap = { outboundBytesSent: 100 };
+    await obj.increment({ outboundBytesSent: 100 });
+    const r = await obj.reserve({ uniqueWorkers: 1, serviceNowRequests: 1 }, cap, "userG");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.dimension).toBe("outboundBytesSent");
+    expect(await obj.get("uniqueWorkers")).toBe(0);
   });
 });
 

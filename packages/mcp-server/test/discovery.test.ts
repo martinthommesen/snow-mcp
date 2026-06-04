@@ -4,6 +4,8 @@ import { permissivePolicy, type ActorPolicy } from "../src/authz/actor-policy.js
 import { RunBudget } from "../src/sn/run-budget.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { McpToolError } from "../src/sn/errors.js";
+import { BUDGETS, SN_REQUEST_LIMITS, TABLE_PAGE_CAP } from "../src/config.js";
+import { serviceNowQueryStringBytes } from "../src/sn/query-budget.js";
 
 const INSTANCE = "inst1.service-now.com";
 
@@ -18,7 +20,7 @@ class MockHttp implements SnHttpClient {
         status: 200,
         json: { result: [
           { element: "number", column_label: "Number", internal_type: "string", mandatory: "true", max_length: "40" },
-          { element: "caller_id", column_label: "Caller", internal_type: "reference", mandatory: "false", max_length: "32" },
+          { element: "caller_id", column_label: "Caller", internal_type: "reference", mandatory: "false", max_length: "32", "reference.name": "sys_user" },
         ] },
       };
     }
@@ -37,7 +39,8 @@ describe("describe_table", () => {
   it("returns shaped field schema", async () => {
     const fields = await describeTable(deps(new MockHttp()), "incident");
     expect(fields).toContainEqual({ name: "number", label: "Number", type: "string", mandatory: true, maxLength: 40 });
-    expect(fields.find((f) => f.name === "caller_id")?.mandatory).toBe(false);
+    const caller = fields.find((f) => f.name === "caller_id");
+    expect(caller).toMatchObject({ mandatory: false, referenceTable: "sys_user", maxLength: 32 });
   });
 
   it("hides ActorPolicy-masked fields from discovery", async () => {
@@ -71,14 +74,34 @@ describe("describe_table", () => {
     expect(q).toBe("nameINincident^elementISNOTEMPTY");
     expect(q).not.toContain("sys_user");
   });
+
+  it("throws table_not_found for a missing table when integration_user can read sys_db_object", async () => {
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") return { status: 200, json: { result: [] } };
+      return { status: 200, json: { result: [] } };
+    });
+    await expect(describeTable(deps(http), "incident")).rejects.toMatchObject({ code: "table_not_found" });
+  });
+
+  it("throws table_not_found consistently under per_user_oauth", async () => {
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") return { status: 200, json: { result: [] } };
+      return { status: 200, json: { result: [] } };
+    });
+    await expect(describeTable({ ...deps(http), credentialMode: "per_user_oauth" }, "incident")).rejects.toMatchObject({
+      code: "table_not_found",
+    });
+  });
 });
 
 describe("list_tables", () => {
   it("returns name/label pairs and drops ActorPolicy-denied tables", async () => {
     const policy: ActorPolicy = { ...permissivePolicy([INSTANCE]), tables: { deny: [/^sys_user$/] } };
-    const tables = await listTables(deps(new MockHttp(), policy), "inc");
+    const { tables, partial, total } = await listTables(deps(new MockHttp(), policy), "inc");
     expect(tables).toContainEqual({ name: "incident", label: "Incident" });
     expect(tables.some((t) => t.name === "sys_user")).toBe(false);
+    expect(partial).toBe(false);
+    expect(total).toBeUndefined();
   });
 
   it("sanitizes the filter value (no encoded-query injection)", async () => {
@@ -90,5 +113,122 @@ describe("list_tables", () => {
     expect(q).not.toContain("=evil");
     expect(q).not.toContain("^cident");
     expect(q).toContain("LIKEincidentevil");
+  });
+
+  it("caps discovery filter length before calling ServiceNow", async () => {
+    const http = new MockHttp();
+    await expect(listTables(deps(http), "x".repeat(SN_REQUEST_LIMITS.maxDiscoveryFilterChars + 1))).rejects.toMatchObject({
+      code: "path_denied",
+    });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it("counts list_tables query bytes against outboundBytesSent before sending", async () => {
+    const http = new MockHttp();
+    const budget = new RunBudget({ ...BUDGETS.perRun, maxOutboundBytes: 10 });
+    await expect(listTables({ ...deps(http), runBudget: budget }, "incident")).rejects.toMatchObject({
+      code: "budget_exceeded",
+      detail: { dimension: "outboundBytesSent" },
+    });
+    expect(http.calls).toHaveLength(0);
+    expect(budget.outboundBytesSent).toBe(0);
+  });
+
+  it("fetches exact string allowlists directly instead of filtering a broad first page", async () => {
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        return {
+          status: 200,
+          json: { result: [{ name: "incident", label: "Incident" }, { name: "problem", label: "Problem" }] },
+        };
+      }
+      return { status: 200, json: { result: [] } };
+    });
+    const policy: ActorPolicy = { ...permissivePolicy([INSTANCE]), tables: { allow: ["incident", "problem"] } };
+    const out = await listTables(deps(http, policy));
+    expect(http.calls[0]!.query!.sysparm_query).toBe("nameINincident,problem^ORDERBYname");
+    expect(out.tables.map((t) => t.name)).toEqual(["incident", "problem"]);
+    expect(out.partial).toBe(false);
+  });
+
+  it("chunks long exact string allowlists so each ServiceNow query stays under the query-byte cap", async () => {
+    const names = Array.from({ length: 180 }, (_, i) => `u_${String(i).padStart(3, "0")}_${"x".repeat(60)}`);
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        expect(serviceNowQueryStringBytes(req.query)).toBeLessThanOrEqual(SN_REQUEST_LIMITS.maxQueryStringBytes);
+        const raw = req.query?.sysparm_query ?? "";
+        const match = /^nameIN(.+)\^ORDERBYname$/.exec(raw);
+        expect(match).toBeTruthy();
+        const requested = match![1]!.split(",");
+        return {
+          status: 200,
+          json: { result: requested.map((name) => ({ name, label: `Label ${name}` })) },
+        };
+      }
+      return { status: 200, json: { result: [] } };
+    });
+    const policy: ActorPolicy = { ...permissivePolicy([INSTANCE]), tables: { allow: names } };
+    const out = await listTables(deps(http, policy));
+    expect(http.calls.length).toBeGreaterThan(1);
+    expect(out.tables.map((t) => t.name)).toEqual(names);
+    expect(out.partial).toBe(false);
+  });
+
+  it("returns precise partial metadata and non-leaking X-Total-Count when no table policy filters apply", async () => {
+    const rows = Array.from({ length: TABLE_PAGE_CAP }, (_, i) => ({ name: `u_table_${i}`, label: `Table ${i}` }));
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        return { status: 200, json: { result: rows }, headers: { "x-total-count": "1234" } };
+      }
+      return { status: 200, json: { result: [] } };
+    });
+    const out = await listTables(deps(http));
+    expect(out.tables).toHaveLength(TABLE_PAGE_CAP);
+    expect(out.partial).toBe(true);
+    expect(out.total).toBe(1234);
+  });
+
+  it("does not mark the exact page boundary partial when X-Total-Count confirms there are no more rows", async () => {
+    const rows = Array.from({ length: TABLE_PAGE_CAP }, (_, i) => ({ name: `u_table_${i}`, label: `Table ${i}` }));
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        return { status: 200, json: { result: rows }, headers: { "x-total-count": String(TABLE_PAGE_CAP) } };
+      }
+      return { status: 200, json: { result: [] } };
+    });
+    const out = await listTables(deps(http));
+    expect(out.tables).toHaveLength(TABLE_PAGE_CAP);
+    expect(out.partial).toBe(false);
+    expect(out.total).toBe(TABLE_PAGE_CAP);
+  });
+
+  it("omits X-Total-Count when table allow/deny policy would filter the raw ServiceNow count", async () => {
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        return {
+          status: 200,
+          json: { result: [{ name: "incident", label: "Incident" }, { name: "sys_user", label: "User" }] },
+          headers: { "x-total-count": "2" },
+        };
+      }
+      return { status: 200, json: { result: [] } };
+    });
+    const out = await listTables(deps(http, { ...permissivePolicy([INSTANCE]), tables: { allow: [/^incident$/] } }));
+    expect(out.tables).toEqual([{ name: "incident", label: "Incident" }]);
+    expect(out.total).toBeUndefined();
+  });
+
+  it("warns when non-exact policy filters make one-page list_tables partial", async () => {
+    const rows = Array.from({ length: TABLE_PAGE_CAP }, (_, i) => ({ name: `u_table_${i}`, label: `Table ${i}` }));
+    const http = new MockHttp((req) => {
+      if (req.path === "/api/now/table/sys_db_object") {
+        return { status: 200, json: { result: rows } };
+      }
+      return { status: 200, json: { result: [] } };
+    });
+    const out = await listTables(deps(http, { ...permissivePolicy([INSTANCE]), tables: { allow: [/^u_table_/] } }));
+    expect(out.partial).toBe(true);
+    expect(out.policyFilteredPartial).toBe(true);
+    expect(out.warning).toMatch(/may omit allowed tables/i);
   });
 });

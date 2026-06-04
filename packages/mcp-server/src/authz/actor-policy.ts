@@ -36,6 +36,42 @@ export function permissivePolicy(allowedInstances: string[]): ActorPolicy {
   };
 }
 
+function serializeTableRule(rule: TableRule): string {
+  return typeof rule === "string" ? `string:${rule}` : `regexp:${rule.source}/${rule.flags}`;
+}
+
+function sortedTableRules(rules: TableRule[] | undefined): string[] {
+  return (rules ?? []).map(serializeTableRule).sort();
+}
+
+function sortedStringRecord(record: Record<string, string[] | undefined>): Record<string, string[]> {
+  return Object.fromEntries(
+    Object.entries(record)
+      .map(([key, values]) => [key, [...(values ?? [])].sort()] as const)
+      .sort(([a], [b]) => a.localeCompare(b)),
+  );
+}
+
+function sortedScalarRecord(record: Record<string, string> | undefined): Record<string, string> {
+  return Object.fromEntries(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+/** Stable authorization-scope fingerprint for idempotency replay binding. */
+export function actorPolicyScopeFingerprint(policy: ActorPolicy): string {
+  return JSON.stringify({
+    allowedInstances: [...policy.allowedInstances].sort(),
+    tables: {
+      allow: sortedTableRules(policy.tables.allow),
+      deny: sortedTableRules(policy.tables.deny),
+    },
+    fieldMasks: sortedStringRecord(policy.fieldMasks),
+    maxMode: policy.maxMode,
+    maxRowsPerRun: policy.maxRowsPerRun,
+    maxBytesPerRun: policy.maxBytesPerRun,
+    rowFilters: sortedScalarRecord(policy.rowFilters),
+  });
+}
+
 /**
  * Validate a policy's mandatory `rowFilters` at load time (P1): a mandatory filter that
  * itself contains a structural operator (`^NQ`/`^OR`/`^EQ`) is self-defeating, since the
@@ -62,6 +98,8 @@ export interface PolicyEnv {
   ACTOR_POLICY_MAX_BYTES_PER_RUN?: string;
   /** Highest mode this actor may request (read_only | write | admin_script). */
   ACTOR_POLICY_MAX_MODE?: Mode;
+  /** JSON object: policy name -> ACTOR_POLICY_* config object. */
+  ACTOR_POLICIES_JSON?: string;
 }
 
 const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
@@ -104,42 +142,44 @@ function parseTableAllowlist(value: string | undefined): string[] {
   return tables;
 }
 
-/** Parse `table:a,b;table2:c` into `{ table: [a,b], table2: [c] }`. */
-function parseTableMap(value: string | undefined, label: string): Record<string, string[]> {
-  const out: Record<string, string[]> = {};
+function parseTableScopedConfig<T>(
+  value: string | undefined,
+  label: string,
+  expectedShape: string,
+  parseValue: (raw: string, entry: string) => T,
+): Record<string, T> {
+  const out: Record<string, T> = {};
   const entries = (value ?? "").split(";").map((s) => s.trim()).filter(Boolean);
   if (hasNonEmptyConfig(value) && entries.length === 0) throw new Error(`${label} is set but contains no entries.`);
   for (const entry of entries) {
     const idx = entry.indexOf(":");
-    if (idx <= 0) throw new Error(`${label} entry must be "table:field,field", got "${entry}".`);
+    if (idx <= 0) throw new Error(`${label} entry must be "${expectedShape}", got "${entry}".`);
     const table = entry.slice(0, idx).trim();
     assertConfiguredTableName(label, table, entry);
     assertUniqueTableEntry(label, out, table, entry);
-    const fields = parseList(entry.slice(idx + 1));
-    if (fields.length === 0) throw new Error(`${label} entry must include at least one field, got "${entry}".`);
-    for (const field of fields) assertConfiguredFieldName(label, field, entry);
-    out[table] = fields;
+    out[table] = parseValue(entry.slice(idx + 1), entry);
   }
   return out;
+}
+
+/** Parse `table:a,b;table2:c` into `{ table: [a,b], table2: [c] }`. */
+function parseTableMap(value: string | undefined, label: string): Record<string, string[]> {
+  return parseTableScopedConfig(value, label, "table:field,field", (raw, entry) => {
+    const fields = parseList(raw);
+    if (fields.length === 0) throw new Error(`${label} entry must include at least one field, got "${entry}".`);
+    for (const field of fields) assertConfiguredFieldName(label, field, entry);
+    return fields;
+  });
 }
 
 /** Parse `table:encoded^query;table2:other^query` into `{ table: "encoded^query" }`. The value
  *  is everything after the FIRST colon (a filter may itself contain `:` in date/time literals). */
 function parseRowFilters(value: string | undefined, label: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  const entries = (value ?? "").split(";").map((s) => s.trim()).filter(Boolean);
-  if (hasNonEmptyConfig(value) && entries.length === 0) throw new Error(`${label} is set but contains no entries.`);
-  for (const entry of entries) {
-    const idx = entry.indexOf(":");
-    if (idx <= 0) throw new Error(`${label} entry must be "table:encoded_query", got "${entry}".`);
-    const table = entry.slice(0, idx).trim();
-    assertConfiguredTableName(label, table, entry);
-    assertUniqueTableEntry(label, out, table, entry);
-    const filter = entry.slice(idx + 1).trim();
+  return parseTableScopedConfig(value, label, "table:encoded_query", (raw, entry) => {
+    const filter = raw.trim();
     if (!filter) throw new Error(`${label} entry must include a non-empty encoded query, got "${entry}".`);
-    out[table] = filter;
-  }
-  return out;
+    return filter;
+  });
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -149,6 +189,17 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
     throw new Error(`ActorPolicy ceiling must be a positive integer, got: ${value}`);
   }
   return n;
+}
+
+function hasFlatPolicyConfig(env: PolicyEnv): boolean {
+  return (
+    hasNonEmptyConfig(env.ACTOR_POLICY_TABLE_ALLOWLIST) ||
+    hasNonEmptyConfig(env.ACTOR_POLICY_FIELD_MASKS) ||
+    hasNonEmptyConfig(env.ACTOR_POLICY_ROW_FILTERS) ||
+    env.ACTOR_POLICY_MAX_ROWS_PER_RUN !== undefined ||
+    env.ACTOR_POLICY_MAX_BYTES_PER_RUN !== undefined ||
+    env.ACTOR_POLICY_MAX_MODE !== undefined
+  );
 }
 
 /**
@@ -167,13 +218,7 @@ export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPoli
   const allowlist = parseTableAllowlist(env.ACTOR_POLICY_TABLE_ALLOWLIST);
   const fieldMasks = parseTableMap(env.ACTOR_POLICY_FIELD_MASKS, "ACTOR_POLICY_FIELD_MASKS");
   const rowFilters = parseRowFilters(env.ACTOR_POLICY_ROW_FILTERS, "ACTOR_POLICY_ROW_FILTERS");
-  const configured =
-    hasNonEmptyConfig(env.ACTOR_POLICY_TABLE_ALLOWLIST) ||
-    hasNonEmptyConfig(env.ACTOR_POLICY_FIELD_MASKS) ||
-    hasNonEmptyConfig(env.ACTOR_POLICY_ROW_FILTERS) ||
-    env.ACTOR_POLICY_MAX_ROWS_PER_RUN !== undefined ||
-    env.ACTOR_POLICY_MAX_BYTES_PER_RUN !== undefined ||
-    env.ACTOR_POLICY_MAX_MODE !== undefined;
+  const configured = hasFlatPolicyConfig(env);
 
   if (!configured) return permissivePolicy([instanceHost]); // live single-operator default, unchanged.
 
@@ -200,6 +245,40 @@ export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPoli
   // operator) is rejected at LOAD, before it can ever let a caller escape the AND-ed filter.
   assertPolicyRowFiltersSafe(policy);
   return policy;
+}
+
+export function denyAllPolicy(instanceHost: string): ActorPolicy {
+  return {
+    allowedInstances: [instanceHost],
+    tables: { allow: [/^$/] },
+    fieldMasks: {},
+    maxMode: "read_only",
+    maxRowsPerRun: 1,
+    maxBytesPerRun: 1,
+  };
+}
+
+export function loadNamedActorPolicies(env: PolicyEnv, instanceHost: string): Map<string, ActorPolicy> {
+  const raw = env.ACTOR_POLICIES_JSON?.trim();
+  const defaultPolicy = raw && !hasFlatPolicyConfig(env)
+    ? denyAllPolicy(instanceHost)
+    : loadActorPolicy(env, instanceHost);
+  const out = new Map<string, ActorPolicy>([["default", defaultPolicy]]);
+  if (!raw) return out;
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  for (const [name, policyEnv] of Object.entries(parsed)) {
+    if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) {
+      throw new Error(`ACTOR_POLICIES_JSON contains invalid policy name "${name}".`);
+    }
+    if (typeof policyEnv !== "object" || policyEnv === null || Array.isArray(policyEnv)) {
+      throw new Error(`ACTOR_POLICIES_JSON.${name} must be an object.`);
+    }
+    if (!hasFlatPolicyConfig(policyEnv as PolicyEnv)) {
+      throw new Error(`ACTOR_POLICIES_JSON.${name} must configure at least one ACTOR_POLICY_* setting.`);
+    }
+    out.set(name, loadActorPolicy(policyEnv, instanceHost));
+  }
+  return out;
 }
 
 interface CompiledTableRules {
@@ -264,6 +343,17 @@ export function isTableAllowed(policy: ActorPolicy, table: string): boolean {
   return true; // no allowlist => allow unless denied
 }
 
+/** Throw `actor_policy_denied` if `mode` exceeds this actor's `maxMode` ceiling. The single
+ *  source of truth for the mode ceiling, enforced both here (via assertActorPolicy, table-scoped
+ *  reads/writes) and on the table-less executor path (runServerScript, H-1). FAIL-CLOSED
+ *  (plan §P6a): modeRisk scores any non-Mode value as +Infinity, so an unknown mode exceeds any
+ *  valid maxMode and is DENIED (never fails open via an `undefined > undefined === false` compare). */
+export function assertModeWithinPolicy(policy: ActorPolicy, mode: Mode): void {
+  if (modeRisk(mode) > modeRisk(policy.maxMode)) {
+    throw new McpToolError("actor_policy_denied", `Mode "${mode}" exceeds this actor's maxMode "${policy.maxMode}".`);
+  }
+}
+
 /** Throw `actor_policy_denied` if this actor may not touch (instance, table) in `mode`. */
 export function assertActorPolicy(
   policy: ActorPolicy,
@@ -280,12 +370,7 @@ export function assertActorPolicy(
       table: ctx.table,
     });
   }
-  // FAIL-CLOSED (plan §P6a): modeRisk scores any non-Mode value as +Infinity, so an unknown
-  // requested `ctx.mode` exceeds any valid maxMode and is DENIED (never fails open to
-  // admin_script via an `undefined > undefined === false` comparison).
-  if (modeRisk(ctx.mode) > modeRisk(policy.maxMode)) {
-    throw new McpToolError("actor_policy_denied", `Mode "${ctx.mode}" exceeds this actor's maxMode "${policy.maxMode}".`);
-  }
+  assertModeWithinPolicy(policy, ctx.mode);
 }
 
 /** Compose the actor's mandatory row filter with the caller's encoded query (AND). */
@@ -354,25 +439,14 @@ function leadingFieldToken(clause: string): string {
   return m ? m[0] : "";
 }
 
-// LOWERCASE SN encoded-query word-operators. Their UPPERCASE/symbol forms already terminate the
-// leadingFieldToken run; only a LOWERCASE operator glued to a masked field name evades it
-// (`salarylike5` reads as one token). We detect that residual by matching a MASKED field followed
-// by one of these — so a legit UNMASKED field with an operator-looking name (`incident_statelike1`
-// when `incident_state` is not masked) is untouched. List is best-effort; an exotic operator not
-// here is the documented residual, gated on the P8 SN operator case-sensitivity confirmation.
-const LOWERCASE_QUERY_OPERATORS = [
-  "startswith", "endswith", "notlike", "like", "isnotempty", "isempty", "notin", "in",
-  "between", "nsameas", "sameas", "anything", "instanceof", "noton", "on",
-  "dynamic", "valchanges", "changesfrom", "changesto", "changes",
-];
-
-/** If `token` is a masked field immediately followed by a lowercase operator (the
- *  leadingFieldToken-evasion case), return that masked field; else undefined. */
-function maskedFieldWithLowercaseOperator(masked: MaskIndex, token: string): string | undefined {
+/** If `token` is a masked field immediately followed by an alphabetic suffix, treat it as an
+ *  ambiguous glued operator form and reject. Distinct fields that continue with `_`, `.`, or a
+ *  digit still pass (`u_ssn_note`, `caller_id.name`, `u_ssn2`). */
+function maskedFieldWithGluedOperator(masked: MaskIndex, token: string): string | undefined {
   for (const m of masked.fields) {
     if (token.length > m.length && token.startsWith(m)) {
       const suffix = token.slice(m.length);
-      if (LOWERCASE_QUERY_OPERATORS.some((op) => suffix.startsWith(op))) return m;
+      if (/^[a-z]/i.test(suffix)) return m;
     }
   }
   return undefined;
@@ -390,9 +464,8 @@ function maskedFieldWithLowercaseOperator(masked: MaskIndex, token: string): str
  * and deny (`actor_policy_denied`) if either is masked (dot-aware via isFieldMasked). This errs toward
  * over-rejection, the correct direction for a confidentiality control. L-3: the lowercase-operator
  * form (`salarylike5`), which the lowercase-only leadingFieldToken would otherwise swallow whole, is
- * now caught via maskedFieldWithLowercaseOperator (masked-prefix + known lowercase operator), so a
- * legit unmasked field with an operator-looking name still passes. Residual: an operator outside that
- * list, or SN case-folding of FIELD names themselves — gated on the P8 case-sensitivity confirmation.
+ * now caught via maskedFieldWithGluedOperator (masked-prefix + alphabetic suffix). Distinct
+ * underscore/dot/digit field continuations still pass; ambiguous glued forms fail closed.
  */
 export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, userQuery: string): void {
   const masked = maskIndex(policy, table);
@@ -404,7 +477,7 @@ export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, use
       if (isFieldMaskedByIndex(masked, f)) {
         throw new McpToolError("actor_policy_denied", `Query references a field not permitted for this actor on "${table}": ${f}.`);
       }
-      const gluedMask = maskedFieldWithLowercaseOperator(masked, f);
+      const gluedMask = maskedFieldWithGluedOperator(masked, f);
       if (gluedMask) {
         throw new McpToolError("actor_policy_denied", `Query references a field not permitted for this actor on "${table}": ${gluedMask}.`);
       }

@@ -20,12 +20,14 @@
     "check:verifier-sync": "node --check sn-executor-app/script-include/x_mcp_verify.js && node --check sn-executor-app/fluent/src/server/x_mcp_verify.js && node scripts/check-verifier-sync.mjs",
     "predev": "npm run copy-wasm",
     "pretest": "npm run copy-wasm && npm run check:verifier-sync",
-    "deploy": "npm run copy-wasm && alchemy deploy",
-    "deploy:destroy": "alchemy destroy",
+    "deploy": "npm run copy-wasm && DEPLOYMENT_PROFILE=production alchemy deploy",
+    "deploy:pilot": "npm run copy-wasm && DEPLOYMENT_PROFILE=pilot ALLOW_PILOT_DEPLOY=1 alchemy deploy",
+    "deploy:destroy": "ALLOW_PILOT_DEPLOY=1 alchemy destroy",
     "deploy:e2e": "node scripts/deployed-e2e.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.16.10",
+    "@cyclonedx/cyclonedx-npm": "4.2.1",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0",
     "wrangler": "4.95.0"

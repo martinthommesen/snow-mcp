@@ -39,7 +39,8 @@ Concretely:
 ```
 MCP client ──Streamable HTTP (Origin-validated)──▶
 OAuthProvider (workers-oauth-provider)            ← client↔Worker OAuth 2.1
-  ├─ /authorize /token /register  → consent (CSRF/state/nonce) + upstream ServiceNow PKCE
+  ├─ /authorize /token /register  → operator-secret consent OR enterprise OIDC RP flow
+  ├─ /oidc/callback               → IdP code exchange + ID-token validation + grant props
   └─ apiRoute /mcp → apiHandler → createMcpHandler(createServer()) [per request]
         ├─ getMcpAuthContext() → mcp_actor {userId, email}; instanceHost
         ├─ Tools: run_code, describe_table, list_tables
@@ -154,6 +155,7 @@ Settled. If evidence contradicts one, stop and record it in [`DELTAS.md`](DELTAS
 |---|---|---|
 | MCP server shape | Stateless `createMcpHandler` (`agents/mcp`) | Cloudflare's current recommended shape |
 | MCP client auth | `@cloudflare/workers-oauth-provider` (OAuth 2.1); identity via `getMcpAuthContext()` | Distinct layer from ServiceNow OAuth; Worker issues its own client token |
+| Enterprise identity | In-Worker OIDC authorization-code + PKCE (`AUTH_MODE=oidc`) | MCP OAuth grants are backed by IdP `sub` + group-derived ceilings/policies |
 | ServiceNow credential mode | `integration_user` (single-operator) or `per_user_oauth` (multi-user) | Multi-user needs `per_user_oauth` **or** `integration_user`+`ActorPolicy` |
 | Actor attribution | Host HMAC-signs the actor payload; the scoped executor verifies it (freshness + nonce, fail-closed) | A claimed `body.actor` is forgeable; sign+verify makes integration-mode attribution real |
 | Authorization (mode) | `effectiveMode = min(requested, OAuth-scope, tenant, instance)`; `admin_script` gated by allowlist + approval | A requested mode must only narrow, never grant |
@@ -185,6 +187,32 @@ type ServiceNowCredentialMode = "integration_user" | "per_user_oauth";
 - **`per_user_oauth` (multi-user default).** ServiceNow ACLs bound access natively and attribution is
   native (ServiceNow sees the real user). "Maximum access" then depends on each human's roles.
 
+## MCP Client Identity
+
+```ts
+type AuthMode = "operator_secret" | "oidc";
+```
+
+- **`operator_secret` (pilot/dev).** `/authorize` renders the local consent form and requires
+  `MCP_OPERATOR_SECRET` plus `MCP_OPERATOR_USER_ID`. This is retained for controlled pilot bring-up.
+- **`oidc` (enterprise).** `/authorize` redirects to the configured IdP with PKCE, `state`, and
+  `nonce`; `/oidc/callback` consumes the stored state once, validates the signed ID token, and
+  completes the MCP OAuth grant with `userId=sub`. `props.maxMode` is
+  `min(MCP requested scopes, OIDC group policy maxMode)`, and `props.actorPolicyName` selects a
+  named host-side `ActorPolicy` loaded from `ACTOR_POLICIES_JSON`.
+
+OIDC `email` is treated as a ServiceNow-linking hint only when the signed ID token also carries
+`email_verified=true`. Users whose IdP does not emit verified email can still get MCP grants keyed
+by OIDC `sub`, but first-time ServiceNow account binding needs an admin-seeded expected sys_id/token
+or an IdP-side verified-email configuration.
+
+OIDC grants persist the IdP refresh token in OAuth-provider grant props, but strip it from MCP
+access-token props. On MCP refresh-token exchange the Worker refreshes the IdP token and
+re-evaluates group-derived `maxMode` and `actorPolicyName`, so group removal downgrades both the
+capability ceiling and the table/row/field policy at the next MCP refresh. Equal-risk group
+mappings must agree on the named `ActorPolicy`; conflicting policies at the same risk are rejected
+instead of depending on JSON/object iteration order.
+
 ## ServiceNow OAuth
 
 Inbound OAuth 2.0, Auth Code + PKCE for human/remote; ROPC for a disposable PDI dev / CI service
@@ -193,6 +221,12 @@ secret) is what makes refresh tokens available.
 
 > **B9 — this OAuth client type does not rotate the refresh token on refresh** (the same refresh
 > token is reused). Token-store rotation logic must **not** assume rotation.
+
+## Sandbox Globals
+
+The sandbox runs with `globalOutbound: null`. Platform globals such as `fetch` may still exist in
+the JavaScript environment, but outbound network calls are blocked by the Worker Loader runtime and
+fail immediately. Treat the supported sandbox API as the typed `servicenow.*` surface only.
 
 ## Testing model — why two harnesses
 
