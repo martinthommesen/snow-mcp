@@ -428,6 +428,59 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     expect(reserves).toBe(1);
   });
 
+  it("does not reuse a non-fresh schema cache when a fresh identity becomes available", async () => {
+    const host = `inst-fresh-cache-${crypto.randomUUID()}.service-now.com`;
+    let freshIdentity: { principalId: string; roleHash: string } | undefined;
+    let normalIdentityCalls = 0;
+    let freshIdentityCalls = 0;
+    let fetches = 0;
+    vi.stubGlobal("fetch", (async () => {
+      fetches++;
+      const table = fetches === 1 ? { name: "incident", label: "Incident" } : { name: "problem", label: "Problem" };
+      return new Response(JSON.stringify({ result: [table] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER,
+        SCHEMA_KV: KV,
+        SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
+        SNOW_DEV_ROPC: "1",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident,problem",
+      } as HandlerEnv,
+      {
+        userId: "fresh-cache-user",
+        scopeMaxMode: "read_only",
+        props: { userId: "fresh-cache-user", scopes: ["servicenow:read"], maxMode: "read_only" },
+        schemaIdentityResolver: async () => {
+          normalIdentityCalls++;
+          return { principalId: "stale-principal", roleHash: "stale-role" };
+        },
+        schemaIdentityFreshResolver: async () => {
+          freshIdentityCalls++;
+          return freshIdentity;
+        },
+      },
+    );
+
+    const first = await handlers.listTables({});
+    expect(JSON.parse(first.content[0]!.text).tables.map((t: { name: string }) => t.name)).toEqual(["incident"]);
+    expect(first.structuredContent).toMatchObject({ cached: false });
+
+    freshIdentity = { principalId: "fresh-principal", roleHash: "fresh-role" };
+    const second = await handlers.listTables({});
+    expect(JSON.parse(second.content[0]!.text).tables.map((t: { name: string }) => t.name)).toEqual(["problem"]);
+    expect(second.structuredContent).toMatchObject({ cached: false });
+    expect(normalIdentityCalls).toBe(1);
+    expect(freshIdentityCalls).toBe(2);
+    expect(fetches).toBe(2);
+  });
+
   it("denies discovery daily budget before refreshing a per-user ServiceNow token", async () => {
     const host = `inst-discovery-auth-order-${crypto.randomUUID()}.service-now.com`;
     const userId = "discovery-auth-order-user";

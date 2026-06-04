@@ -592,11 +592,21 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     const identity = await schemaCacheIdentity(freshOnly);
     return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity, policyHash: await actorPolicyHash(policy) }) : undefined;
   }
+  async function buildFreshSchemaCache(): Promise<SchemaCache | undefined> {
+    const pending = buildSchemaCache(true);
+    freshSchemaCachePromise = pending;
+    try {
+      const cache = await pending;
+      if (!cache && freshSchemaCachePromise === pending) freshSchemaCachePromise = undefined;
+      return cache;
+    } catch (e) {
+      if (freshSchemaCachePromise === pending) freshSchemaCachePromise = undefined;
+      throw e;
+    }
+  }
   const schemaCache = (opts: { freshOnly?: boolean } = {}): Promise<SchemaCache | undefined> => {
     if (opts.freshOnly) {
-      if (schemaCachePromise) return schemaCachePromise;
-      freshSchemaCachePromise ??= buildSchemaCache(true);
-      return freshSchemaCachePromise;
+      return freshSchemaCachePromise ?? buildFreshSchemaCache();
     }
     schemaCachePromise ??= buildSchemaCache(false);
     return schemaCachePromise;
