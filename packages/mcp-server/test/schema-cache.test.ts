@@ -374,6 +374,237 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     expect(reconciles[0]!.delta.outboundBytesSent).toBeLessThan(0);
   });
 
+  it("serves cached list_tables hits without spending exhausted daily discovery budget", async () => {
+    const host = `inst-discovery-cache-budget-${crypto.randomUUID()}.service-now.com`;
+    let fetches = 0;
+    let reserves = 0;
+    vi.stubGlobal("fetch", (async () => {
+      fetches++;
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+    const budget = {
+      reserve: async () => {
+        reserves++;
+        return reserves === 1 ? { ok: true } : { ok: false, dimension: "serviceNowRequests" };
+      },
+      reconcile: async () => {},
+    };
+
+    const handlers = buildHandlers(
+      {
+        LOADER,
+        SCHEMA_KV: KV,
+        BUDGET_DO: {
+          idFromName: (name: string) => name,
+          get: () => budget,
+        } as unknown as DurableObjectNamespace,
+        SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
+        SNOW_DEV_ROPC: "1",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
+      } as HandlerEnv,
+      {
+        userId: "discovery-cache-budget-user",
+        scopeMaxMode: "read_only",
+        props: { userId: "discovery-cache-budget-user", scopes: ["servicenow:read"], maxMode: "read_only" },
+        schemaIdentity: { principalId: "discovery-cache-budget-principal", roleHash: "discovery-cache-budget-role" },
+      },
+    );
+
+    const first = await handlers.listTables({});
+    expect(first.isError).not.toBe(true);
+    expect(first.structuredContent).toMatchObject({ cached: false });
+    expect(fetches).toBe(1);
+    expect(reserves).toBe(1);
+
+    const second = await handlers.listTables({});
+    expect(second.isError).not.toBe(true);
+    expect(second.structuredContent).toMatchObject({ cached: true });
+    expect(fetches).toBe(1);
+    expect(reserves).toBe(1);
+  });
+
+  it("denies discovery daily budget before refreshing a per-user ServiceNow token", async () => {
+    const host = `inst-discovery-auth-order-${crypto.randomUUID()}.service-now.com`;
+    const userId = "discovery-auth-order-user";
+    const secret = "discovery-auth-order-kek";
+    const stub = TOKEN_DO.get(TOKEN_DO.idFromName(`${userId}|${host}`));
+    const store = new TokenStore(stub, await buildKekRing(secret), userId, host);
+    await store.put("servicenow", {
+      access_token: "expired",
+      refresh_token: "refresh-me",
+      expires_at: Date.now() - 1,
+    });
+
+    let fetches = 0;
+    vi.stubGlobal("fetch", (async () => {
+      fetches++;
+      return new Response(JSON.stringify({ access_token: "new-token", expires_in: 1800 }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+    const budget = {
+      reserve: async () => ({ ok: false, dimension: "serviceNowRequests" }),
+      reconcile: async () => {},
+    };
+
+    const handlers = buildHandlers(
+      {
+        LOADER,
+        BUDGET_DO: {
+          idFromName: (name: string) => name,
+          get: () => budget,
+        } as unknown as DurableObjectNamespace,
+        TOKEN_DO: TOKEN_DO as unknown as DurableObjectNamespace,
+        SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
+        SNOW_OAUTH_CLIENT_ID: "cid",
+        SNOW_OAUTH_CLIENT_SECRET: "csecret",
+        TOKEN_KEK_CURRENT: secret,
+        OAUTH_PROVIDER_SECRET: "oauth-provider-secret",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
+      } as HandlerEnv,
+      {
+        userId,
+        scopeMaxMode: "read_only",
+        props: { userId, email: "reauth@example.com", scopes: ["servicenow:read"], maxMode: "read_only" },
+        workerOrigin: "https://mcp.example.workers.dev",
+      },
+    );
+
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code?: string }).code).toBe("budget_exceeded");
+    expect(fetches).toBe(0);
+  });
+
+  it("denies discovery daily budget before schema-cache identity resolution can refresh", async () => {
+    const host = `inst-discovery-schema-budget-${crypto.randomUUID()}.service-now.com`;
+    const userId = "discovery-schema-budget-user";
+    const secret = "schema-budget-kek";
+    const stub = TOKEN_DO.get(TOKEN_DO.idFromName(`${userId}|${host}`));
+    const store = new TokenStore(stub, await buildKekRing(secret), userId, host);
+    await store.put("servicenow", {
+      access_token: "a",
+      expires_at: Date.now() + 60_000,
+    });
+
+    let identityCalls = 0;
+    let fetches = 0;
+    vi.stubGlobal("fetch", (async () => {
+      fetches++;
+      return new Response(JSON.stringify({ access_token: "new-token", expires_in: 1800 }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+    const budget = {
+      reserve: async () => ({ ok: false, dimension: "serviceNowRequests" }),
+      reconcile: async () => {},
+    };
+
+    const handlers = buildHandlers(
+      {
+        LOADER,
+        SCHEMA_KV: KV,
+        BUDGET_DO: {
+          idFromName: (name: string) => name,
+          get: () => budget,
+        } as unknown as DurableObjectNamespace,
+        TOKEN_DO: TOKEN_DO as unknown as DurableObjectNamespace,
+        SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
+        SNOW_OAUTH_CLIENT_ID: "cid",
+        SNOW_OAUTH_CLIENT_SECRET: "csecret",
+        TOKEN_KEK_CURRENT: secret,
+        OAUTH_PROVIDER_SECRET: "schema-budget-provider-secret",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
+      } as HandlerEnv,
+      {
+        userId,
+        scopeMaxMode: "read_only",
+        props: { userId, email: "schema-budget@example.com", scopes: ["servicenow:read"], maxMode: "read_only" },
+        workerOrigin: "https://mcp.example.workers.dev",
+        schemaIdentityResolver: async () => {
+          identityCalls++;
+          await fetch(`https://${host}/oauth_token.do`);
+          return { principalId: "should-not-resolve", roleHash: "should-not-resolve" };
+        },
+      },
+    );
+
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code?: string }).code).toBe("budget_exceeded");
+    expect(identityCalls).toBe(0);
+    expect(fetches).toBe(0);
+  });
+
+  it("reconciles a discovery reservation when per-user token refresh fails", async () => {
+    const host = `inst-discovery-auth-reconcile-${crypto.randomUUID()}.service-now.com`;
+    const userId = "discovery-auth-reconcile-user";
+    const secret = "discovery-auth-reconcile-kek";
+    const stub = TOKEN_DO.get(TOKEN_DO.idFromName(`${userId}|${host}`));
+    const store = new TokenStore(stub, await buildKekRing(secret), userId, host);
+    await store.put("servicenow", {
+      access_token: "expired",
+      refresh_token: "bad-refresh",
+      expires_at: Date.now() - 1,
+    });
+
+    let fetches = 0;
+    vi.stubGlobal("fetch", (async () => {
+      fetches++;
+      return new Response(JSON.stringify({ error: "invalid_grant" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+    const reconciles: Array<{ delta: Record<string, number>; userId?: string }> = [];
+    const budget = {
+      reserve: async () => ({ ok: true }),
+      reconcile: async (delta: Record<string, number>, budgetUserId?: string) => {
+        reconciles.push({ delta, userId: budgetUserId });
+      },
+    };
+
+    const handlers = buildHandlers(
+      {
+        LOADER,
+        BUDGET_DO: {
+          idFromName: (name: string) => name,
+          get: () => budget,
+        } as unknown as DurableObjectNamespace,
+        TOKEN_DO: TOKEN_DO as unknown as DurableObjectNamespace,
+        SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
+        SNOW_OAUTH_CLIENT_ID: "cid",
+        SNOW_OAUTH_CLIENT_SECRET: "csecret",
+        TOKEN_KEK_CURRENT: secret,
+        OAUTH_PROVIDER_SECRET: "oauth-provider-secret",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
+      } as HandlerEnv,
+      {
+        userId,
+        scopeMaxMode: "read_only",
+        props: { userId, email: "reauth@example.com", scopes: ["servicenow:read"], maxMode: "read_only" },
+        workerOrigin: "https://mcp.example.workers.dev",
+      },
+    );
+
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code?: string }).code).toBe("reauth_required");
+    expect(fetches).toBe(1);
+    expect(reconciles).toHaveLength(1);
+    expect(reconciles[0]!.userId).toBe(userId);
+    expect(reconciles[0]!.delta.serviceNowRequests).toBeLessThan(0);
+    expect(reconciles[0]!.delta.outboundBytesSent).toBeLessThan(0);
+  });
+
   it("does not serve stale broad cached schema after ActorPolicy is tightened", async () => {
     const host = `inst-policy-${crypto.randomUUID()}.service-now.com`;
     const identity = { principalId: "policy-principal", roleHash: "policy-role" };

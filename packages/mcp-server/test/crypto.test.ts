@@ -44,6 +44,20 @@ describe("§2.7 token envelope", () => {
     expect(await open(env, aad, rotated)).toBe("tok");
   });
 
+  it("preserves legacy kekVersion=current rows when the same key is still current", async () => {
+    const legacy = await seal("tok", aad, { current: { version: "current", keyBytes: key(1) } });
+    expect(await open(legacy, aad, { current: { version: "2026-05", keyBytes: key(1) } })).toBe("tok");
+  });
+
+  it("preserves legacy kekVersion=current rows during a current-to-previous rotation window", async () => {
+    const legacy = await seal("tok", aad, { current: { version: "current", keyBytes: key(1) } });
+    const rotated: KekRing = {
+      current: { version: "2026-06", keyBytes: key(2) },
+      previous: { version: "2026-05", keyBytes: key(1) },
+    };
+    expect(await open(legacy, aad, rotated)).toBe("tok");
+  });
+
   it("cannot decrypt once the previous KEK ages out of the ring", async () => {
     const env = await seal("tok", aad, ringV1);
     const newRing: KekRing = { current: { version: "2026-07", keyBytes: key(9) } };

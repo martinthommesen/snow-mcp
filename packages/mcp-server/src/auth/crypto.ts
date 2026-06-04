@@ -68,15 +68,23 @@ export async function seal(plaintext: string, aad: string, ring: KekRing): Promi
 /**
  * Decrypt an envelope, binding `expectedAad`. Fails closed (throws) on AAD mismatch,
  * tampering, or an unknown KEK version. Uses the stamped KEK version, accepting the previous
- * KEK only during an explicit rotation window.
+ * KEK only during an explicit rotation window. Legacy rows stamped with kekVersion="current"
+ * are tried against current and previous so one deploy does not brick pre-versioned tokens.
  */
 export async function open(envelope: TokenEnvelope, expectedAad: string, ring: KekRing): Promise<string> {
   if (envelope.aad !== expectedAad) {
     throw new Error("token envelope AAD mismatch — refusing to decrypt (fail closed).");
   }
   const candidates: Kek[] = [];
-  if (envelope.kekVersion === ring.current.version) candidates.push(ring.current);
-  if (ring.previous && envelope.kekVersion === ring.previous.version) candidates.push(ring.previous);
+  const addCandidate = (kek: Kek | undefined) => {
+    if (kek && !candidates.includes(kek)) candidates.push(kek);
+  };
+  if (envelope.kekVersion === ring.current.version) addCandidate(ring.current);
+  if (ring.previous && envelope.kekVersion === ring.previous.version) addCandidate(ring.previous);
+  if (envelope.kekVersion === "current") {
+    addCandidate(ring.current);
+    addCandidate(ring.previous);
+  }
   if (candidates.length === 0) throw new Error(`unknown KEK version "${envelope.kekVersion}" (fail closed).`);
 
   const iv = base64ToBytes(envelope.iv);

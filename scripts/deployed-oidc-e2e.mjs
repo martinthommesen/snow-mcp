@@ -107,6 +107,14 @@ function numberEnv(name, defaultValue) {
   return Number.isInteger(n) && n > 0 ? n : defaultValue;
 }
 
+function parseScopes(raw) {
+  const value = raw?.trim() || "servicenow:write";
+  return value
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function resolveConfig() {
   const baseRaw = process.argv[2] ?? process.env.WORKER_PUBLIC_ORIGIN;
   if (!baseRaw) {
@@ -121,10 +129,7 @@ function resolveConfig() {
   if (process.env.DEPLOYMENT_PROFILE && process.env.DEPLOYMENT_PROFILE.trim() !== "production") {
     throw new Error('DEPLOYMENT_PROFILE must be "production" for production OIDC deployed E2E.');
   }
-  const scopes = (process.env.OIDC_E2E_SCOPES ?? "servicenow:write")
-    .split(/[\s,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const scopes = parseScopes(process.env.OIDC_E2E_SCOPES);
   if (scopes.length === 0) throw new Error("OIDC_E2E_SCOPES must include at least one MCP scope.");
   return {
     base: canonicalHttpsOrigin(baseRaw, "WORKER_PUBLIC_ORIGIN"),

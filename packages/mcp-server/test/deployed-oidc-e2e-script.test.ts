@@ -22,4 +22,13 @@ describe("production deployed OIDC E2E script", () => {
     expect(scriptText).toContain("MCP_OPERATOR_SECRET must not be set");
     expect(scriptText).not.toContain("operator_secret");
   });
+
+  it("treats empty OIDC_E2E_SCOPES as the documented default scope", () => {
+    expect(scriptText).toContain("parseScopes(process.env.OIDC_E2E_SCOPES)");
+    expect(scriptText).not.toContain('process.env.OIDC_E2E_SCOPES ?? "servicenow:write"');
+  });
+
+  it("makes the refresh downgrade assertion default-on", () => {
+    expect(scriptText).toContain('expectRefreshWriteDenied: boolEnv("OIDC_E2E_EXPECT_REFRESH_WRITE_DENIED", true)');
+  });
 });

@@ -247,6 +247,12 @@ export async function resolveStoredSnPrincipal(
   return principal;
 }
 
+/** Return only a still-fresh stored principal. Never refreshes tokens or calls ServiceNow. */
+export async function resolveFreshStoredSnPrincipal(store: TokenStore, now: number): Promise<SnPrincipal | null> {
+  const existing = await store.get("servicenow").catch(() => null);
+  return hasFreshPrincipal(existing, now) ? buildPrincipal(existing.sys_id, existing.roles ?? [], existing) : null;
+}
+
 /** Raise `reauth_required`, attaching the host-HMAC ticket URL (P2 detail channel) when one
  *  is available so run_code / the discovery tools can surface a click-through reauth link. */
 function reauthRequired(message: string, authorizeUrl?: string): McpToolError {

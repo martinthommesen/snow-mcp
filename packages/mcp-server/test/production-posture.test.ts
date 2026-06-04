@@ -282,6 +282,29 @@ describe("Phase 1B production posture", () => {
       INSTANCE_MAX_MODE: "admin_script" as Mode,
       ALLOW_ADMIN_SCRIPT_CEILING: "true",
       SNOW_EXECUTOR_VERIFIER_ATTESTED: "true",
+      ADMIN_SCRIPT_ALLOWLIST: "operator",
+      ADMIN_SCRIPT_REQUIRED_GROUP: "mcp-admins",
+    }))).toEqual([]);
+  });
+
+  it("requires admin_script ceiling deployments to have an allowlist and second approval path", () => {
+    expect(collectPostureViolations(productionEnv({
+      TENANT_MAX_MODE: "admin_script" as Mode,
+      INSTANCE_MAX_MODE: "admin_script" as Mode,
+      ALLOW_ADMIN_SCRIPT_CEILING: "true",
+      SNOW_EXECUTOR_VERIFIER_ATTESTED: "true",
+    }))).toEqual(expect.arrayContaining([
+      "ADMIN_SCRIPT_ALLOWLIST must include at least one actor when ALLOW_ADMIN_SCRIPT_CEILING=true in production.",
+      "admin_script requires ADMIN_SCRIPT_APPROVAL_TOKENS or ADMIN_SCRIPT_REQUIRED_GROUP when ALLOW_ADMIN_SCRIPT_CEILING=true in production.",
+    ]));
+
+    expect(collectPostureViolations(productionEnv({
+      TENANT_MAX_MODE: "admin_script" as Mode,
+      INSTANCE_MAX_MODE: "admin_script" as Mode,
+      ALLOW_ADMIN_SCRIPT_CEILING: "true",
+      SNOW_EXECUTOR_VERIFIER_ATTESTED: "true",
+      ADMIN_SCRIPT_ALLOWLIST: "operator",
+      ADMIN_SCRIPT_APPROVAL_TOKENS: STRONG_SECRET,
     }))).toEqual([]);
   });
 

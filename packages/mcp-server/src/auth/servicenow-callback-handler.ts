@@ -99,6 +99,8 @@ function oauthConfig(env: CallbackHandlerEnv, instanceHost: string): SnOAuthConf
 function configured(env: CallbackHandlerEnv): boolean {
   return Boolean(
     env.SERVICENOW_CREDENTIAL_MODE === "per_user_oauth" &&
+      env.AUTH_DO &&
+      env.TOKEN_DO &&
       env.SNOW_INSTANCE_HOST &&
       env.SNOW_OAUTH_CLIENT_ID &&
       env.SNOW_OAUTH_CLIENT_SECRET &&

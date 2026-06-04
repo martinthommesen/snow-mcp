@@ -24,7 +24,9 @@ export interface PostureEnv {
   SNAPSHOT_KEK_CURRENT?: string;
   ALLOW_LOCALHOST?: string;
   ALLOWED_ORIGINS?: string;
+  ADMIN_SCRIPT_ALLOWLIST?: string;
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string;
+  ADMIN_SCRIPT_REQUIRED_GROUP?: string;
   SNOW_INSTANCE_HOST?: string;
   SNOW_EXECUTOR_PATH?: string;
   SNOW_DEV_ROPC?: string;
@@ -449,6 +451,14 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   const allowAdminScript = env.ALLOW_ADMIN_SCRIPT_CEILING === "true";
   if (allowAdminScript && env.SNOW_EXECUTOR_VERIFIER_ATTESTED !== "true") {
     violations.push('SNOW_EXECUTOR_VERIFIER_ATTESTED must be "true" before ALLOW_ADMIN_SCRIPT_CEILING=true in production.');
+  }
+  if (allowAdminScript) {
+    if (csv(env.ADMIN_SCRIPT_ALLOWLIST).length === 0) {
+      violations.push("ADMIN_SCRIPT_ALLOWLIST must include at least one actor when ALLOW_ADMIN_SCRIPT_CEILING=true in production.");
+    }
+    if (csv(env.ADMIN_SCRIPT_APPROVAL_TOKENS).length === 0 && !hasText(env.ADMIN_SCRIPT_REQUIRED_GROUP)) {
+      violations.push("admin_script requires ADMIN_SCRIPT_APPROVAL_TOKENS or ADMIN_SCRIPT_REQUIRED_GROUP when ALLOW_ADMIN_SCRIPT_CEILING=true in production.");
+    }
   }
   validateModeCeiling(violations, "TENANT_MAX_MODE", env.TENANT_MAX_MODE, allowAdminScript);
   validateModeCeiling(violations, "INSTANCE_MAX_MODE", env.INSTANCE_MAX_MODE, allowAdminScript);

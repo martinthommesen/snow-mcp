@@ -27,6 +27,7 @@ import { TokenStore } from "../auth/token-store.js";
 import {
   getServiceNowBearer,
   preflightAuth,
+  resolveFreshStoredSnPrincipal,
   resolveStoredSnPrincipal,
   type CredentialMode,
   type SnOAuthConfig,
@@ -148,6 +149,8 @@ export interface AuthContext {
   schemaIdentity?: SchemaCachePrincipalIdentity;
   /** Lazy schema identity resolver. Non-schema calls should not pay a TokenStore read. */
   schemaIdentityResolver?: () => Promise<SchemaCachePrincipalIdentity | undefined>;
+  /** Lazy, zero-network resolver used to check SchemaCache hits before spending discovery budget. */
+  schemaIdentityFreshResolver?: () => Promise<SchemaCachePrincipalIdentity | undefined>;
 }
 
 export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandlers {
@@ -532,11 +535,9 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   }
 
   async function runDiscoveryWithBudget<T>(runBudget: RunBudget, fn: () => Promise<T>): Promise<T> {
-    if (requestAuthorization) {
-      await requestAuthorization();
-    } else if (preflightAuthDep) {
+    if (reserveDiscoveryDailyBudget && preflightAuthDep) {
       await preflightAuthDep();
-    } else if (http instanceof NotConnectedHttpClient) {
+    } else if (!requestAuthorization && http instanceof NotConnectedHttpClient) {
       await http.request();
     }
     let reserved = false;
@@ -550,6 +551,9 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       reserved = true;
     }
     try {
+      if (requestAuthorization) {
+        await requestAuthorization();
+      }
       return await fn();
     } finally {
       if (reserved && reconcileDiscoveryDailyBudget) {
@@ -574,27 +578,58 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // In per_user_oauth the resolver must return the ServiceNow sys_id; if it cannot, we skip cache
   // for this request rather than keying ACL-filtered schema under the wrong identity.
   let schemaCachePromise: Promise<SchemaCache | undefined> | undefined;
-  const schemaCache = (): Promise<SchemaCache | undefined> => {
-    if (!env.SCHEMA_KV) return Promise.resolve(undefined);
-    schemaCachePromise ??= (async () => {
-      const identity = auth.schemaIdentity ?? (auth.schemaIdentityResolver
-        ? await auth.schemaIdentityResolver()
-        : { principalId: userId, roleHash: "default" });
-      return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity, policyHash: await actorPolicyHash(policy) }) : undefined;
-    })();
+  let freshSchemaCachePromise: Promise<SchemaCache | undefined> | undefined;
+  async function schemaCacheIdentity(freshOnly: boolean): Promise<SchemaCachePrincipalIdentity | undefined> {
+    if (auth.schemaIdentity) return auth.schemaIdentity;
+    if (freshOnly) {
+      if (auth.schemaIdentityFreshResolver) return auth.schemaIdentityFreshResolver();
+      return auth.schemaIdentityResolver ? undefined : { principalId: userId, roleHash: "default" };
+    }
+    return auth.schemaIdentityResolver ? auth.schemaIdentityResolver() : { principalId: userId, roleHash: "default" };
+  }
+  async function buildSchemaCache(freshOnly: boolean): Promise<SchemaCache | undefined> {
+    if (!env.SCHEMA_KV) return undefined;
+    const identity = await schemaCacheIdentity(freshOnly);
+    return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity, policyHash: await actorPolicyHash(policy) }) : undefined;
+  }
+  const schemaCache = (opts: { freshOnly?: boolean } = {}): Promise<SchemaCache | undefined> => {
+    if (opts.freshOnly) {
+      if (schemaCachePromise) return schemaCachePromise;
+      freshSchemaCachePromise ??= buildSchemaCache(true);
+      return freshSchemaCachePromise;
+    }
+    schemaCachePromise ??= buildSchemaCache(false);
     return schemaCachePromise;
   };
+
+  async function budgetedDescribeTable(table: string): Promise<{ fields: Awaited<ReturnType<typeof describeTable>>; cached: boolean }> {
+    const runBudget = makeDiscoveryRunBudget();
+    return runDiscoveryWithBudget(runBudget, async () => {
+      const cache = await schemaCache();
+      const fetcher = () => describeTable(discoveryDeps(runBudget), table);
+      return cache ? cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
+    });
+  }
+
+  async function budgetedListTables(filter: string | undefined): Promise<Awaited<ReturnType<typeof listTables>> & { cached: boolean }> {
+    const runBudget = makeDiscoveryRunBudget();
+    return runDiscoveryWithBudget(runBudget, async () => {
+      const cache = await schemaCache();
+      const fetcher = () => listTables(discoveryDeps(runBudget), filter);
+      return cache ? cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
+    });
+  }
 
   return {
     runCode: (input) => runCode(input, runCodeDeps),
     describeTable: async ({ table }): Promise<ToolTextResult> => {
       try {
-        const cache = await schemaCache();
+        const cache = await schemaCache({ freshOnly: true });
         const fetcher = () => {
           const runBudget = makeDiscoveryRunBudget();
           return runDiscoveryWithBudget(runBudget, () => describeTable(discoveryDeps(runBudget), table));
         };
-        const { fields, cached } = cache ? await cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
+        const { fields, cached } = cache ? await cache.describeTable(table, fetcher) : await budgetedDescribeTable(table);
         return { content: [{ type: "text", text: JSON.stringify({ table, fields }) }], isError: false, structuredContent: { table, fieldCount: fields.length, cached } };
       } catch (e) {
         return toToolResult(e);
@@ -602,12 +637,13 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     },
     listTables: async ({ filter }): Promise<ToolTextResult> => {
       try {
-        const cache = await schemaCache();
+        const cache = await schemaCache({ freshOnly: true });
         const fetcher = () => {
           const runBudget = makeDiscoveryRunBudget();
           return runDiscoveryWithBudget(runBudget, () => listTables(discoveryDeps(runBudget), filter));
         };
-        const { tables, partial, total, policyFilteredPartial, warning, cached } = cache ? await cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
+        const result = cache ? await cache.listTables(filter, fetcher) : await budgetedListTables(filter);
+        const { tables, partial, total, policyFilteredPartial, warning, cached } = result;
         return {
           content: [{ type: "text", text: JSON.stringify({ tables, partial, ...(total !== undefined ? { total } : {}), ...(warning ? { warning } : {}) }) }],
           isError: false,
@@ -636,7 +672,11 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
  * absent, stale-unresolvable, or unreadable, returns undefined so schema tools bypass cache for
  * that request. It NEVER throws, so it cannot block the reauth_required path.
  */
-export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Promise<SchemaCachePrincipalIdentity | undefined> {
+export async function resolveSchemaIdentity(
+  env: HandlerEnv,
+  userId: string,
+  opts: { freshOnly?: boolean } = {},
+): Promise<SchemaCachePrincipalIdentity | undefined> {
   const tokenKekSecret = env.TOKEN_KEK_CURRENT;
   const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
   const oauthReady = Boolean(
@@ -656,15 +696,17 @@ export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Pr
       putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>;
     };
     const store = new TokenStore(stub, await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV), userId, instanceHost);
-    const principal = await resolveStoredSnPrincipal(
-      {
-        instanceHost,
-        clientId: env.SNOW_OAUTH_CLIENT_ID!,
-        clientSecret: env.SNOW_OAUTH_CLIENT_SECRET!,
-      },
-      store,
-      Date.now(),
-    );
+    const principal = opts.freshOnly
+      ? await resolveFreshStoredSnPrincipal(store, Date.now())
+      : await resolveStoredSnPrincipal(
+        {
+          instanceHost,
+          clientId: env.SNOW_OAUTH_CLIENT_ID!,
+          clientSecret: env.SNOW_OAUTH_CLIENT_SECRET!,
+        },
+        store,
+        Date.now(),
+      );
     if (!principal) return undefined;
     const roles = principal.roles;
     return {

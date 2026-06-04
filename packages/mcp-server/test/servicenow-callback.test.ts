@@ -202,6 +202,25 @@ describe("§6b callback fails closed", () => {
     expect(inactiveMode!.status).toBe(400);
   });
 
+  it("requires AUTH_DO before consuming an authorization ticket", async () => {
+    const { fetchImpl } = mockSn();
+    const ticket = await mintTicket({ userId: "userNoAuthDo", actorEmail: "alice@example.com", instanceHost: HOST, nonce: "auth-do", exp: Date.now() + 60_000 }, SECRET);
+    const res = await serviceNowCallbackHandler(
+      new Request(`${ORIGIN}/servicenow/authorize?ticket=${encodeURIComponent(ticket)}`),
+      { ...handlerEnv(fetchImpl), AUTH_DO: undefined } as unknown as CallbackHandlerEnv,
+    );
+    expect(res!.status).toBe(400);
+  });
+
+  it("requires TOKEN_DO before exchanging a callback code", async () => {
+    const { fetchImpl, calls } = mockSn();
+    const hEnv = handlerEnv(fetchImpl);
+    const state = await authorize("userNoTokenDo", hEnv);
+    const res = await callback(state, { ...hEnv, TOKEN_DO: undefined } as unknown as CallbackHandlerEnv);
+    expect(res!.status).toBe(400);
+    expect(calls.some((c) => c.grant === "authorization_code")).toBe(false);
+  });
+
   it("REPLAYED/consumed state → rejected (consume-once), and stores no second token", async () => {
     const { fetchImpl } = mockSn();
     const hEnv = handlerEnv(fetchImpl);

@@ -143,19 +143,19 @@ export class MutationLedgerDO extends DurableObject {
     // record (which would stamp a result under an empty requestHash, replaying it for
     // ANY future hash). A stray complete() is a no-op (P4 fix of the :56 fabrication bug).
     const rec = await this.getActiveRecord();
-    if (!rec) return;
+    if (!rec || rec.status !== "started") return;
     await this.putRecord({ status: "completed", requestHash: rec.requestHash, result: replaySafeResult(result) });
   }
 
   async fail(): Promise<void> {
     const rec = await this.getActiveRecord();
-    if (rec) await this.putRecord({ status: "failed", requestHash: rec.requestHash });
+    if (rec?.status === "started") await this.putRecord({ status: "failed", requestHash: rec.requestHash });
   }
 
   /** Mark an outcome unknown (e.g. runServerScript timed out). Blocks future retries (S17). */
   async markIndeterminate(): Promise<void> {
     const rec = await this.getActiveRecord();
-    if (rec) await this.putRecord({ status: "indeterminate", requestHash: rec.requestHash });
+    if (rec?.status === "started") await this.putRecord({ status: "indeterminate", requestHash: rec.requestHash });
   }
 
   async status(): Promise<LedgerStatus | "none"> {

@@ -213,6 +213,7 @@ const apiHandler = {
         props,
         ...(workerOrigin ? { workerOrigin } : {}),
         schemaIdentityResolver: () => resolveSchemaIdentity(env, userId),
+        schemaIdentityFreshResolver: () => resolveSchemaIdentity(env, userId, { freshOnly: true }),
       })), {
         authContext: { props },
       })(request, env, ctx);

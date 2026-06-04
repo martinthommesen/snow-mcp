@@ -423,6 +423,36 @@ describe("Phase 7.3 / S17 — MutationLedgerDO leveled idempotency", () => {
     expect(retry).toEqual({ state: "blocked", status: "indeterminate" });
   });
 
+  it("does not let a late complete() clobber an indeterminate record", async () => {
+    const l = ledger("k-no-clobber-indeterminate");
+    expect(await l.begin("hash-indeterminate")).toEqual({ state: "new" });
+    await l.markIndeterminate();
+    await l.complete({ ok: true });
+    expect(await l.status()).toBe("indeterminate");
+    expect(await ledger("k-no-clobber-indeterminate").begin("hash-indeterminate")).toEqual({
+      state: "blocked",
+      status: "indeterminate",
+    });
+  });
+
+  it("does not let a late markIndeterminate() clobber a clean failed record", async () => {
+    const l = ledger("k-no-clobber-failed");
+    expect(await l.begin("hash-failed")).toEqual({ state: "new" });
+    await l.fail();
+    await l.markIndeterminate();
+    expect(await l.status()).toBe("failed");
+    expect(await ledger("k-no-clobber-failed").begin("hash-failed")).toEqual({ state: "new" });
+  });
+
+  it("does not let a late fail() clobber a completed replay record", async () => {
+    const l = ledger("k-no-clobber-completed");
+    expect(await l.begin("hash-completed")).toEqual({ state: "new" });
+    await l.complete({ ok: true });
+    await l.fail();
+    expect(await l.status()).toBe("completed");
+    expect((await ledger("k-no-clobber-completed").begin("hash-completed")).state).toBe("replay");
+  });
+
   it("an in-flight (started) key blocks a concurrent duplicate", async () => {
     const l = ledger("k-inflight");
     expect((await l.begin("h")).state).toBe("new");
