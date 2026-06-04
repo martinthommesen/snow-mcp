@@ -15,10 +15,10 @@ import { McpToolError } from "./errors.js";
 import { SN_REQUEST_LIMITS, TABLE_PAGE_CAP } from "../config.js";
 
 // Identifier grammars (ServiceNow names are lowercase alnum + underscore).
-const TABLE_NAME = /^[a-z0-9_]{1,80}$/;
+export const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
 const SYS_ID = /^[0-9a-f]{32}$/;
-const FIELD_NAME = /^[a-z0-9_.]{1,80}$/; // dot-walk allowed for reads (e.g. caller_id.name)
-const UPDATE_KEY = /^[a-z0-9_]{1,80}$/; // write targets: no dot-walk
+export const FIELD_NAME_RE = /^[a-z0-9_.]{1,80}$/; // dot-walk allowed for reads (e.g. caller_id.name)
+const UPDATE_KEY_RE = TABLE_NAME_RE; // write targets: no dot-walk
 // Prototype-pollution-adjacent keys rejected for least-surprise (see validateUpdateFields).
 const RESERVED_UPDATE_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -29,7 +29,7 @@ const REASON_MAX = 1024;
 // Exact uppercase ORDERBY/ORDERBYDESC are allowed ordering clauses; all OR/NQ/EQ case
 // variants are denied. This deliberately rejects ambiguous mixed/lower-case ordering tokens
 // such as ^ORderby... because they can also parse as a ^OR escape with a derby... field.
-function hasStructuralOperator(query: string): boolean {
+export function hasEncodedQueryStructuralOperator(query: string): boolean {
   for (let i = 0; i < query.length; i++) {
     const atStart = i === 0;
     const afterCaret = query.charCodeAt(i) === 94; // ^
@@ -51,7 +51,7 @@ function deny(message: string, detail?: Record<string, unknown>): never {
 }
 
 export function validateTableName(table: unknown): string {
-  if (typeof table !== "string" || !TABLE_NAME.test(table)) {
+  if (typeof table !== "string" || !TABLE_NAME_RE.test(table)) {
     deny(`Invalid table name.`, { table: String(table) });
   }
   return table as string;
@@ -85,7 +85,7 @@ export function validateFields(
     deny(`${label} exceeds the maximum of ${maxFields} field names.`, { count: fields.length, maxFields });
   }
   for (const f of fields) {
-    if (typeof f !== "string" || !FIELD_NAME.test(f)) {
+    if (typeof f !== "string" || !FIELD_NAME_RE.test(f)) {
       deny(`Invalid field name.`, { field: String(f) });
     }
   }
@@ -105,7 +105,7 @@ export function validateUpdateFields(fields: unknown): Record<string, unknown> {
   const keys = Object.keys(obj);
   if (keys.length === 0) deny(`Update fields must not be empty.`);
   for (const k of keys) {
-    if (!UPDATE_KEY.test(k)) deny(`Invalid update field name.`, { field: k });
+    if (!UPDATE_KEY_RE.test(k)) deny(`Invalid update field name.`, { field: k });
     // Reject reserved keys for least-surprise: they are not valid ServiceNow column names, and
     // although canonicalObjectJson/JSON.stringify already neutralizes `__proto__` (it never
     // reaches a prototype), rejecting them keeps the PATCH body unambiguous (finding M-3).
@@ -167,7 +167,7 @@ export function validateUserQuery(query: unknown, hasMandatoryFilter: boolean): 
       maxLength: SN_REQUEST_LIMITS.maxEncodedQueryChars,
     });
   }
-  if (hasMandatoryFilter && hasStructuralOperator(query as string)) {
+  if (hasMandatoryFilter && hasEncodedQueryStructuralOperator(query as string)) {
     deny(`Query may not contain a structural operator (^NQ/^OR/^EQ) under a restrictive row filter.`);
   }
   return query as string;
@@ -178,7 +178,7 @@ export function validateUserQuery(query: unknown, hasMandatoryFilter: boolean): 
  * with / contains a structural operator is self-defeating (it would not constrain rows).
  */
 export function assertMandatoryRowFilterSafe(table: string, filter: string): void {
-  if (hasStructuralOperator(filter)) {
+  if (hasEncodedQueryStructuralOperator(filter)) {
     throw new Error(`Mandatory rowFilter for "${table}" must not contain a structural operator (^NQ/^OR/^EQ): ${filter}`);
   }
 }

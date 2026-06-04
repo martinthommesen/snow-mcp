@@ -6,7 +6,7 @@
 // access natively.)
 
 import { McpToolError } from "../sn/errors.js";
-import { assertMandatoryRowFilterSafe } from "../sn/validate.js";
+import { assertMandatoryRowFilterSafe, FIELD_NAME_RE, TABLE_NAME_RE } from "../sn/validate.js";
 import { isValidMode, modeRisk, type Mode } from "@servicenow-codemode/shared";
 
 export type TableRule = string | RegExp;
@@ -102,9 +102,6 @@ export interface PolicyEnv {
   /** JSON object: policy name -> ACTOR_POLICY_* config object. */
   ACTOR_POLICIES_JSON?: string;
 }
-
-const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
-const FIELD_NAME_RE = /^[a-z0-9_.]{1,80}$/;
 
 function parseList(value: string | undefined): string[] {
   return (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -331,13 +328,16 @@ function matchesTable(rules: CompiledTableRules, table: string): boolean {
   return rules.exact.has(table) || rules.patterns.some((re) => re.test(table));
 }
 
-export function isTableAllowed(policy: ActorPolicy, table: string): boolean {
-  const compiled = compilePolicy(policy);
+function isTableAllowedCompiled(compiled: CompiledPolicy, table: string): boolean {
   if (matchesTable(compiled.deny, table)) return false;
   if (compiled.hasAllowRules) {
     return matchesTable(compiled.allow, table);
   }
   return true; // no allowlist => allow unless denied
+}
+
+export function isTableAllowed(policy: ActorPolicy, table: string): boolean {
+  return isTableAllowedCompiled(compilePolicy(policy), table);
 }
 
 /** Throw `actor_policy_denied` if `mode` exceeds this actor's `maxMode` ceiling. The single
@@ -362,7 +362,7 @@ export function assertActorPolicy(
       instance: ctx.instance,
     });
   }
-  if (!isTableAllowed(policy, ctx.table)) {
+  if (!isTableAllowedCompiled(compiled, ctx.table)) {
     throw new McpToolError("actor_policy_denied", `Table "${ctx.table}" is not allowed for this actor.`, {
       table: ctx.table,
     });
@@ -428,7 +428,7 @@ export function assertRequestedFieldsAllowed(policy: ActorPolicy, table: string,
 const QUERY_OP_PREFIX = /^(ORDERBYDESC|ORDERBY|GROUPBY|NQ|OR|EQ)/i;
 
 /** The leading ServiceNow field token of a clause: the initial run of lowercase field chars.
- *  SN field names are lowercase `[a-z0-9_.]` (see validate.ts FIELD_NAME), so an UPPERCASE
+ *  SN field names are lowercase `[a-z0-9_.]` (see validate.ts FIELD_NAME_RE), so an UPPERCASE
  *  operator (LIKE/IN/STARTSWITH/ISEMPTY/BETWEEN/…) or a symbol (`=`,`>`,`<`) terminates the run
  *  cleanly — `salaryLIKE5` and `salary>5` both yield `salary`. */
 function leadingFieldToken(clause: string): string {

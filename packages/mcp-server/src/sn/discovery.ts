@@ -8,7 +8,7 @@ import type { SnHttpClient } from "./http.js";
 import { McpToolError, throwMappedServiceNowError } from "./errors.js";
 import { requireCapability, SN_REQUEST_LIMITS, TABLE_PAGE_CAP } from "../config.js";
 import { assertActorPolicy, isFieldMasked, isTableAllowed, type ActorPolicy } from "../authz/actor-policy.js";
-import { validateDiscoveryFilter, validateTableName } from "./validate.js";
+import { TABLE_NAME_RE, validateDiscoveryFilter, validateTableName } from "./validate.js";
 import { utf8Len } from "../sandbox/serialize.js";
 import type { RunBudget } from "./run-budget.js";
 import type { Mode } from "@servicenow-codemode/shared";
@@ -43,10 +43,6 @@ export interface ListTablesResult {
   policyFilteredPartial?: boolean;
   warning?: string;
 }
-
-// Mirror of the validate.ts table-name grammar; used to gate hierarchy parents so a
-// malformed super_class.name never reaches the `nameIN` join.
-const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
 
 function esc(v: string): string {
   // Encoded-query value sanitation: strip ^ and = which would break the query grammar.

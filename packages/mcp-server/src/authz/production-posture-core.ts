@@ -1,4 +1,7 @@
 import { isValidMode, parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
+import { decodeFixedBase64Secret } from "../auth/encoding.js";
+import { looksLikeStrongSecret } from "../auth/crypto.js";
+import { FIELD_NAME_RE, hasEncodedQueryStructuralOperator, TABLE_NAME_RE } from "../sn/validate.js";
 
 export type DeploymentProfile = "pilot" | "production";
 
@@ -71,8 +74,6 @@ const coreBindings = [
 ] as const satisfies readonly (keyof PostureEnv)[];
 
 const scopedExecutorPath = /^\/api\/(x|sn)_[a-z0-9_]+\/x_mcp\/executor\/run$/;
-const actorPolicyTableNameRe = /^[a-z0-9_]{1,80}$/;
-const actorPolicyFieldNameRe = /^[a-z0-9_.]{1,80}$/;
 const onceCache = new WeakMap<object, true | ProductionPostureError>();
 let warnedPilot = false;
 
@@ -138,13 +139,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function looksLikeStrongSecret(secret: string): boolean {
-  const s = secret.trim();
-  const base64ish = /^[A-Za-z0-9+/_-]+={0,2}$/.test(s) && s.replace(/=+$/, "").length >= 43;
-  const hexish = /^[0-9a-fA-F]+$/.test(s) && s.length >= 64;
-  return base64ish || hexish;
-}
-
 function strongSecret(value: string | undefined): boolean {
   return hasText(value) && looksLikeStrongSecret(value!);
 }
@@ -162,26 +156,6 @@ function validateStrongTokenList(violations: string[], label: string, value: str
   for (const token of tokens) {
     if (!looksLikeStrongSecret(token)) violations.push(`${label} entries must be strong CSPRNG secrets.`);
   }
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  const bin = atob(value);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function decodeFixedBase64Secret(value: string | undefined, expectedBytes: number): void {
-  const normalized = (value ?? "").trim();
-  if (
-    normalized.length === 0 ||
-    !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) ||
-    normalized.length % 4 === 1
-  ) {
-    throw new Error("invalid base64");
-  }
-  const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4)) % 4, "=");
-  if (base64ToBytes(padded).length !== expectedBytes) throw new Error("wrong length");
 }
 
 function validateModeCeiling(violations: string[], label: string, value: unknown, allowAdminScript: boolean): void {
@@ -226,14 +200,14 @@ function validateActorPolicyTableAllowlist(violations: string[], label: string, 
     violations.push(`${label} is set but contains no table names.`);
   }
   for (const table of tables) {
-    if (!actorPolicyTableNameRe.test(table)) {
+    if (!TABLE_NAME_RE.test(table)) {
       violations.push(`${label} contains invalid table name "${table}".`);
     }
   }
 }
 
 function validateUniqueActorPolicyTable(violations: string[], label: string, seen: Set<string>, table: string, entry: string): boolean {
-  if (!actorPolicyTableNameRe.test(table)) {
+  if (!TABLE_NAME_RE.test(table)) {
     violations.push(`${label} contains invalid table name "${table}" in entry "${entry}".`);
     return false;
   }
@@ -273,7 +247,7 @@ function validateActorPolicyFieldMasks(violations: string[], label: string, valu
     if (fields.length === 0) violations.push(`${label} entry must include at least one field, got "${entry}".`);
     if (validTable) {
       for (const field of fields) {
-        if (!actorPolicyFieldNameRe.test(field)) {
+        if (!FIELD_NAME_RE.test(field)) {
           violations.push(`${label} contains invalid field name "${field}" in entry "${entry}".`);
         }
       }
@@ -288,23 +262,10 @@ function validateActorPolicyRowFilters(violations: string[], label: string, valu
     const filter = rawValue.trim();
     if (!filter) {
       violations.push(`${label} entry must include a non-empty encoded query, got "${entry}".`);
-    } else if (hasActorPolicyStructuralOperator(filter)) {
+    } else if (hasEncodedQueryStructuralOperator(filter)) {
       violations.push(`${label} contains a self-defeating structural operator.`);
     }
   }
-}
-
-function hasActorPolicyStructuralOperator(query: string): boolean {
-  for (let i = 0; i < query.length; i++) {
-    const atStart = i === 0;
-    const afterCaret = query.charCodeAt(i) === 94; // ^
-    if (!atStart && !afterCaret) continue;
-    const tokenStart = afterCaret ? i + 1 : i;
-    if (query.startsWith("ORDERBYDESC", tokenStart) || query.startsWith("ORDERBY", tokenStart)) continue;
-    const op = query.slice(tokenStart, tokenStart + 2).toUpperCase();
-    if (op === "OR" || op === "NQ" || op === "EQ") return true;
-  }
-  return false;
 }
 
 function validateActorPolicyPositiveInt(violations: string[], label: string, value: unknown): void {
@@ -495,16 +456,17 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   requireStrongSecret(violations, "TOKEN_KEK_CURRENT", env.TOKEN_KEK_CURRENT);
   requireStrongSecret(violations, "OAUTH_PROVIDER_SECRET", env.OAUTH_PROVIDER_SECRET);
   try {
-    decodeFixedBase64Secret(env.X_MCP_EXECUTOR_HMAC_KEY, 32);
+    decodeFixedBase64Secret("X_MCP_EXECUTOR_HMAC_KEY", env.X_MCP_EXECUTOR_HMAC_KEY ?? "", 32);
   } catch {
     violations.push("X_MCP_EXECUTOR_HMAC_KEY must decode to exactly 32 bytes.");
   }
 
   if (env.ALLOW_LOCALHOST === "true") violations.push('ALLOW_LOCALHOST must not be "true" in production.');
-  if (csv(env.ALLOWED_ORIGINS).length === 0) {
+  const allowedOrigins = csv(env.ALLOWED_ORIGINS);
+  if (allowedOrigins.length === 0) {
     violations.push("ALLOWED_ORIGINS must include at least one origin in production.");
   }
-  for (const origin of csv(env.ALLOWED_ORIGINS)) {
+  for (const origin of allowedOrigins) {
     if (!isCanonicalHttpsOrigin(origin)) violations.push("ALLOWED_ORIGINS entries must be canonical public HTTPS origins in production.");
   }
   validateStrongTokenList(violations, "ADMIN_SCRIPT_APPROVAL_TOKENS", env.ADMIN_SCRIPT_APPROVAL_TOKENS);
@@ -512,7 +474,8 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     if (!env[binding]) violations.push(`${binding} binding is required in production.`);
   }
 
-  if (csv(env.SNAPSHOT_ENABLED_TABLES).length > 0) {
+  const snapshotEnabledTables = csv(env.SNAPSHOT_ENABLED_TABLES);
+  if (snapshotEnabledTables.length > 0) {
     if (!env.SNAPSHOT_KV) violations.push("SNAPSHOT_KV binding is required when SNAPSHOT_ENABLED_TABLES is set.");
     if (!strongSecret(env.SNAPSHOT_KEK_CURRENT)) {
       violations.push("SNAPSHOT_KEK_CURRENT must be a strong CSPRNG secret when SNAPSHOT_ENABLED_TABLES is set.");
