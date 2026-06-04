@@ -100,6 +100,10 @@ export function mapServiceNowError(status: number, body?: ServiceNowErrorBody): 
   if (status === 413 && raw === "code_size") {
     return new McpToolError("code_size", "ServiceNow executor rejected the script because it is too large.");
   }
+  // Executor-disabled is a CLEAN, retry-safe failure: the executor returns this flat `error` string
+  // from its kill gate BEFORE running any script (see x_mcp_executor.js), so no mutation occurred.
+  // Pinned to the executor's flat-`error`-string contract — a nested `{ error: { message } }` shape
+  // would fall through to the 5xx `instance_hibernating` (indeterminate) mapping below instead.
   if (status === 503 && (raw === "executor_disabled" || raw === "run_server_script_disabled")) {
     return new McpToolError("capability_denied", "ServiceNow executor is disabled.", { executorError: raw });
   }

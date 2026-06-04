@@ -41,7 +41,7 @@ export interface SnFetchClientOptions {
 /**
  * Concrete ServiceNow client. Validates host + path, injects the bearer host-side,
  * and applies a request timeout. Retry/jitter on 429/5xx is a Phase-1.5 addition.
- * NOTE: network behavior is unverified locally — see OPEN_QUESTIONS.md.
+ * NOTE: network behavior is unverified locally — see docs/DELTAS.md.
  */
 export class SnFetchClient implements SnHttpClient {
   private readonly host: string;

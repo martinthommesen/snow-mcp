@@ -67,8 +67,8 @@ export async function seal(plaintext: string, aad: string, ring: KekRing): Promi
 
 /**
  * Decrypt an envelope, binding `expectedAad`. Fails closed (throws) on AAD mismatch,
- * tampering, or an unknown KEK version. Tries the KEK whose version matches, then the
- * previous KEK if the matching one fails (rotation window).
+ * tampering, or an unknown KEK version. Uses the stamped KEK version, accepting the previous
+ * KEK only during an explicit rotation window.
  */
 export async function open(envelope: TokenEnvelope, expectedAad: string, ring: KekRing): Promise<string> {
   if (envelope.aad !== expectedAad) {
@@ -77,11 +77,7 @@ export async function open(envelope: TokenEnvelope, expectedAad: string, ring: K
   const candidates: Kek[] = [];
   if (envelope.kekVersion === ring.current.version) candidates.push(ring.current);
   if (ring.previous && envelope.kekVersion === ring.previous.version) candidates.push(ring.previous);
-  // Rotation safety: if the stamped version matches neither, still try both keys.
-  if (candidates.length === 0) {
-    candidates.push(ring.current);
-    if (ring.previous) candidates.push(ring.previous);
-  }
+  if (candidates.length === 0) throw new Error(`unknown KEK version "${envelope.kekVersion}" (fail closed).`);
 
   const iv = base64ToBytes(envelope.iv);
   const ct = base64ToBytes(envelope.ciphertext);
@@ -168,7 +164,7 @@ export function warnIfWeakSecretOnce(name: string, secret: string): void {
  * keys are overwhelmingly unlikely to share a label (32-bit content address), which avoids
  * the constant-"current" same-label collision that defeated rotation before P3. A label
  * collision is harmless: GCM authentication — not the label — decides decryption, so a wrong
- * key can never produce a valid open(); a collision only adds a candidate to open()'s loop.
+ * key can never produce a valid open().
  * The label is stable across deploys for a given passphrase (P3).
  */
 async function kekLabel(keyBytes: Uint8Array): Promise<string> {
@@ -180,10 +176,6 @@ async function kekLabel(keyBytes: Uint8Array): Promise<string> {
  * Build a rotation-capable KEK ring from a current passphrase (+ optional previous) using
  * content-addressed version labels (P3). Reused for BOTH the token ring (wired now) and the
  * snapshot ring (P4 consumes this same helper). Fails closed if no current secret is given.
- *
- * Migration safety: a legacy envelope stamped `kekVersion:"current"` matches neither
- * content-addressed label, so `open()`'s try-all fallback still decrypts it as long as
- * `currentSecret` derives the same bytes the old `TOKEN_KEK` passphrase did.
  */
 export async function buildKekRing(currentSecret: string, prevSecret?: string): Promise<KekRing> {
   if (!currentSecret) throw new Error("KEK ring requires a current secret (fail closed).");

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  seal, open, tokenAad, buildKekRing, deriveKeyBytes, warnIfWeakSecret, warnIfWeakSecretOnce, type KekRing,
+  seal, open, tokenAad, buildKekRing, warnIfWeakSecret, warnIfWeakSecretOnce, type KekRing,
 } from "../src/auth/crypto.js";
 
 // ─── §2.7 — AES-256-GCM token envelope (S7 fragments) ─────────────────────────
@@ -71,16 +71,10 @@ describe("§P3 buildKekRing", () => {
     expect(await open(env, aad, rotated)).toBe("tok");
   });
 
-  it("migration: a legacy envelope stamped kekVersion:'current' still opens under the new ring", async () => {
-    // Old code sealed with version label "current" and key = deriveKeyBytes(passphrase).
-    const legacyRing: KekRing = { current: { version: "current", keyBytes: await deriveKeyBytes("legacy-pass") } };
-    const legacyEnv = await seal("legacy-token", aad, legacyRing);
-    expect(legacyEnv.kekVersion).toBe("current");
-    // New ring built from the SAME passphrase → label is content-addressed (matches neither),
-    // so open()'s try-all fallback decrypts it.
-    const newRing = await buildKekRing("legacy-pass");
-    expect(newRing.current.version).not.toBe("current");
-    expect(await open(legacyEnv, aad, newRing)).toBe("legacy-token");
+  it("rejects envelopes stamped with an unknown KEK version", async () => {
+    const ring = await buildKekRing("current-pass");
+    const env = await seal("tok", aad, ring);
+    await expect(open({ ...env, kekVersion: "unknown" }, aad, ring)).rejects.toThrow(/unknown KEK version/);
   });
 
   it("fails closed when no current secret is given (missing KEK)", async () => {

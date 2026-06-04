@@ -77,37 +77,29 @@ describe("Alchemy deploy bindings", () => {
   });
 });
 
-// P2b: the token-KEK binding must accept the versioned key alone (the host reads
-// TOKEN_KEK_CURRENT ?? TOKEN_KEK). These exercise the EXTRACTED helper directly — a raw-text
+// P2b: the token-KEK binding requires the versioned current key. These exercise the EXTRACTED
+// helper directly — a raw-text
 // assertion on alchemy.run.ts cannot prove deploy-time behavior because the module has a
 // top-level `await alchemy(...)` and would attempt to provision on import.
 describe("tokenKekBindings (P2b)", () => {
   const tag = (v: string) => `secret(${v})`; // stand-in for alchemy.secret
 
-  it("accepts TOKEN_KEK_CURRENT alone (versioned-only config deploys)", () => {
+  it("requires and binds TOKEN_KEK_CURRENT", () => {
     const b = tokenKekBindings({ TOKEN_KEK_CURRENT: "cur" }, tag);
     expect(b).toEqual({ TOKEN_KEK_CURRENT: "secret(cur)" });
-    expect(b).not.toHaveProperty("TOKEN_KEK");
   });
 
-  it("accepts legacy TOKEN_KEK alone (existing single-key deployments still deploy)", () => {
-    const b = tokenKekBindings({ TOKEN_KEK: "leg" }, tag);
-    expect(b).toEqual({ TOKEN_KEK: "secret(leg)" });
-    expect(b).not.toHaveProperty("TOKEN_KEK_CURRENT");
-  });
-
-  it("binds both + PREV when all present", () => {
-    expect(tokenKekBindings({ TOKEN_KEK: "leg", TOKEN_KEK_CURRENT: "cur", TOKEN_KEK_PREV: "prev" }, tag)).toEqual({
-      TOKEN_KEK: "secret(leg)",
+  it("binds PREV only alongside CURRENT during a rotation window", () => {
+    expect(tokenKekBindings({ TOKEN_KEK_CURRENT: "cur", TOKEN_KEK_PREV: "prev" }, tag)).toEqual({
       TOKEN_KEK_CURRENT: "secret(cur)",
       TOKEN_KEK_PREV: "secret(prev)",
     });
   });
 
-  it("throws when NEITHER current nor legacy is set (fail-closed, naming both keys)", () => {
-    expect(() => tokenKekBindings({}, tag)).toThrow(/TOKEN_KEK_CURRENT.*TOKEN_KEK|TOKEN_KEK.*TOKEN_KEK_CURRENT/);
+  it("throws when current is unset", () => {
+    expect(() => tokenKekBindings({}, tag)).toThrow(/TOKEN_KEK_CURRENT/);
     // Whitespace-only values are treated as unset.
-    expect(() => tokenKekBindings({ TOKEN_KEK: "   ", TOKEN_KEK_CURRENT: "" }, tag)).toThrow(/Missing token KEK/);
+    expect(() => tokenKekBindings({ TOKEN_KEK_CURRENT: "" }, tag)).toThrow(/Missing token KEK/);
   });
 });
 
@@ -117,6 +109,11 @@ describe("operatorSecretBindings", () => {
   it("does not require or bind MCP_OPERATOR_SECRET when AUTH_MODE=oidc", () => {
     expect(operatorSecretBindings({ AUTH_MODE: "oidc" }, tag)).toEqual({});
     expect(operatorSecretBindings({ AUTH_MODE: "oidc " }, tag)).toEqual({});
+  });
+
+  it("does not require or bind MCP_OPERATOR_SECRET for production deployments", () => {
+    expect(operatorSecretBindings({ DEPLOYMENT_PROFILE: "production" }, tag)).toEqual({});
+    expect(operatorSecretBindings({ DEPLOYMENT_PROFILE: "production", MCP_OPERATOR_SECRET: "leftover" }, tag)).toEqual({});
   });
 
   it("requires MCP_OPERATOR_SECRET for operator-secret mode", () => {

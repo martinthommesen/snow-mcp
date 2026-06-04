@@ -3,7 +3,7 @@
 // Two modes:
 //  - CONNECTED path: run_code reaches the real instance via ServiceNowRPC and
 //    describe_table/list_tables use the discovery module. ServiceNow credentials
-//    come from per-user OAuth or the explicit dev ROPC fallback.
+//    come from per-user OAuth or the explicit dev ROPC path.
 //  - NOT-CONNECTED: fail closed with `reauth_required` until creds exist.
 
 import type { ServerHandlers, ToolTextResult } from "../server.js";
@@ -72,19 +72,17 @@ export interface HandlerEnv extends PolicyEnv {
   // Host secret for the per-user OAuth reauth ticket (§6b). Reused (not a new required secret);
   // also the OAuthProvider state secret. Optional: absent + per_user_oauth ⇒ no ticket minted.
   OAUTH_PROVIDER_SECRET?: string;
-  TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
-  SNAPSHOT_KEK?: string; // one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
   // Versioned KEK ring (P3): current + optional previous, for token + snapshot stores.
   TOKEN_KEK_CURRENT?: string;
   TOKEN_KEK_PREV?: string;
   SNAPSHOT_KEK_CURRENT?: string;
   SNAPSHOT_KEK_PREV?: string;
-  // Credential mode (P6) + mode ceilings (P5). All optional in P0.
+  // Credential mode (P6) + mode ceilings (P5).
   SERVICENOW_CREDENTIAL_MODE?: string;
   DEPLOYMENT_PROFILE?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
-  // Dev Basic-Auth fallback + ROPC creds, enabled only by explicit SNOW_DEV_ROPC=1.
+  // Dev Basic-Auth/ROPC path, enabled only by explicit SNOW_DEV_ROPC=1.
   SNOW_DEV_ROPC?: string;
   SNOW_DEV_ROPC_USERNAME?: string;
   SNOW_DEV_ROPC_PASSWORD?: string;
@@ -98,7 +96,7 @@ export interface HandlerEnv extends PolicyEnv {
   // an empty/unset ADMIN_SCRIPT_ALLOWLIST denies every admin_script request, so a live
   // deployment must set it to permit specific actors. ADMIN_SCRIPT_APPROVAL_TOKENS /
   // ADMIN_SCRIPT_REQUIRED_GROUP are the optional SECOND factor (token OR group) layered on top.
-  // (read_only / write are unaffected — those run under the permissive single-operator policy.)
+  // (read_only / write are unaffected.)
   ADMIN_SCRIPT_ALLOWLIST?: string; // comma-separated actor userIds permitted admin_script.
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string; // comma-separated valid approval tokens.
   ADMIN_SCRIPT_REQUIRED_GROUP?: string; // required access-group name (token OR group).
@@ -120,9 +118,13 @@ function utcDateKey(): string {
 type ParsedCredentialMode = CredentialMode | "invalid";
 
 function parseCredentialMode(value: string | undefined): ParsedCredentialMode {
-  if (value === undefined || value.trim() === "") return "integration_user";
+  if (value === undefined || value.trim() === "") return "invalid";
   if (value === "integration_user" || value === "per_user_oauth") return value;
   return "invalid";
+}
+
+function selectedCredentialMode(value: ParsedCredentialMode): CredentialMode | undefined {
+  return value === "invalid" ? undefined : value;
 }
 
 const defaultInstanceAllowlist = { allowedHostSuffixes: DEFAULT_ALLOWED_HOST_SUFFIXES } satisfies InstanceAllowlist;
@@ -165,11 +167,8 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     : "unconfigured.invalid";
   const instanceAllowlist = instanceAllowlistForProfile(env, instanceHost);
   const userId = auth.userId;
-  // §6b: configurable RESTRICTIVE ActorPolicy. NON-BREAKING — with NO policy config set this
-  // returns the permissive single-operator policy (live deployment unchanged). When policy vars
-  // ARE set it builds a restrictive policy (table allowlist + field masks + row filters + per-run
-  // row/byte ceilings) and validates the configured rowFilters at load (fail-closed). The dead
-  // maxRowsPerRun/maxBytesPerRun fields now bite via makeRunBudget below under a restrictive policy.
+  // §6b: configurable restrictive ActorPolicy. With no policy config the default policy denies
+  // all tables; configured policies add allowlists, masks, row filters, and per-run ceilings.
   const actorPolicies = loadNamedActorPolicies(env, instanceHost);
   const requestedPolicyName = typeof auth.props.actorPolicyName === "string" ? auth.props.actorPolicyName : "default";
   const selectedPolicy = actorPolicies.get(requestedPolicyName);
@@ -187,12 +186,11 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // Authorization header strategy (preference order):
   //  1. Per-user ServiceNow OAuth Bearer — tokens minted/refreshed and stored encrypted in
   //     TokenStoreDO (§2.7, §7.5). Preferred.
-  //  2. Explicit dev Basic-Auth fallback (SNOW_DEV_ROPC=1).
+  //  2. Explicit dev Basic-Auth/ROPC path (SNOW_DEV_ROPC=1).
   //  3. Not connected -> fail closed.
-  // TOKEN_KEK is a one-release alias for TOKEN_KEK_CURRENT (P3 migration).
-  const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
+  const tokenKekSecret = env.TOKEN_KEK_CURRENT;
   const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
-  const serviceNowCredentialMode: CredentialMode = credentialMode === "per_user_oauth" ? "per_user_oauth" : "integration_user";
+  const serviceNowCredentialMode = selectedCredentialMode(credentialMode);
   const devRopcEnabled = env.SNOW_DEV_ROPC === "1";
   const oauthReady = Boolean(env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST && (credentialMode !== "per_user_oauth" || auth.workerOrigin));
   const devConnected = Boolean(devRopcEnabled && env.SNOW_INSTANCE_HOST && env.SNOW_DEV_ROPC_USERNAME && env.SNOW_DEV_ROPC_PASSWORD);
@@ -264,7 +262,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     requestAuthorization = (): Promise<string> => {
       authorizationPromise ??= (async () => {
         const store = await oauthStore!();
-        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), serviceNowCredentialMode, await reauthAuthorizeUrl()));
+        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), serviceNowCredentialMode!, await reauthAuthorizeUrl()));
       })();
       return authorizationPromise;
     };
@@ -433,11 +431,11 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       }
     : undefined;
 
-  // Recovery snapshots (§7.7): encrypt under the SNAPSHOT_KEK ring (same buildKekRing scheme
+  // Recovery snapshots (§7.7): encrypt under the SNAPSHOT_KEK_CURRENT ring (same buildKekRing scheme
   // as the token ring, P3) and persist to SNAPSHOT_KV with a 30-day TTL. No enabled tables means
   // no snapshots, so the recovery claim is narrowed. The integration user never decrypts
   // (the KEK lives only host-side). The ring is built lazily + cached.
-  const snapshotKekSecret = env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK;
+  const snapshotKekSecret = env.SNAPSHOT_KEK_CURRENT;
   const snapshotEnabledTables = csv(env.SNAPSHOT_ENABLED_TABLES);
   const snapshotReady = Boolean(env.SNAPSHOT_KV && snapshotKekSecret && snapshotEnabledTables.length > 0);
   const snapshotConfig: SnapshotConfig = { enabledTables: snapshotEnabledTables };
@@ -500,15 +498,14 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   const preflightAuthDep = perUserConfigurationError
     ? async (): Promise<never> => { throw new McpToolError("reauth_required", perUserConfigurationError); }
     : oauthStore
-    ? async (): Promise<void> => preflightAuth(await oauthStore!(), serviceNowCredentialMode, await reauthAuthorizeUrl())
+    ? async (): Promise<void> => preflightAuth(await oauthStore!(), serviceNowCredentialMode!, await reauthAuthorizeUrl())
     : undefined;
 
   const runCodeDeps: RunCodeDeps = {
     loader: env.LOADER,
     scopeMaxMode, // from the client's OAuth scope (§2.0.1)
-    // Mode ceilings (§P5): env-configurable. UNSET defaults to admin_script (preserves today's
-    // "scope is the cap" behavior); a SET-but-invalid value fails closed to read_only — never
-    // widens the ceiling (parseMaxMode).
+    // Mode ceilings (§P5): env-configurable. UNSET leaves the OAuth scope as the cap; a
+    // SET-but-invalid value fails closed to read_only and never widens the ceiling.
     tenantMaxMode: parseMaxMode(env.TENANT_MAX_MODE),
     instanceMaxMode: parseMaxMode(env.INSTANCE_MAX_MODE),
     // Per-run budget meter carrying the actor's row/byte caps (§P5). The dead
@@ -535,6 +532,13 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   }
 
   async function runDiscoveryWithBudget<T>(runBudget: RunBudget, fn: () => Promise<T>): Promise<T> {
+    if (requestAuthorization) {
+      await requestAuthorization();
+    } else if (preflightAuthDep) {
+      await preflightAuthDep();
+    } else if (http instanceof NotConnectedHttpClient) {
+      await http.request();
+    }
     let reserved = false;
     if (reserveDiscoveryDailyBudget) {
       const reservation = await reserveDiscoveryDailyBudget();
@@ -568,7 +572,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Built lazily so run_code and other
   // non-schema calls do not pay a per-user TokenStore read/decrypt just to compute identity.
   // In per_user_oauth the resolver must return the ServiceNow sys_id; if it cannot, we skip cache
-  // for this request rather than keying ACL-filtered schema under a fallback identity.
+  // for this request rather than keying ACL-filtered schema under the wrong identity.
   let schemaCachePromise: Promise<SchemaCache | undefined> | undefined;
   const schemaCache = (): Promise<SchemaCache | undefined> => {
     if (!env.SCHEMA_KV) return Promise.resolve(undefined);
@@ -633,12 +637,13 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
  * that request. It NEVER throws, so it cannot block the reauth_required path.
  */
 export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Promise<SchemaCachePrincipalIdentity | undefined> {
-  const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
+  const tokenKekSecret = env.TOKEN_KEK_CURRENT;
   const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
   const oauthReady = Boolean(
     env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST,
   );
-  if (credentialMode !== "per_user_oauth") return { principalId: userId, roleHash: "default" };
+  if (credentialMode === "invalid") return undefined;
+  if (credentialMode === "integration_user") return { principalId: userId, roleHash: "default" };
   if (!oauthReady) return undefined;
   try {
     // Intentional two-step guard: normalize the configured ServiceNow host under the default
@@ -668,7 +673,7 @@ export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Pr
     };
   } catch (e) {
     // Best-effort: an identity failure must NEVER block the request. Bypassing cache is safer than
-    // reusing a fallback key for ACL-filtered schema. Log only the error object (no token/key data).
+    // reusing the wrong key for ACL-filtered schema. Log only the error object (no token/key data).
     console.error("resolveSchemaIdentity failed; SchemaCache disabled for this request", e);
     return undefined;
   }

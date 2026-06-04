@@ -72,4 +72,3 @@ The design rationale and the per-control reasoning live alongside the code:
 - [`FORK.md`](docs/FORK.md) — deployment (env vars + the one-time re-scope step).
 - [`docs/ADR/0001-codemode-integration.md`](docs/ADR/0001-codemode-integration.md)
   — the Code Mode execution contract.
-- [`docs/archive/`](docs/archive) — historical phase and review records.

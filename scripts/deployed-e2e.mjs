@@ -1,4 +1,4 @@
-// End-to-end test of the DEPLOYED, OAuth-SECURED Worker via a real MCP client.
+// Pilot-only end-to-end test of the DEPLOYED, operator-secret OAuth Worker via a real MCP client.
 // Proves: (a) unauthenticated /mcp -> 401; (b) full OAuth dance (DCR + PKCE + operator
 // consent) yields a token; (c) authenticated run_code -> Worker Loader sandbox ->
 // ServiceNowRPC -> LIVE ServiceNow; (d) sandbox network isolation (S1).
@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { readDevVar, resolveDeployedE2eConfig } from "./deployed-e2e-origin.mjs";
 
-// Your deployed Worker base URL — pass argv[2] only when it matches WORKER_PUBLIC_ORIGIN.
+// Your deployed pilot Worker base URL — pass argv[2] only when it matches WORKER_PUBLIC_ORIGIN.
 // The script validates the canonical HTTPS origin before reading/sending MCP_OPERATOR_SECRET.
 let config;
 try {

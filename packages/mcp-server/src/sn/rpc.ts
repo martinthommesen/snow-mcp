@@ -9,7 +9,7 @@
 // caller query for masked fields (assertQueryFieldsAllowed). runServerScript is TABLE-LESS, so it
 // applies the ActorPolicy MODE CEILING explicitly (H-1) — there is no table allowlist to run.
 // The enforcement is unit-verified locally against a mock
-// SnHttpClient; live ServiceNow behavior is not (see OPEN_QUESTIONS.md).
+// SnHttpClient; live ServiceNow behavior is not (see docs/DELTAS.md).
 //
 // NOTE: the plan writes `class ServiceNowRPC extends RpcTarget`. We expose plain
 // methods and hand `fns()` to codemode, whose ToolDispatcher is itself the RpcTarget
@@ -54,7 +54,7 @@ import {
 import type { AuditSink, AuditIdentity } from "./mutation-guard.js";
 import { assertAdminScriptApproved, type ApprovalContext } from "../authz/approval.js";
 import { recoverability } from "../recovery/policy.js";
-import { isReplaySafeWrapper, replaySafeResult } from "./replay-payload.js";
+import { isReplaySafeWrapper, replaySafeResult, visibleReplayResult } from "./replay-payload.js";
 
 export interface ServiceNowRpcDeps {
   http: SnHttpClient;
@@ -96,7 +96,7 @@ export interface MutationDeps {
   audit?: AuditSink;
   /**
    * Recovery snapshot capture for a reversible-class tableUpdate. Owns the (lazily-built)
-   * SNAPSHOT_KEK ring, the enabled-table classification, encryption (AAD-bound), and the
+   * SNAPSHOT_KEK_CURRENT ring, the enabled-table classification, encryption (AAD-bound), and the
    * durable persist (SNAPSHOT_KV). Returns true when a snapshot was persisted, false when
    * the table is opted out (claim narrowed). THROWS if it cannot persist — the caller then
    * fails the mutation CLOSED (no recovery row => no mutate). The integration user never
@@ -440,7 +440,7 @@ export class ServiceNowRPC {
       this.deps.runBudget.countServiceNowRequest();
     };
 
-    const result = await guardMutation<unknown>(
+    const guarded = await guardMutation<unknown>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -478,9 +478,10 @@ export class ServiceNowRPC {
         isIndeterminate: isPostSendUnknown,
       },
     );
-    const visibleResult = isReplaySafeWrapper(result)
-      ? result
-      : replaySafeResult(maskRow(this.deps.actorPolicy, table, (result ?? {}) as Record<string, unknown>));
+    if (!isReplaySafeWrapper(guarded.result)) {
+      throw new McpToolError("internal_error", "tableUpdate replay payload is not replay-safe.");
+    }
+    const visibleResult = visibleReplayResult(guarded.result);
     // Per-run byte enforcement (§P5): count the PATCH response AFTER guardMutation resolves.
     // Counting inside the effect closure would let a byte-cap throw classify as post-send
     // unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and poison the
@@ -599,6 +600,7 @@ export class ServiceNowRPC {
     const actorUserId = signing.claims.mcp_actor_user_id;
     const requestHash = await runServerScriptRequestHash({
       script: args.script, reason, mode: this.deps.effectiveMode, instance: this.deps.instanceHost, actorUserId,
+      policyScope: actorPolicyScopeFingerprint(this.deps.actorPolicy),
     });
     const outboundUpperBoundBytes = runServerScriptBodyUpperBoundBytes({ script: args.script, claims: signing.claims, reason });
 
@@ -622,7 +624,7 @@ export class ServiceNowRPC {
       this.deps.runBudget.countServiceNowRequest();
     };
 
-    const result = await guardMutation<unknown>(
+    const guarded = await guardMutation<unknown>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -651,8 +653,12 @@ export class ServiceNowRPC {
     // resolves. Counting inside the effect closure would let a byte-cap throw classify as
     // post-send unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and
     // poison the ledger for a script that actually succeeded.
-    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result ?? null)));
-    return result;
+    if (!isReplaySafeWrapper(guarded.result)) {
+      throw new McpToolError("internal_error", "runServerScript replay payload is not replay-safe.");
+    }
+    const visibleResult = visibleReplayResult(guarded.result);
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(visibleResult ?? null)));
+    return visibleResult;
   }
 
   // Encode the typed error code into the thrown message so it survives the sandbox

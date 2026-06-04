@@ -54,7 +54,7 @@ describe("§2.8 getServiceNowBearer", () => {
   it("mints via ROPC on first use and stores the token encrypted", async () => {
     const { fetchImpl, calls } = mockFetch({ password: { access_token: "AT1", refresh_token: "RT1", expires_in: 1800 } });
     const s = store("oa1");
-    const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 1000);
+    const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 1000, "integration_user");
     expect(tok).toBe("AT1");
     expect(calls).toEqual([{ grant: "password", redirect: "manual" }]);
     expect((await s.get("servicenow"))?.refresh_token).toBe("RT1");
@@ -64,7 +64,7 @@ describe("§2.8 getServiceNowBearer", () => {
     const s = store("oa2");
     await s.put("servicenow", { access_token: "STORED", refresh_token: "R", expires_at: 10_000 });
     const { fetchImpl, calls } = mockFetch({});
-    const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 5_000); // before expiry
+    const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 5_000, "integration_user"); // before expiry
     expect(tok).toBe("STORED");
     expect(calls).toEqual([]);
   });
@@ -73,7 +73,7 @@ describe("§2.8 getServiceNowBearer", () => {
     const s = store("oa3");
     await s.put("servicenow", { access_token: "OLD", refresh_token: "RKEEP", expires_at: 1_000 });
     const { fetchImpl, calls } = mockFetch({ refresh_token: { access_token: "NEW", expires_in: 1800 } }); // no refresh_token returned
-    const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 5_000); // after expiry
+    const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 5_000, "integration_user"); // after expiry
     expect(tok).toBe("NEW");
     expect(calls).toEqual([{ grant: "refresh_token", redirect: "manual" }]);
     expect((await s.get("servicenow"))?.refresh_token).toBe("RKEEP"); // carried forward
@@ -151,7 +151,7 @@ describe("§6b getServiceNowBearer — per_user_oauth missing token reauths (nev
     expect(calls).toEqual([]);
   });
 
-  it("integration_user STILL mints via ROPC on a missing token (unchanged)", async () => {
+  it("integration_user mints via ROPC on a missing token when explicitly selected", async () => {
     const s = store("oaMissingIU");
     const { fetchImpl, calls } = mockFetch({ password: { access_token: "MINTED", expires_in: 1800 } });
     const tok = await getServiceNowBearer(baseCfg(fetchImpl), s, 1000, "integration_user");

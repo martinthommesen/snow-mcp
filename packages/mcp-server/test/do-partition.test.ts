@@ -5,7 +5,7 @@ import {
   MUTATION_LEDGER_RETENTION_MS,
   normalizeLedgerRecordForStorage,
 } from "../src/do/mutation-ledger.js";
-import { replaySafeResult } from "../src/sn/replay-payload.js";
+import { replaySafeResult, visibleReplayResult, type ReplaySafeWrapper } from "../src/sn/replay-payload.js";
 
 // ─── Phase 0.12 — Durable Object partition proof ──────────────────────────────
 // Proves token isolation per (user,instance) and that the GLOBAL budget counter
@@ -67,11 +67,11 @@ describe("Phase 0.12 — BudgetDO global counter coordinates through ONE object"
 });
 
 describe("MutationLedgerDO replay storage", () => {
-  it("migrates legacy rows without expiresAt instead of deleting their idempotency state", () => {
+  it("normalizes retained rows without expiresAt instead of letting them re-execute", () => {
     const now = 1_700_000_000_000;
 
     const indeterminate = normalizeLedgerRecordForStorage({ status: "indeterminate", requestHash: "h1" }, now);
-    expect(indeterminate).toMatchObject({
+    expect(indeterminate).toEqual({
       kind: "migrated",
       record: { status: "indeterminate", requestHash: "h1", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
     });
@@ -83,8 +83,11 @@ describe("MutationLedgerDO replay storage", () => {
     }, now);
     expect(completed).toMatchObject({
       kind: "migrated",
-      record: { status: "completed", requestHash: "h2", result: { ok: true } },
+      record: { status: "completed", requestHash: "h2", expiresAt: now + MUTATION_LEDGER_RETENTION_MS },
     });
+    expect(visibleReplayResult((completed as { record: { result: ReplaySafeWrapper } }).record.result)).toEqual({ ok: true });
+
+    expect(normalizeLedgerRecordForStorage({ status: "failed", requestHash: "h3" }, now)).toEqual({ kind: "expired" });
   });
 
   it("keeps expired unknown outcomes blocked instead of turning them into fresh claims", () => {
@@ -405,7 +408,11 @@ describe("Phase 7.3 / S17 — MutationLedgerDO leveled idempotency", () => {
     expect(await l.begin("hashA")).toEqual({ state: "new" });
     await l.complete({ sys_id: "abc", ok: true });
     const replay = await ledger("k-l1").begin("hashA");
-    expect(replay).toEqual({ state: "replay", result: { sys_id: "abc", ok: true } });
+    expect(replay).toMatchObject({
+      state: "replay",
+      result: { replaySafe: true, truncated: false, serializedResult: expect.any(String) },
+    });
+    expect(visibleReplayResult((replay as { result: ReplaySafeWrapper }).result)).toEqual({ sys_id: "abc", ok: true });
   });
 
   it("S17 — an INDETERMINATE runServerScript is NOT silently re-executed on retry", async () => {

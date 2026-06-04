@@ -6,12 +6,12 @@
 import { parseAuthMode } from "@servicenow-codemode/shared";
 
 export interface TokenKekEnv {
-  TOKEN_KEK?: string;
   TOKEN_KEK_CURRENT?: string;
   TOKEN_KEK_PREV?: string;
 }
 
 export interface OperatorSecretEnv {
+  DEPLOYMENT_PROFILE?: string;
   AUTH_MODE?: string;
   MCP_OPERATOR_SECRET?: string;
 }
@@ -43,6 +43,7 @@ export function parseDevVarLine(raw: string): [string, string] | undefined {
 }
 
 export function operatorSecretBindings<S>(env: OperatorSecretEnv, secret: (value: string) => S): Record<string, S> {
+  if (env.DEPLOYMENT_PROFILE?.trim() === "production") return {};
   if (parseAuthMode(env.AUTH_MODE) === "oidc") return {};
   const operatorSecret = env.MCP_OPERATOR_SECRET;
   if (!operatorSecret) throw new Error("Missing MCP_OPERATOR_SECRET in environment/.dev.vars");
@@ -50,25 +51,17 @@ export function operatorSecretBindings<S>(env: OperatorSecretEnv, secret: (value
 }
 
 /**
- * Build the token-KEK Worker secret bindings (P3 versioned ring). The host reads
- * `TOKEN_KEK_CURRENT ?? TOKEN_KEK`, so the deploy must accept EITHER key: require at least one
- * of `TOKEN_KEK_CURRENT` (preferred) / `TOKEN_KEK`, bind the legacy `TOKEN_KEK` only when
- * present (so the versioned-key config deploys without the legacy alias), and pass through an
- * optional `TOKEN_KEK_PREV`. `secret` wraps a raw value as an Alchemy secret and is injected to
- * keep this module free of the `alchemy` import.
+ * Build the token-KEK Worker secret bindings (P3 versioned ring). `TOKEN_KEK_CURRENT` is required;
+ * `TOKEN_KEK_PREV` is accepted only during an active rotation window.
  */
 export function tokenKekBindings<S>(env: TokenKekEnv, secret: (value: string) => S): Record<string, S> {
   const current = env.TOKEN_KEK_CURRENT?.trim() || undefined;
-  const legacy = env.TOKEN_KEK?.trim() || undefined;
-  if (!current && !legacy) {
-    throw new Error(
-      "Missing token KEK: set TOKEN_KEK_CURRENT (preferred) or TOKEN_KEK in environment/.dev.vars",
-    );
+  if (!current) {
+    throw new Error("Missing token KEK: set TOKEN_KEK_CURRENT in environment/.dev.vars");
   }
   const prev = env.TOKEN_KEK_PREV?.trim() || undefined;
   return {
-    ...(legacy ? { TOKEN_KEK: secret(legacy) } : {}),
-    ...(current ? { TOKEN_KEK_CURRENT: secret(current) } : {}),
+    TOKEN_KEK_CURRENT: secret(current),
     ...(prev ? { TOKEN_KEK_PREV: secret(prev) } : {}),
   };
 }

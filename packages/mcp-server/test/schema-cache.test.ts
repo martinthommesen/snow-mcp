@@ -144,7 +144,7 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     });
   }
 
-  it("returns the MCP actor identity in integration_user mode (no extra decrypt; live deployment untouched)", async () => {
+  it("returns the MCP actor identity in explicit integration_user mode (no extra decrypt)", async () => {
     const out = await resolveSchemaIdentity({ ...baseEnv, SERVICENOW_CREDENTIAL_MODE: "integration_user" } as HandlerEnv, "u-int");
     expect(out).toEqual({ principalId: "u-int", roleHash: "default" });
   });
@@ -238,9 +238,11 @@ describe("§6b resolveSchemaIdentity wiring", () => {
         LOADER,
         SCHEMA_KV: KV,
         SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
         SNOW_DEV_ROPC: "1",
         SNOW_DEV_ROPC_USERNAME: "dev-user",
         SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
       } as HandlerEnv,
       {
         userId: "lazy-role-user",
@@ -266,12 +268,13 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     expect(fetches).toBe(1);
   });
 
-  it("threads list_tables partial/total through uncached and cached handler results", async () => {
+  it("threads list_tables partial metadata through uncached and cached handler results", async () => {
     const host = `inst-list-meta-${crypto.randomUUID()}.service-now.com`;
+    const allowedTables = Array.from({ length: 1000 }, (_, i) => `u_table_${i}`);
     let fetches = 0;
     vi.stubGlobal("fetch", (async () => {
       fetches++;
-      const rows = Array.from({ length: 1000 }, (_, i) => ({ name: `u_table_${i}`, label: `Table ${i}` }));
+      const rows = allowedTables.map((name, i) => ({ name, label: `Table ${i}` }));
       return new Response(JSON.stringify({ result: rows }), {
         headers: { "content-type": "application/json", "x-total-count": "1200" },
       });
@@ -282,9 +285,11 @@ describe("§6b resolveSchemaIdentity wiring", () => {
         LOADER,
         SCHEMA_KV: KV,
         SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
         SNOW_DEV_ROPC: "1",
         SNOW_DEV_ROPC_USERNAME: "dev-user",
         SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        ACTOR_POLICY_TABLE_ALLOWLIST: allowedTables.join(","),
       } as HandlerEnv,
       {
         userId: "list-meta-user",
@@ -298,15 +303,17 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     const firstText = JSON.parse(first.content[0]!.text) as { tables: unknown[]; partial: boolean; total?: number };
     expect(firstText.tables).toHaveLength(1000);
     expect(firstText.partial).toBe(true);
-    expect(firstText.total).toBe(1200);
-    expect(first.structuredContent).toMatchObject({ cached: false, partial: true, total: 1200 });
+    expect(firstText.total).toBeUndefined();
+    expect(first.structuredContent).toMatchObject({ cached: false, partial: true });
+    const fetchesAfterFirst = fetches;
 
     const second = await handlers.listTables({});
     const secondText = JSON.parse(second.content[0]!.text) as { partial: boolean; total?: number };
     expect(secondText.partial).toBe(true);
-    expect(secondText.total).toBe(1200);
-    expect(second.structuredContent).toMatchObject({ cached: true, partial: true, total: 1200 });
-    expect(fetches).toBe(1);
+    expect(secondText.total).toBeUndefined();
+    expect(second.structuredContent).toMatchObject({ cached: true, partial: true });
+    expect(fetchesAfterFirst).toBeGreaterThan(0);
+    expect(fetches).toBe(fetchesAfterFirst);
   });
 
   it("wraps uncached list_tables ServiceNow fetches in a daily budget reserve/reconcile", async () => {
@@ -338,9 +345,11 @@ describe("§6b resolveSchemaIdentity wiring", () => {
           get: () => budget,
         } as unknown as DurableObjectNamespace,
         SNOW_INSTANCE_HOST: host,
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
         SNOW_DEV_ROPC: "1",
         SNOW_DEV_ROPC_USERNAME: "dev-user",
         SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
       } as HandlerEnv,
       {
         userId: "discovery-budget-user",
@@ -397,9 +406,11 @@ describe("§6b resolveSchemaIdentity wiring", () => {
           LOADER,
           SCHEMA_KV: KV,
           SNOW_INSTANCE_HOST: host,
+          SERVICENOW_CREDENTIAL_MODE: "integration_user",
           SNOW_DEV_ROPC: "1",
           SNOW_DEV_ROPC_USERNAME: "dev-user",
           SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+          ACTOR_POLICY_TABLE_ALLOWLIST: "incident,sys_user",
           ...env,
         } as HandlerEnv,
         {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { SignJWT } from "jose";
 import {
   discoverOidc,
   oidcAccessTokenProps,
@@ -170,7 +171,7 @@ describe("Phase 3 OIDC identity projection", () => {
   it("normalizes OIDC group policy names the same way production posture does", () => {
     const env = {
       ...envWithFetch(fetch),
-      OIDC_DEFAULT_POLICY_NAME: " fallback ",
+      OIDC_DEFAULT_POLICY_NAME: " backup ",
       OIDC_GROUP_POLICY_MAP: JSON.stringify({
         admins: { maxMode: "write", policy: " admin " },
         readers: { maxMode: "read_only", policy: 123 },
@@ -178,8 +179,8 @@ describe("Phase 3 OIDC identity projection", () => {
       }),
     };
     expect(oidcPropsFromClaims(env, { sub: "u-admin", groups: ["admins"] }, ["servicenow:write"]).grantProps.actorPolicyName).toBe("admin");
-    expect(oidcPropsFromClaims(env, { sub: "u-reader", groups: ["readers"] }, ["servicenow:read"]).grantProps.actorPolicyName).toBe("fallback");
-    expect(oidcPropsFromClaims(env, { sub: "u-writer", groups: ["writers"] }, ["servicenow:write"]).grantProps.actorPolicyName).toBe("fallback");
+    expect(oidcPropsFromClaims(env, { sub: "u-reader", groups: ["readers"] }, ["servicenow:read"]).grantProps.actorPolicyName).toBe("backup");
+    expect(oidcPropsFromClaims(env, { sub: "u-writer", groups: ["writers"] }, ["servicenow:write"]).grantProps.actorPolicyName).toBe("backup");
   });
 
   it("rejects equally privileged groups that select different ActorPolicies", () => {
@@ -298,5 +299,102 @@ describe("Phase 3 OIDC identity projection", () => {
       ),
     ).rejects.toThrow(/signed id_token/i);
     expect(userinfoCalls).toBe(0);
+  });
+});
+
+describe("Phase 3 OIDC ID-token validation hardening (negative cases)", () => {
+  // Mint a structurally-valid RS256 id_token, overriding exactly the one claim/field under test.
+  // kid "k1" matches the fixture JWKS and nonce "n1" matches the exchange below, so the FIRST
+  // failure is always the field being tested (jwtVerify checks iss/aud/exp/sig/alg before nonce).
+  async function rs256Token(
+    signingKey: CryptoKey,
+    o: { sub?: string; iss?: string; aud?: string; expFromNow?: string } = {},
+  ): Promise<string> {
+    return new SignJWT({ sub: o.sub ?? "u-neg", groups: ["admins"], nonce: "n1" })
+      .setProtectedHeader({ alg: "RS256", kid: "k1" })
+      .setIssuer(o.iss ?? ISSUER)
+      .setAudience(o.aud ?? CLIENT_ID)
+      .setIssuedAt()
+      .setExpirationTime(o.expFromNow ?? "5m")
+      .sign(signingKey);
+  }
+
+  // Drive the real authorization-code path: exchangeOidcCode -> validateIdToken (jose.jwtVerify).
+  function exchange(idTokenJwt: string, jwks: unknown): Promise<unknown> {
+    return oidcPropsFromCode(
+      envWithFetch(fakeFetch(jwks, () => ({ id_token: idTokenJwt, refresh_token: "RT" }))),
+      "code-neg",
+      "verifier-neg",
+      "n1",
+      ["servicenow:read"],
+    );
+  }
+
+  it("rejects an ID token from the wrong issuer", async () => {
+    const keys = await signer();
+    const token = await rs256Token(keys.privateKey, { iss: "https://evil-idp.example.com" });
+    await expect(exchange(token, keys.jwks)).rejects.toThrow();
+  });
+
+  it("rejects an ID token minted for a different audience", async () => {
+    const keys = await signer();
+    const token = await rs256Token(keys.privateKey, { aud: "some-other-client" });
+    await expect(exchange(token, keys.jwks)).rejects.toThrow();
+  });
+
+  it("rejects an expired ID token beyond the clock-tolerance window", async () => {
+    const keys = await signer();
+    const token = await rs256Token(keys.privateKey, { expFromNow: "-5m" });
+    await expect(exchange(token, keys.jwks)).rejects.toThrow();
+  });
+
+  it("rejects an ID token signed by a key absent from the IdP JWKS", async () => {
+    const served = await signer();
+    const attacker = await signer();
+    // Signed by the attacker's key, but kid "k1" resolves to the genuine served JWKS key -> mismatch.
+    const token = await rs256Token(attacker.privateKey);
+    await expect(exchange(token, served.jwks)).rejects.toThrow();
+  });
+
+  it("rejects an unsigned (alg:none) ID token", async () => {
+    const keys = await signer();
+    const b64u = (obj: unknown) => btoa(JSON.stringify(obj)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    const noneToken = `${b64u({ alg: "none", typ: "JWT" })}.${b64u({ iss: ISSUER, aud: CLIENT_ID, sub: "u", nonce: "n1", exp })}.`;
+    await expect(exchange(noneToken, keys.jwks)).rejects.toThrow();
+  });
+
+  it("rejects an HS256 (algorithm-confusion) ID token", async () => {
+    const keys = await signer();
+    const hsToken = await new SignJWT({ sub: "u", nonce: "n1", groups: ["admins"] })
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer(ISSUER)
+      .setAudience(CLIENT_ID)
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(new TextEncoder().encode("symmetric-confusion-secret-32-bytes-min!!"));
+    await expect(exchange(hsToken, keys.jwks)).rejects.toThrow();
+  });
+
+  it("rejects an OIDC refresh whose id_token subject differs from the bound subject", async () => {
+    const keys = await signer();
+    const token = await idToken(keys.privateKey, { sub: "someone-else", groups: ["admins"] });
+    await expect(
+      refreshOidcGrantProps(
+        envWithFetch(fakeFetch(keys.jwks, () => ({ id_token: token, refresh_token: "RT-new" }))),
+        { authMode: "oidc", userId: "oidc-u-orig", oidcSubject: "u-orig", oidcRefreshToken: "RT-old" },
+        ["servicenow:read"],
+      ),
+    ).rejects.toThrow(/subject changed/i);
+  });
+
+  it("falls back to read_only/default for an unmapped IdP group (least privilege)", () => {
+    const { grantProps } = oidcPropsFromClaims(
+      envWithFetch(fetch),
+      { sub: "u-unmapped", groups: ["some-unmapped-team"] },
+      ["servicenow:admin_script"],
+    );
+    expect(grantProps.maxMode).toBe("read_only");
+    expect(grantProps.actorPolicyName).toBe("default");
   });
 });

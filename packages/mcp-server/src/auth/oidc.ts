@@ -5,7 +5,7 @@ import {
   jwtVerify,
   type JWTPayload,
 } from "jose";
-import { isValidMode, modeRisk, parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
+import { isValidMode, modeRisk, parseAuthMode, parseScopeMaxMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
 import { generatePkce } from "./servicenow-oauth.js";
 import { canonicalPublicOrigin } from "./public-origin.js";
 import { maxModeFromScopes } from "./mcp-scopes.js";
@@ -235,6 +235,11 @@ function groupsFromClaims(env: OidcEnv, claims: JWTPayload): string[] {
   const claim = env.OIDC_GROUP_CLAIM?.trim() || DEFAULT_GROUP_CLAIM;
   const value = claims[claim];
   if (Array.isArray(value)) return value.filter((v): v is string => typeof v === "string" && v.trim() !== "");
+  // A string claim is treated as exactly ONE group name and is deliberately NOT split on
+  // whitespace: only an array-valued claim enumerates multiple groups. This is fail-closed — a
+  // space-delimited "groupA groupB" matches no policy-map entry (→ read_only/default) rather than
+  // being split into groups that could each grant a wider policy. Configure the IdP to emit the
+  // group claim as a JSON array when a user can belong to multiple mapped groups.
   if (typeof value === "string" && value.trim()) return [value];
   return [];
 }
@@ -313,7 +318,7 @@ export function stripOidcSecrets(props: Record<string, unknown>): Record<string,
 }
 
 export function oidcAccessTokenProps(props: Record<string, unknown>, requestedScopes: readonly string[]): Record<string, unknown> {
-  const grantMaxMode: Mode = isValidMode(props.maxMode) ? props.maxMode : "read_only";
+  const grantMaxMode: Mode = parseScopeMaxMode(props.maxMode);
   const requestedMaxMode = maxModeFromScopes(requestedScopes);
   return {
     ...stripOidcSecrets(props),

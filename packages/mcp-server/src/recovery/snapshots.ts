@@ -1,6 +1,6 @@
 // Recovery snapshots (plan §7.7, T20). Encrypted before/after field snapshots for
 // CONFIGURED tables, so a `tableUpdate` is reversible. Reuses the AES-GCM envelope
-// (auth/crypto.ts) under a dedicated SNAPSHOT_KEK. The snapshot store is itself
+// (auth/crypto.ts) under a dedicated SNAPSHOT_KEK_CURRENT. The snapshot store is itself
 // sensitive (RETENTION.md): retention window, KEK rotation, access control, PII class,
 // and explicit table enablement. Pure host logic (crypto) — unit-verified; persistent
 // storage retention is enforced by the KV write TTL in tools/handlers.ts.

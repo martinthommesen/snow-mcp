@@ -16,6 +16,15 @@ export function isValidMode(value: unknown): value is Mode {
 }
 
 /**
+ * Fail-closed coercion of an untrusted/raw `maxMode` (e.g. read off an OAuth grant-props bag) to a
+ * {@link Mode}. An invalid/missing value collapses to `read_only` — the single boundary helper the
+ * host uses so a forged or garbled grant can never widen the scope ceiling (plan §P6a).
+ */
+export function parseScopeMaxMode(value: unknown): Mode {
+  return isValidMode(value) ? value : "read_only";
+}
+
+/**
  * Risk of a mode, FAIL-CLOSED for any non-{@link Mode} value (plan §P6a; closes the
  * fail-open noted by the P5 reviewer). `MODE_RISK[unknown]` is `undefined`, and every
  * `>`/`<` comparison against `undefined` is `false`, so an unknown mode would slip past

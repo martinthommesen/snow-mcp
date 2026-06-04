@@ -55,7 +55,7 @@ function esc(v: string): string {
 
 function exactAllowlistNames(policy: ActorPolicy): string[] | undefined {
   const allow = policy.tables.allow;
-  if (!allow || allow.length === 0) return undefined;
+  if (!allow) return undefined;
   const names = allow.filter((rule): rule is string => typeof rule === "string");
   return names.length === allow.length ? [...new Set(names)].sort() : undefined;
 }
@@ -203,6 +203,9 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
   deps.runBudget.countRpcCall();
 
   const exactAllowlist = exactAllowlistNames(deps.actorPolicy);
+  if (exactAllowlist && exactAllowlist.length === 0) {
+    return { tables: [], partial: false };
+  }
   if (exactAllowlist && exactAllowlist.length > 0) {
     const rows: Record<string, unknown>[] = [];
     let partial = false;
@@ -223,9 +226,7 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
     return { tables, partial };
   }
 
-  const query = exactAllowlist && exactAllowlist.length > 0
-    ? `nameIN${exactAllowlist.map(esc).join(",")}^ORDERBYname`
-    : validFilter
+  const query = validFilter
       ? `nameLIKE${esc(validFilter)}^ORlabelLIKE${esc(validFilter)}`
       : "ORDERBYname";
   const q = tableListQuery(query);

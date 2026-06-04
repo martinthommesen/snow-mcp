@@ -66,7 +66,6 @@ export interface CallbackHandlerEnv {
   SNOW_OAUTH_CLIENT_ID?: string;
   SNOW_OAUTH_CLIENT_SECRET?: string;
   TOKEN_KEK_CURRENT?: string;
-  TOKEN_KEK?: string;
   TOKEN_KEK_PREV?: string;
   OAUTH_PROVIDER_SECRET?: string;
   SERVICENOW_CREDENTIAL_MODE?: "per_user_oauth" | "integration_user";
@@ -104,7 +103,7 @@ function configured(env: CallbackHandlerEnv): boolean {
       env.SNOW_OAUTH_CLIENT_ID &&
       env.SNOW_OAUTH_CLIENT_SECRET &&
       env.OAUTH_PROVIDER_SECRET &&
-      (env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK) &&
+      env.TOKEN_KEK_CURRENT &&
       canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN),
   );
 }
@@ -226,7 +225,7 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
     return textResponse("ServiceNow principal resolution failed.", 400);
   }
 
-  const ring = await buildKekRing((env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK)!, env.TOKEN_KEK_PREV);
+  const ring = await buildKekRing(env.TOKEN_KEK_CURRENT!, env.TOKEN_KEK_PREV);
   const tokStub = env.TOKEN_DO.get(env.TOKEN_DO.idFromName(`${record.userId}|${instanceHost}`));
   const store = new TokenStore(tokStub, ring, record.userId, instanceHost);
   let existing: SnTokens | null = null;

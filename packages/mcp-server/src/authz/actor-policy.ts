@@ -61,6 +61,7 @@ export function actorPolicyScopeFingerprint(policy: ActorPolicy): string {
   return JSON.stringify({
     allowedInstances: [...policy.allowedInstances].sort(),
     tables: {
+      allowConfigured: policy.tables.allow !== undefined,
       allow: sortedTableRules(policy.tables.allow),
       deny: sortedTableRules(policy.tables.deny),
     },
@@ -182,8 +183,8 @@ function parseRowFilters(value: string | undefined, label: string): Record<strin
   });
 }
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (value === undefined) return fallback;
+function parsePositiveInt(value: string | undefined, defaultValue: number): number {
+  if (value === undefined) return defaultValue;
   const n = Number(value);
   if (!Number.isInteger(n) || n < 1) {
     throw new Error(`ActorPolicy ceiling must be a positive integer, got: ${value}`);
@@ -205,14 +206,10 @@ function hasFlatPolicyConfig(env: PolicyEnv): boolean {
 /**
  * Load the host-side ActorPolicy from env config (P6b).
  *
- * DEFAULT DECISION (preserve the live single-operator deployment; mirror P4/P5's opt-in gates):
- * when NO policy config var is set, FALL BACK to the existing `permissivePolicy` so today's
- * deployment keeps working — we do NOT flip the runtime default to deny-all. When ANY policy var
- * IS provided, build a RESTRICTIVE policy from it (table allowlist + field masks + row filters +
+ * When NO policy config var is set, deny all tables. When ANY policy var is provided, build a
+ * restrictive policy from it (table allowlist + field masks + row filters +
  * per-run row/byte ceilings + max mode) and VALIDATE the configured rowFilters at load
  * (`assertPolicyRowFiltersSafe` → throws on a self-defeating `^NQ`/`^OR`/`^EQ` filter = fail-closed).
- * The recommended restrictive config ships as a DOCUMENTED EXAMPLE (.dev.vars.example), not as the
- * hardcoded runtime default.
  */
 export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPolicy {
   const allowlist = parseTableAllowlist(env.ACTOR_POLICY_TABLE_ALLOWLIST);
@@ -220,7 +217,7 @@ export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPoli
   const rowFilters = parseRowFilters(env.ACTOR_POLICY_ROW_FILTERS, "ACTOR_POLICY_ROW_FILTERS");
   const configured = hasFlatPolicyConfig(env);
 
-  if (!configured) return permissivePolicy([instanceHost]); // live single-operator default, unchanged.
+  if (!configured) return denyAllPolicy(instanceHost);
 
   // FAIL-CLOSED on the mode ceiling (P6b-2): validate the configured maxMode BEFORE building
   // the policy. assertActorPolicy compares `modeRisk(ctx.mode) > modeRisk(policy.maxMode)`, and
@@ -234,7 +231,7 @@ export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPoli
 
   const policy: ActorPolicy = {
     allowedInstances: [instanceHost],
-    tables: allowlist.length > 0 ? { allow: allowlist } : {},
+    tables: { allow: allowlist },
     fieldMasks,
     maxMode, // restrictive default: read_only unless raised (set-but-invalid coerced to read_only).
     maxRowsPerRun: parsePositiveInt(env.ACTOR_POLICY_MAX_ROWS_PER_RUN, 10_000),
@@ -250,7 +247,7 @@ export function loadActorPolicy(env: PolicyEnv, instanceHost: string): ActorPoli
 export function denyAllPolicy(instanceHost: string): ActorPolicy {
   return {
     allowedInstances: [instanceHost],
-    tables: { allow: [/^$/] },
+    tables: { allow: [] },
     fieldMasks: {},
     maxMode: "read_only",
     maxRowsPerRun: 1,
@@ -323,7 +320,7 @@ function compilePolicy(policy: ActorPolicy): CompiledPolicy {
     allowedInstances: new Set(policy.allowedInstances),
     deny: compileTableRules(policy.tables.deny),
     allow: compileTableRules(policy.tables.allow),
-    hasAllowRules: Boolean(policy.tables.allow && policy.tables.allow.length > 0),
+    hasAllowRules: policy.tables.allow !== undefined,
     masks,
   };
   compiledPolicies.set(policy, compiled);
@@ -497,6 +494,7 @@ function canonicalPolicy(policy: ActorPolicy): unknown {
   return {
     allowedInstances: [...policy.allowedInstances].sort(),
     tables: {
+      allowConfigured: policy.tables.allow !== undefined,
       allow: (policy.tables.allow ?? []).map(ruleKey).sort(),
       deny: (policy.tables.deny ?? []).map(ruleKey).sort(),
     },

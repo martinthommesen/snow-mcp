@@ -14,7 +14,7 @@ SNOW_DEV_ROPC_PASSWORD=""
 
 # --- MCP-client OAuth provider (§2.4) ---
 OAUTH_PROVIDER_SECRET=""             # signing/encryption secret for @cloudflare/workers-oauth-provider
-AUTH_MODE="operator_secret"          # "operator_secret" (pilot/dev) | "oidc" (enterprise identity)
+AUTH_MODE="operator_secret"          # "operator_secret" (pilot/dev only) | "oidc" (required in production)
 OIDC_ISSUER=""                       # issuer URL when AUTH_MODE=oidc
 OIDC_CLIENT_ID=""
 OIDC_CLIENT_SECRET=""
@@ -24,18 +24,16 @@ OIDC_GROUP_POLICY_MAP=""             # JSON: {"group":{"maxMode":"write","policy
 OIDC_DEFAULT_POLICY_NAME="default"
 
 # --- Encryption keys (§2.7, §7.7) ---
-TOKEN_KEK=""                         # one-release alias for TOKEN_KEK_CURRENT (P3 migration)
-SNAPSHOT_KEK=""                      # one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
-# Versioned KEK ring (P3): set CURRENT = today's passphrase on first deploy; rotate later by
-# moving CURRENT -> PREV and setting a new CURRENT (both decrypt during the window).
+# Versioned KEK ring (P3): set CURRENT on first deploy; rotate later by moving CURRENT -> PREV
+# and setting a new CURRENT (both decrypt during the window).
 TOKEN_KEK_CURRENT=""                 # AES-256-GCM KEK for TokenStoreDO token envelopes (current)
 TOKEN_KEK_PREV=""                    # accepted during a rotation window (optional)
 SNAPSHOT_KEK_CURRENT=""              # AES-256-GCM KEK for recovery snapshots (current)
 SNAPSHOT_KEK_PREV=""                 # accepted during a rotation window (optional)
 
 # --- Deployment posture + mode / credential config (P5/P6) ---
-DEPLOYMENT_PROFILE="pilot"           # "pilot" preserves today's permissive defaults; "production" enables fail-closed preflight
-SERVICENOW_CREDENTIAL_MODE=""        # "per_user_oauth" | "integration_user" (default integration_user)
+DEPLOYMENT_PROFILE="pilot"           # "pilot" preserves dev defaults; "production" requires OIDC + fail-closed preflight
+SERVICENOW_CREDENTIAL_MODE=""        # required: "per_user_oauth" | "integration_user" (production requires per_user_oauth)
 TENANT_MAX_MODE=""                   # mode ceiling: read_only | write | admin_script (default admin_script)
 INSTANCE_MAX_MODE=""                 # mode ceiling: read_only | write | admin_script (default admin_script)
 ALLOW_ADMIN_SCRIPT_CEILING=""        # production only: "true" deliberately permits an admin_script tenant/instance ceiling
@@ -53,8 +51,8 @@ ADMIN_SCRIPT_APPROVAL_TOKENS=""      # comma-separated valid approval tokens
 ADMIN_SCRIPT_REQUIRED_GROUP=""       # required access-group name (token OR group satisfies the second approval)
 
 # --- Restrictive ActorPolicy (§6b) ---
-# PILOT: leave ALL empty to keep the permissive single-operator default. PRODUCTION:
-# configure a restrictive host-side policy or the production posture preflight fails closed.
+# Leave ALL empty to deny all ServiceNow tables. Configure a restrictive host-side policy
+# before connecting the Worker to an instance; production posture preflight requires it.
 # The values below are a RECOMMENDED conservative example (commented out) — uncomment + tailor
 # per tenant. A self-defeating mandatory row filter (one containing ^NQ/^OR/^EQ) is REJECTED at load.
 # ACTOR_POLICY_TABLE_ALLOWLIST="incident,problem,change_request,task,sc_request"   # only these tables (whole-name match)
@@ -69,11 +67,11 @@ ADMIN_SCRIPT_REQUIRED_GROUP=""       # required access-group name (token OR grou
 # Mirror this value to the ServiceNow property `x_1793136_mcp.executor.hmac_secret` on the instance.
 X_MCP_EXECUTOR_HMAC_KEY=""
 
-# Single-operator consent secret for the MCP OAuth flow (§2.4)
+# Single-operator consent secret for the MCP OAuth flow (§2.4, pilot/dev only; unset in production)
 MCP_OPERATOR_SECRET=""
 MCP_OPERATOR_USER_ID=""              # required stable MCP actor subject for consent grants
 MCP_OPERATOR_EMAIL=""                # optional actor email stored in OAuth props / audit identity
 MCP_OPERATOR_ACCESS_GROUPS=""        # optional comma-separated groups for admin_script second approval
 
-# Executor endpoint path (instance-specific; global-scope APIs get a numeric namespace)
+# Executor endpoint path; production requires /api/(x|sn)_<scope>/x_mcp/executor/run.
 SNOW_EXECUTOR_PATH=""

@@ -1,4 +1,4 @@
-import { parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
+import { isValidMode, parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
 
 export type DeploymentProfile = "pilot" | "production";
 
@@ -12,14 +12,12 @@ export interface PostureEnv {
   WORKER_PUBLIC_ORIGIN?: string;
   MCP_OPERATOR_SECRET?: string;
   MCP_OPERATOR_USER_ID?: string;
-  TOKEN_KEK?: string;
   TOKEN_KEK_CURRENT?: string;
   OAUTH_PROVIDER_SECRET?: string;
   X_MCP_EXECUTOR_HMAC_KEY?: string;
   SNOW_EXECUTOR_VERIFIER_ATTESTED?: string;
   SNAPSHOT_ENABLED_TABLES?: string;
   SNAPSHOT_KV?: unknown;
-  SNAPSHOT_KEK?: string;
   SNAPSHOT_KEK_CURRENT?: string;
   ALLOW_LOCALHOST?: string;
   ALLOWED_ORIGINS?: string;
@@ -72,7 +70,6 @@ const coreBindings = [
   "CONSENT_RATE_DO",
 ] as const satisfies readonly (keyof PostureEnv)[];
 
-const modeSet = new Set(["read_only", "write", "admin_script"]);
 const scopedExecutorPath = /^\/api\/(x|sn)_[a-z0-9_]+\/x_mcp\/executor\/run$/;
 const actorPolicyTableNameRe = /^[a-z0-9_]{1,80}$/;
 const actorPolicyFieldNameRe = /^[a-z0-9_.]{1,80}$/;
@@ -83,10 +80,6 @@ export function parseDeploymentProfile(value: string | undefined): DeploymentPro
   const trimmed = value?.trim();
   if (trimmed === "pilot" || trimmed === "production") return trimmed;
   return undefined;
-}
-
-function isValidMode(value: unknown): value is Mode {
-  return typeof value === "string" && modeSet.has(value);
 }
 
 function hasText(value: string | undefined): boolean {
@@ -467,6 +460,9 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   } catch {
     violations.push('AUTH_MODE must be "operator_secret" or "oidc".');
   }
+  if (authMode !== undefined && authMode !== "oidc") {
+    violations.push('AUTH_MODE must be "oidc" in production.');
+  }
   if (!hasText(env.SNOW_OAUTH_CLIENT_ID)) violations.push("SNOW_OAUTH_CLIENT_ID is required in production.");
   if (!hasText(env.SNOW_OAUTH_CLIENT_SECRET)) violations.push("SNOW_OAUTH_CLIENT_SECRET is required in production.");
   if (!hasText(env.WORKER_PUBLIC_ORIGIN)) {
@@ -474,8 +470,10 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   } else if (!isCanonicalHttpsOrigin(env.WORKER_PUBLIC_ORIGIN)) {
     violations.push("WORKER_PUBLIC_ORIGIN must be a canonical HTTPS origin in production.");
   }
-  if (authMode === "oidc") {
-    if (hasText(env.MCP_OPERATOR_SECRET)) violations.push("MCP_OPERATOR_SECRET must be unset when AUTH_MODE=oidc.");
+  if (hasText(env.MCP_OPERATOR_SECRET)) {
+    violations.push("MCP_OPERATOR_SECRET must be unset in production; use AUTH_MODE=oidc.");
+  }
+  if (authMode !== undefined) {
     if (!hasText(env.OIDC_ISSUER)) {
       violations.push("OIDC_ISSUER is required when AUTH_MODE=oidc.");
     } else if (!isHttpsUrl(env.OIDC_ISSUER)) {
@@ -485,9 +483,6 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     if (!hasText(env.OIDC_CLIENT_SECRET)) violations.push("OIDC_CLIENT_SECRET is required when AUTH_MODE=oidc.");
     if (!hasText(env.OIDC_GROUP_POLICY_MAP)) violations.push("OIDC_GROUP_POLICY_MAP is required when AUTH_MODE=oidc.");
     validateOidcPolicyReferences(violations, env, actorPolicyNames);
-  } else if (authMode === "operator_secret") {
-    if (!hasText(env.MCP_OPERATOR_USER_ID)) violations.push("MCP_OPERATOR_USER_ID is required while operator-secret consent is active.");
-    requireStrongSecret(violations, "MCP_OPERATOR_SECRET", env.MCP_OPERATOR_SECRET);
   }
 
   const allowAdminScript = env.ALLOW_ADMIN_SCRIPT_CEILING === "true";
@@ -497,7 +492,7 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   validateModeCeiling(violations, "TENANT_MAX_MODE", env.TENANT_MAX_MODE, allowAdminScript);
   validateModeCeiling(violations, "INSTANCE_MAX_MODE", env.INSTANCE_MAX_MODE, allowAdminScript);
 
-  requireStrongSecret(violations, "TOKEN_KEK_CURRENT/TOKEN_KEK", env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK);
+  requireStrongSecret(violations, "TOKEN_KEK_CURRENT", env.TOKEN_KEK_CURRENT);
   requireStrongSecret(violations, "OAUTH_PROVIDER_SECRET", env.OAUTH_PROVIDER_SECRET);
   try {
     decodeFixedBase64Secret(env.X_MCP_EXECUTOR_HMAC_KEY, 32);
@@ -519,14 +514,14 @@ export function collectPostureViolations(env: PostureEnv): string[] {
 
   if (csv(env.SNAPSHOT_ENABLED_TABLES).length > 0) {
     if (!env.SNAPSHOT_KV) violations.push("SNAPSHOT_KV binding is required when SNAPSHOT_ENABLED_TABLES is set.");
-    if (!strongSecret(env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK)) {
-      violations.push("SNAPSHOT_KEK_CURRENT/SNAPSHOT_KEK must be a strong CSPRNG secret when SNAPSHOT_ENABLED_TABLES is set.");
+    if (!strongSecret(env.SNAPSHOT_KEK_CURRENT)) {
+      violations.push("SNAPSHOT_KEK_CURRENT must be a strong CSPRNG secret when SNAPSHOT_ENABLED_TABLES is set.");
     }
   }
 
   validatePinnedInstance(violations, env);
-  if (hasText(env.SNOW_EXECUTOR_PATH) && !scopedExecutorPath.test(env.SNOW_EXECUTOR_PATH!.trim())) {
-    violations.push("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run when configured.");
+  if (!hasText(env.SNOW_EXECUTOR_PATH) || !scopedExecutorPath.test(env.SNOW_EXECUTOR_PATH!.trim())) {
+    violations.push("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run in production.");
   }
   if (env.SNOW_DEV_ROPC === "1") violations.push("SNOW_DEV_ROPC must be disabled in production.");
 

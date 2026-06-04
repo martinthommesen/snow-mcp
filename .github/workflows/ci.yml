@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       run_live_gates:
-        description: "Run sub-prod live verifier and deployed e2e gates"
+        description: "Run sub-prod live scoped-executor verifier; production OIDC deployed e2e is pending"
         required: false
         default: "false"
         type: choice
@@ -88,7 +88,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   live-subprod-gates:
-    name: live sub-prod gates
+    name: live sub-prod scoped executor gate
     runs-on: ubuntu-latest
     needs: [local-gates]
     if: github.event_name == 'workflow_dispatch' && inputs.run_live_gates == 'true' && github.ref == 'refs/heads/main'
@@ -121,10 +121,3 @@ jobs:
           SNOW_DEV_ROPC_PASSWORD: ${{ secrets.SNOW_DEV_ROPC_PASSWORD }}
           X_MCP_EXECUTOR_HMAC_KEY: ${{ secrets.X_MCP_EXECUTOR_HMAC_KEY }}
           SNOW_EXECUTOR_PATH: ${{ secrets.SNOW_EXECUTOR_PATH }}
-
-      - name: Run deployed MCP e2e
-        run: npm run deploy:e2e
-        env:
-          WORKER_PUBLIC_ORIGIN: ${{ secrets.WORKER_PUBLIC_ORIGIN }}
-          MCP_OPERATOR_SECRET: ${{ secrets.MCP_OPERATOR_SECRET }}
-          MCP_OPERATOR_USER_ID: ${{ secrets.MCP_OPERATOR_USER_ID }}

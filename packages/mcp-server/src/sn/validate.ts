@@ -19,6 +19,8 @@ const TABLE_NAME = /^[a-z0-9_]{1,80}$/;
 const SYS_ID = /^[0-9a-f]{32}$/;
 const FIELD_NAME = /^[a-z0-9_.]{1,80}$/; // dot-walk allowed for reads (e.g. caller_id.name)
 const UPDATE_KEY = /^[a-z0-9_]{1,80}$/; // write targets: no dot-walk
+// Prototype-pollution-adjacent keys rejected for least-surprise (see validateUpdateFields).
+const RESERVED_UPDATE_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/;
 
 const REASON_MAX = 1024;
@@ -104,6 +106,10 @@ export function validateUpdateFields(fields: unknown): Record<string, unknown> {
   if (keys.length === 0) deny(`Update fields must not be empty.`);
   for (const k of keys) {
     if (!UPDATE_KEY.test(k)) deny(`Invalid update field name.`, { field: k });
+    // Reject reserved keys for least-surprise: they are not valid ServiceNow column names, and
+    // although canonicalObjectJson/JSON.stringify already neutralizes `__proto__` (it never
+    // reaches a prototype), rejecting them keeps the PATCH body unambiguous (finding M-3).
+    if (RESERVED_UPDATE_KEYS.has(k)) deny(`Update field name is reserved.`, { field: k });
   }
   return obj;
 }
@@ -150,8 +156,7 @@ export function validateDiscoveryFilter(filter: unknown): string | undefined {
  * Reject a caller-supplied encoded query that smuggles a structural operator
  * (`^NQ`/`^OR`/`^EQ`) when a restrictive mandatory `rowFilters[table]` is active — such
  * an operator would let the caller break out of the AND-ed mandatory filter. When no
- * mandatory filter applies (e.g. the permissive single-operator policy), the query is
- * left untouched.
+ * mandatory filter applies, the query is left untouched.
  */
 export function validateUserQuery(query: unknown, hasMandatoryFilter: boolean): string {
   if (query === undefined) return "";

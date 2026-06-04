@@ -19,12 +19,15 @@ function binding(): never {
 function productionEnv(overrides: Partial<PostureEnv> = {}): PostureEnv {
   return {
     DEPLOYMENT_PROFILE: "production",
+    AUTH_MODE: "oidc",
     SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
     SNOW_OAUTH_CLIENT_ID: "sn-client",
     SNOW_OAUTH_CLIENT_SECRET: "sn-secret",
     WORKER_PUBLIC_ORIGIN: "https://worker.example.com",
-    MCP_OPERATOR_SECRET: STRONG_SECRET,
-    MCP_OPERATOR_USER_ID: "operator-1",
+    OIDC_ISSUER: "https://idp.example.com",
+    OIDC_CLIENT_ID: "mcp-client",
+    OIDC_CLIENT_SECRET: "client-secret",
+    OIDC_GROUP_POLICY_MAP: "{\"admins\":\"write\"}",
     TOKEN_KEK_CURRENT: STRONG_SECRET,
     OAUTH_PROVIDER_SECRET: STRONG_SECRET,
     X_MCP_EXECUTOR_HMAC_KEY: STRONG_SECRET,
@@ -32,6 +35,7 @@ function productionEnv(overrides: Partial<PostureEnv> = {}): PostureEnv {
     INSTANCE_MAX_MODE: "write" as Mode,
     ALLOWED_ORIGINS: "https://app.example.com",
     SNOW_INSTANCE_HOST: "prod123.service-now.com",
+    SNOW_EXECUTOR_PATH: "/api/x_acme_mcp/x_mcp/executor/run",
     ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
     ACTOR_POLICY_MAX_MODE: "write" as Mode,
     LOADER: binding(),
@@ -158,12 +162,10 @@ describe("Phase 1B production posture", () => {
     expect(collectPostureViolations(productionEnv({
       TOKEN_KEK_CURRENT: "password",
       OAUTH_PROVIDER_SECRET: "also-password",
-      MCP_OPERATOR_SECRET: "operator-password",
       X_MCP_EXECUTOR_HMAC_KEY: "not-base64",
     }))).toEqual(expect.arrayContaining([
-      "TOKEN_KEK_CURRENT/TOKEN_KEK must be a strong CSPRNG secret.",
+      "TOKEN_KEK_CURRENT must be a strong CSPRNG secret.",
       "OAUTH_PROVIDER_SECRET must be a strong CSPRNG secret.",
-      "MCP_OPERATOR_SECRET must be a strong CSPRNG secret.",
       "X_MCP_EXECUTOR_HMAC_KEY must decode to exactly 32 bytes.",
     ]));
   });
@@ -207,11 +209,18 @@ describe("Phase 1B production posture", () => {
     }))).toEqual([]);
   });
 
-  it("requires OIDC config and rejects the operator secret when AUTH_MODE=oidc", () => {
+  it("requires OIDC enterprise identity and rejects the shared operator secret in production", () => {
     expect(collectPostureViolations(productionEnv({
-      AUTH_MODE: "oidc",
+      AUTH_MODE: "operator_secret",
+      MCP_OPERATOR_SECRET: STRONG_SECRET,
+      MCP_OPERATOR_USER_ID: "operator-1",
+      OIDC_ISSUER: undefined,
+      OIDC_CLIENT_ID: undefined,
+      OIDC_CLIENT_SECRET: undefined,
+      OIDC_GROUP_POLICY_MAP: undefined,
     }))).toEqual(expect.arrayContaining([
-      "MCP_OPERATOR_SECRET must be unset when AUTH_MODE=oidc.",
+      'AUTH_MODE must be "oidc" in production.',
+      "MCP_OPERATOR_SECRET must be unset in production; use AUTH_MODE=oidc.",
       "OIDC_ISSUER is required when AUTH_MODE=oidc.",
       "OIDC_CLIENT_ID is required when AUTH_MODE=oidc.",
       "OIDC_CLIENT_SECRET is required when AUTH_MODE=oidc.",
@@ -220,8 +229,6 @@ describe("Phase 1B production posture", () => {
 
     expect(collectPostureViolations(productionEnv({
       AUTH_MODE: "oidc ",
-      MCP_OPERATOR_SECRET: undefined,
-      MCP_OPERATOR_USER_ID: undefined,
       OIDC_ISSUER: "https://idp.example.com",
       OIDC_CLIENT_ID: "mcp-client",
       OIDC_CLIENT_SECRET: "client-secret",
@@ -233,16 +240,12 @@ describe("Phase 1B production posture", () => {
   it("rejects invalid AUTH_MODE values instead of applying operator-secret defaults", () => {
     expect(collectPostureViolations(productionEnv({
       AUTH_MODE: "oidcish",
-      MCP_OPERATOR_SECRET: undefined,
-      MCP_OPERATOR_USER_ID: undefined,
     }))).toContain('AUTH_MODE must be "operator_secret" or "oidc".');
   });
 
   it("validates OIDC group policy references against named ActorPolicies", () => {
     expect(collectPostureViolations(productionEnv({
       AUTH_MODE: "oidc",
-      MCP_OPERATOR_SECRET: undefined,
-      MCP_OPERATOR_USER_ID: undefined,
       OIDC_ISSUER: "https://idp.example.com",
       OIDC_CLIENT_ID: "mcp-client",
       OIDC_CLIENT_SECRET: "client-secret",
@@ -253,8 +256,6 @@ describe("Phase 1B production posture", () => {
   it("rejects malformed OIDC issuer URLs in production", () => {
     expect(collectPostureViolations(productionEnv({
       AUTH_MODE: "oidc",
-      MCP_OPERATOR_SECRET: undefined,
-      MCP_OPERATOR_USER_ID: undefined,
       OIDC_ISSUER: "http://idp.example.com",
       OIDC_CLIENT_ID: "mcp-client",
       OIDC_CLIENT_SECRET: "client-secret",
@@ -291,17 +292,20 @@ describe("Phase 1B production posture", () => {
       SNAPSHOT_KEK_CURRENT: "",
     }))).toEqual(expect.arrayContaining([
       "SNAPSHOT_KV binding is required when SNAPSHOT_ENABLED_TABLES is set.",
-      "SNAPSHOT_KEK_CURRENT/SNAPSHOT_KEK must be a strong CSPRNG secret when SNAPSHOT_ENABLED_TABLES is set.",
+      "SNAPSHOT_KEK_CURRENT must be a strong CSPRNG secret when SNAPSHOT_ENABLED_TABLES is set.",
     ]));
   });
 
   it("rejects legacy or malformed executor endpoint paths", () => {
     expect(collectPostureViolations(productionEnv({
+      SNOW_EXECUTOR_PATH: undefined,
+    }))).toContain("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run in production.");
+    expect(collectPostureViolations(productionEnv({
       SNOW_EXECUTOR_PATH: "/api/1793136/x_mcp/executor/run",
-    }))).toContain("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run when configured.");
+    }))).toContain("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run in production.");
     expect(collectPostureViolations(productionEnv({
       SNOW_EXECUTOR_PATH: "/api/x_mcp/executor/run",
-    }))).toContain("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run when configured.");
+    }))).toContain("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run in production.");
     expect(collectPostureViolations(productionEnv({
       SNOW_EXECUTOR_PATH: "/api/x_acme_mcp/x_mcp/executor/run",
     }))).toEqual([]);

@@ -7,7 +7,7 @@ import { isOriginAllowed, originDeniedResponse, type OriginConfig } from "./obse
 import { serviceNowCallbackHandler } from "./auth/servicenow-callback-handler.js";
 import { canonicalPublicOrigin } from "./auth/public-origin.js";
 import type { Mode } from "@servicenow-codemode/shared";
-import { isValidMode } from "@servicenow-codemode/shared";
+import { parseScopeMaxMode } from "@servicenow-codemode/shared";
 import { redactString } from "./observability/redact.js";
 import {
   assertProductionPostureOnce,
@@ -58,9 +58,7 @@ export interface Env {
   SNOW_OAUTH_CLIENT_SECRET?: string;
   SNOW_EXECUTOR_PATH?: string;
   X_MCP_EXECUTOR_HMAC_KEY?: string;
-  TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
   OAUTH_PROVIDER_SECRET?: string;
-  SNAPSHOT_KEK?: string; // one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
   // Versioned KEK ring (P3): current + optional previous, for both token + snapshot stores.
   TOKEN_KEK_CURRENT?: string;
   TOKEN_KEK_PREV?: string;
@@ -80,9 +78,8 @@ export interface Env {
   ADMIN_SCRIPT_ALLOWLIST?: string;
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string;
   ADMIN_SCRIPT_REQUIRED_GROUP?: string;
-  // Restrictive ActorPolicy (§6b). All optional: with NONE set the policy falls back to the
-  // permissive single-operator default (live deployment unchanged); set ANY to build a
-  // restrictive policy (table allowlist + field masks + row filters + per-run ceilings).
+  // Restrictive ActorPolicy (§6b). With none set the policy denies all tables; configure
+  // allowlists, field masks, row filters, and per-run ceilings before connecting ServiceNow.
   ACTOR_POLICY_TABLE_ALLOWLIST?: string;
   ACTOR_POLICY_FIELD_MASKS?: string;
   ACTOR_POLICY_ROW_FILTERS?: string;
@@ -183,6 +180,11 @@ export function authenticatedUserId(props: Record<string, unknown>): string | un
   return typeof userId === "string" && userId.trim() ? userId : undefined;
 }
 
+export function authenticatedGrantAllowedForDeploymentProfile(env: Pick<Env, "DEPLOYMENT_PROFILE">, props: Record<string, unknown>): boolean {
+  if (parseDeploymentProfile(env.DEPLOYMENT_PROFILE) !== "production") return true;
+  return props.authMode === "oidc" && typeof props.oidcSubject === "string" && props.oidcSubject.trim() !== "";
+}
+
 /** Authenticated MCP API handler. Reached ONLY after the OAuthProvider validates the
  *  client token; `ctx.props` carries the grant props (userId, scopes, maxMode). */
 const apiHandler = {
@@ -191,10 +193,13 @@ const apiHandler = {
       if (!isOriginAllowed(request, originConfig(env))) return originDeniedResponse();
       assertProductionPostureOnce(env as PostureEnv);
       const props = ((ctx as { props?: unknown }).props as Record<string, unknown>) ?? {};
+      if (!authenticatedGrantAllowedForDeploymentProfile(env, props)) {
+        return Response.json({ error: "invalid_auth_context" }, { status: 401 });
+      }
       // I-3: validate (not just null-coalesce) — a set-but-invalid maxMode falls back to read_only,
       // consistent with parseMaxMode/loadActorPolicy. modeRisk would already block escalation, but
       // this keeps the fail-closed posture uniform across every ceiling input.
-      const scopeMaxMode: Mode = isValidMode(props.maxMode) ? props.maxMode : "read_only";
+      const scopeMaxMode: Mode = parseScopeMaxMode(props.maxMode);
       const userId = authenticatedUserId(props);
       if (!userId) return Response.json({ error: "invalid_auth_context" }, { status: 401 });
       const workerOrigin = canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN);

@@ -259,7 +259,7 @@ function reauthRequired(message: string, authorizeUrl?: string): McpToolError {
  * or — for `integration_user` only — mint via ROPC if none.
  *
  * Mode-split (§6b):
- *  - `integration_user` (default): reuse → refresh → ROPC mint (shared credential, no per-user
+ *  - `integration_user`: reuse → refresh → ROPC mint (shared credential, no per-user
  *    principal). An undecryptable token is re-minted via ROPC (P3 fail-closed, no throw).
  *  - `per_user_oauth`: reuse → refresh → else `reauth_required` (NEVER ROPC). A missing,
  *    expired-unrefreshable, or undecryptable token raises `reauth_required` carrying
@@ -270,7 +270,7 @@ export async function getServiceNowBearer(
   cfg: SnOAuthConfig,
   store: TokenStore,
   now: number,
-  mode: CredentialMode = "integration_user",
+  mode: CredentialMode,
   authorizeUrl?: string,
 ): Promise<string> {
   // Fail-closed: an undecryptable stored token (e.g. after a botched KEK rotation) must not

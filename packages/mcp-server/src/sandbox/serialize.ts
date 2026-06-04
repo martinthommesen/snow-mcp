@@ -117,17 +117,17 @@ export function serializeResult(value: unknown, maxBytes: number): SerializedRes
     json = JSON.stringify(value === undefined ? null : value);
   } catch {
     const sanitized = sanitizeForJson(value);
-    let fallback: string;
+    let replacementJson: string;
     try {
-      fallback = JSON.stringify({
+      replacementJson = JSON.stringify({
         error: "result_not_serializable",
         ...(sanitized.path ? { path: sanitized.path } : {}),
         value: sanitized.value,
       });
     } catch {
-      fallback = JSON.stringify({ error: "result_not_serializable", ...(sanitized.path ? { path: sanitized.path } : {}) });
+      replacementJson = JSON.stringify({ error: "result_not_serializable", ...(sanitized.path ? { path: sanitized.path } : {}) });
     }
-    return cappedJsonText(fallback, maxBytes);
+    return cappedJsonText(replacementJson, maxBytes);
   }
   return cappedJsonText(json, maxBytes);
 }

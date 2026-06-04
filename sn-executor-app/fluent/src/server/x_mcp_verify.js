@@ -6,9 +6,9 @@
 // every signature (B1). scripts/executor-install.mjs installs the canonical file
 // directly, so this copy is for Fluent app source/deploy only.
 //
-// ⚠️ UNVERIFIED IN THIS BUILD — the in-scope HMAC + SHA-256 mechanism is Phase 0.13a
-//    (open). GlideCertificateEncryption.generateMac / GlideDigest.getSHA256Base64 must be
-//    proven on the target family before it ships (P8). See docs/OPEN_QUESTIONS.md.
+// Live verification is release evidence, not a source comment. Run
+// scripts/executor-scoped-verify.mjs on the target family/build and record the result in
+// docs/PRODUCTION_READINESS.md before enabling production executor use.
 //
 // CONTRACT (must byte-for-byte match the host signer in packages/mcp-server/src/auth/actor.ts):
 //   canonical = the ASCII-only encoder below, keys in THIS fixed order:
@@ -73,9 +73,8 @@ x_mcp_verify.prototype = {
   },
 
   _hmacBase64: function (key, message) {
-    // TODO(0.13a): confirm the exact in-scope HMAC API + key encoding on the target family.
-    // GlideCertificateEncryption.generateMac(key, algorithm, data) returns base64; key is
-    // typically base64-encoded. We mirror the host (raw-key HMAC-SHA256 -> base64).
+    // GlideCertificateEncryption.generateMac(key, algorithm, data) returns base64. The target
+    // family/build verifier gate proves this still matches the host signer before release.
     var mac = new GlideCertificateEncryption();
     return mac.generateMac(key, 'HmacSHA256', message); // base64 (may be null on bad input)
   },
@@ -93,7 +92,7 @@ x_mcp_verify.prototype = {
 
   // This instance's host name, used to reject cross-instance replay (plan §P7 item 3a).
   // `instance_name` is the PDI subdomain; the host signs the full FQDN, so compare on the
-  // subdomain prefix. instance.uri / glide.servlet.uri are fallbacks if unset.
+  // subdomain prefix and fail closed if the property is unreadable.
   _thisInstance: function () {
     return gs.getProperty('instance_name', '');
   },
@@ -116,10 +115,9 @@ x_mcp_verify.prototype = {
     if (!sig) return { verified: false };
 
     // (a) script binding.
-    // ⚠️ 0.13a seam: GlideDigest.getSHA256Base64(String) must hash the UTF-8 bytes of the
+    // GlideDigest.getSHA256Base64(String) must hash the UTF-8 bytes of the
     // input to match the host's WebCrypto SHA-256 over `TextEncoder().encode(input)` (UTF-8).
-    // If SN hashes UTF-16/Latin-1, non-ASCII scripts break signatures. Source-only here;
-    // proven on a live PDI at P8 (see docs/OPEN_QUESTIONS.md). ASCII scripts are unaffected.
+    // The target family/build verifier gate must cover this before release.
     var expectedHash = new GlideDigest().getSHA256Base64(String(script || ''));
     if (expectedHash !== String(actor.script_sha256 || '')) return { verified: false };
 

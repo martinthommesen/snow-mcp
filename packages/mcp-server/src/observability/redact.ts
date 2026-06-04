@@ -7,7 +7,11 @@ const TOKEN_PATTERNS: readonly RegExp[] = [
   /\beyJ[A-Za-z0-9._\-]{10,}/g, // JWT-ish
 ];
 
-const SECRET_ASSIGNMENT = /(^|[^A-Za-z0-9_.-])([A-Za-z0-9_.-]*(?:password|secret|token|api[_-]?key|authorization)[A-Za-z0-9_.-]*)\s*[=:]\s*[^\s,&"'}\]]+/gi;
+// Secret-assignment scrubber. The keyword set mirrors the secret families in DENY_FIELDS —
+// including `hmac`/`kek` (the executor HMAC key and the snapshot KEK, the two highest-value
+// secrets) — so free-form string logs scrub the same secrets the object redactor denies. The
+// key name + separator are preserved; only the value is replaced, for log readability.
+const SECRET_ASSIGNMENT = /(^|[^A-Za-z0-9_.-])([A-Za-z0-9_.-]*(?:password|secret|token|api[_-]?key|authorization|hmac|kek)[A-Za-z0-9_.-]*)(\s*[=:]\s*)[^\s,&"'}\]]+/gi;
 
 /** Field names whose VALUES are always redacted in objects (case-insensitive). */
 const DENY_FIELDS = new Set(
@@ -49,7 +53,7 @@ function isDeniedField(key: string): boolean {
 export function redactString(input: string): string {
   let out = input;
   for (const re of TOKEN_PATTERNS) out = out.replace(re, REDACTED);
-  out = out.replace(SECRET_ASSIGNMENT, (_match, prefix: string) => `${prefix}${REDACTED}`);
+  out = out.replace(SECRET_ASSIGNMENT, (_match, prefix: string, key: string, sep: string) => `${prefix}${key}${sep}${REDACTED}`);
   return out;
 }
 

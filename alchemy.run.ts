@@ -29,14 +29,13 @@ function reqEnv(k: string): string {
   return v;
 }
 
-const allowPilotDeploy = process.env.ALLOW_PILOT_DEPLOY === "1";
-if (process.env.DEPLOYMENT_PROFILE?.trim() !== "production" && !allowPilotDeploy) {
-  throw new Error('Alchemy deploy requires DEPLOYMENT_PROFILE="production"; use `npm run deploy:pilot` for pilot/dev profiles.');
+if (process.env.DEPLOYMENT_PROFILE?.trim() !== "production") {
+  throw new Error('Alchemy deploy requires DEPLOYMENT_PROFILE="production".');
 }
 
 const app = await alchemy("servicenow-codemode-mcp", {
   // Fail-closed (plan §P6a, finding 26): the Alchemy encrypted-state password MUST be the real
-  // OAUTH_PROVIDER_SECRET — never a hardcoded dev fallback. reqEnv throws when it is unset,
+  // OAUTH_PROVIDER_SECRET — never a hardcoded dev default. reqEnv throws when it is unset,
   // matching the Worker-secret bindings below (which already fail closed via reqEnv).
   password: reqEnv("OAUTH_PROVIDER_SECRET"),
 });
@@ -110,13 +109,10 @@ const bindings = {
       }
     : {}),
   X_MCP_EXECUTOR_HMAC_KEY: alchemy.secret(reqEnv("X_MCP_EXECUTOR_HMAC_KEY")),
-  // Token KEK ring (P3): require TOKEN_KEK_CURRENT (preferred) or legacy TOKEN_KEK and bind
-  // whichever are present. The host reads `TOKEN_KEK_CURRENT ?? TOKEN_KEK`, so a versioned-only
-  // config (no legacy alias) must still deploy. See alchemy.bindings.ts.
+  // Token KEK ring (P3): require TOKEN_KEK_CURRENT and pass TOKEN_KEK_PREV only during rotation.
   ...tokenKekBindings(process.env, (v) => alchemy.secret(v)),
   OAUTH_PROVIDER_SECRET: alchemy.secret(reqEnv("OAUTH_PROVIDER_SECRET")),
   ...(process.env.OIDC_CLIENT_SECRET ? { OIDC_CLIENT_SECRET: alchemy.secret(process.env.OIDC_CLIENT_SECRET) } : {}),
-  ...(process.env.SNAPSHOT_KEK ? { SNAPSHOT_KEK: alchemy.secret(process.env.SNAPSHOT_KEK) } : {}),
   ...(process.env.SNOW_OAUTH_CLIENT_SECRET ? { SNOW_OAUTH_CLIENT_SECRET: alchemy.secret(process.env.SNOW_OAUTH_CLIENT_SECRET) } : {}),
   ...(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS ? { ADMIN_SCRIPT_APPROVAL_TOKENS: alchemy.secret(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS) } : {}),
   // Versioned snapshot-KEK ring (P3). Optional until provisioned; never reqEnv yet so the
@@ -131,11 +127,9 @@ assertProductionPosture({
   ...bindings,
   MCP_OPERATOR_SECRET: process.env.MCP_OPERATOR_SECRET,
   X_MCP_EXECUTOR_HMAC_KEY: process.env.X_MCP_EXECUTOR_HMAC_KEY,
-  TOKEN_KEK: process.env.TOKEN_KEK,
   TOKEN_KEK_CURRENT: process.env.TOKEN_KEK_CURRENT,
   OAUTH_PROVIDER_SECRET: process.env.OAUTH_PROVIDER_SECRET,
   OIDC_CLIENT_SECRET: process.env.OIDC_CLIENT_SECRET,
-  SNAPSHOT_KEK: process.env.SNAPSHOT_KEK,
   SNAPSHOT_KEK_CURRENT: process.env.SNAPSHOT_KEK_CURRENT,
   SNOW_OAUTH_CLIENT_SECRET: process.env.SNOW_OAUTH_CLIENT_SECRET,
   ADMIN_SCRIPT_APPROVAL_TOKENS: process.env.ADMIN_SCRIPT_APPROVAL_TOKENS,

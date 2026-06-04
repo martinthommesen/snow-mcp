@@ -16,8 +16,7 @@ export interface RunBudgetLimits {
  * maxBytesPerRun — formerly DEAD fields (set, never read; CODE_REVIEW finding 11). There
  * is no `config.BUDGETS.perRun` operand for rows/bytes, so these are the SOLE per-run row
  * /byte caps (the literal "min(config, policy)" reduces to policy-only here). Default to
- * Number.POSITIVE_INFINITY so an unconfigured (permissive) RunBudget never trips — matching
- * the legacy observability-only behavior callers rely on.
+ * Number.POSITIVE_INFINITY when no row/byte caps are configured.
  */
 export interface RunBudgetCaps {
   maxRows?: number;

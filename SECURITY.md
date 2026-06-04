@@ -20,6 +20,8 @@ workaround, or risk acceptance. If a secret may have been exposed, rotate it fir
 
 ## Security Gates
 
-Before a production release, run the local gates in `.github/workflows/ci.yml`, then run the
-manual `live-subprod-gates` workflow against a non-PDI sub-production ServiceNow instance. Record
-the resulting evidence in `docs/PRODUCTION_READINESS.md`.
+Before a production release, run the local gates in `.github/workflows/ci.yml`, then run the `ci`
+workflow via manual dispatch with `run_live_gates=true` (the `live-subprod-gates` job) against a
+non-PDI sub-production ServiceNow instance. That live job currently verifies only the scoped
+ServiceNow executor. Production release remains blocked until an OIDC authorization-code deployed
+MCP E2E gate is added and recorded in `docs/PRODUCTION_READINESS.md`.

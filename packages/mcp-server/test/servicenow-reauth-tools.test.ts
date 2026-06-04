@@ -36,6 +36,7 @@ function perUserEnv(): HandlerEnv {
     TOKEN_KEK_CURRENT: "kek-passphrase",
     OAUTH_PROVIDER_SECRET: "host-secret",
     SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
+    ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
   };
 }
 
@@ -145,6 +146,32 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
     expect(networkCalls).toBe(0);
   });
 
+  it("an unset SERVICENOW_CREDENTIAL_MODE fails closed instead of selecting integration_user", async () => {
+    let networkCalls = 0;
+    vi.stubGlobal("fetch", (async () => {
+      networkCalls++;
+      return new Response(JSON.stringify({ result: [{ name: "incident", label: "Incident" }] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+
+    const handlers = buildHandlers(
+      {
+        LOADER: E.LOADER,
+        BUDGET_DO: E.BUDGET_DO,
+        SNOW_INSTANCE_HOST: "dev999.service-now.com",
+        SNOW_DEV_ROPC_USERNAME: "dev-user",
+        SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+      },
+      auth,
+    );
+    const res = await handlers.listTables({});
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as { code: string }).code).toBe("reauth_required");
+    expect(res.content[0]!.text).toContain("SERVICENOW_CREDENTIAL_MODE");
+    expect(networkCalls).toBe(0);
+  });
+
   it("dev Basic auth stays disabled when SNOW_DEV_ROPC is absent even if credentials are present", async () => {
     let networkCalls = 0;
     vi.stubGlobal("fetch", (async () => {
@@ -187,6 +214,8 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
         SNOW_DEV_ROPC: "0",
         SNOW_DEV_ROPC_USERNAME: "dev-user",
         SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
       },
       auth,
     );
@@ -213,6 +242,8 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
         SNOW_DEV_ROPC: "1",
         SNOW_DEV_ROPC_USERNAME: "dev-user",
         SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
       },
       auth,
     );
@@ -241,6 +272,8 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
         TOKEN_KEK_CURRENT: "kek-passphrase",
         SNOW_DEV_ROPC_USERNAME: "dev-user",
         SNOW_DEV_ROPC_PASSWORD: "dev-pass",
+        SERVICENOW_CREDENTIAL_MODE: "integration_user",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
       },
       auth,
     );
@@ -293,6 +326,7 @@ describe("§6b reauth_required surfaces on all three tools (per_user_oauth, no t
         SNOW_OAUTH_CLIENT_SECRET: "csec",
         TOKEN_KEK_CURRENT: "kek-passphrase",
         SERVICENOW_CREDENTIAL_MODE: "per_user_oauth",
+        ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
       },
       {
         userId: USER,
@@ -341,6 +375,7 @@ describe("§6b-1 buildHandlers resolves + persists the per-user principal at sig
       ADMIN_SCRIPT_ALLOWLIST: RESOLVE_USER,
       ADMIN_SCRIPT_REQUIRED_GROUP: "mcp-admins",
       MCP_OPERATOR_ACCESS_GROUPS: "mcp-admins",
+      ACTOR_POLICY_MAX_MODE: "admin_script",
     };
   }
   const resolveAuth = {
