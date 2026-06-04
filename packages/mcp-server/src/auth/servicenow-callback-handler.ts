@@ -33,6 +33,7 @@ import { buildKekRing } from "./crypto.js";
 import { redactString } from "../observability/redact.js";
 import { canonicalPublicOrigin } from "./public-origin.js";
 import type { AuthCorrelationRecord } from "../do/auth-correlation.js";
+import { RunBudget } from "../sn/run-budget.js";
 
 /** Minimal DO surface the routes need (test-injectable; real DOs satisfy these structurally). */
 interface AuthCorrelationStub {
@@ -53,12 +54,20 @@ interface TokenStoreNamespace {
   idFromName(name: string): DurableObjectId;
   get(id: DurableObjectId): TokenStoreStub;
 }
+interface BudgetStub {
+  increment(req: Record<string, number>, userId?: string): Promise<void>;
+}
+interface BudgetNamespace {
+  idFromName(name: string): DurableObjectId;
+  get(id: DurableObjectId): BudgetStub;
+}
 
 /** Env-like param for the routes (mirrors the auth-surface handler shape so it is unit-testable
  *  with real DO namespaces from `cloudflare:test` + an injectable `fetchImpl`). */
 export interface CallbackHandlerEnv {
   AUTH_DO: AuthCorrelationNamespace;
   TOKEN_DO: TokenStoreNamespace;
+  BUDGET_DO?: BudgetNamespace;
   // I-1: configured public origin for the OAuth redirect_uri. Required for per_user_oauth so the
   // redirect_uri never depends on the request Host.
   WORKER_PUBLIC_ORIGIN?: string;
@@ -112,6 +121,35 @@ function configured(env: CallbackHandlerEnv): boolean {
 
 function redirectUri(origin: string): string {
   return `${origin}/servicenow/callback`;
+}
+
+function utcDateKey(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function accrueCallbackBudget(env: CallbackHandlerEnv, userId: string, budget: RunBudget | undefined): Promise<void> {
+  if (!env.BUDGET_DO || !budget) return;
+  const snapshot = budget.snapshot();
+  if ((snapshot.serviceNowRequests ?? 0) === 0 && (snapshot.outboundBytesSent ?? 0) === 0) return;
+  try {
+    const ns = env.BUDGET_DO;
+    await ns.get(ns.idFromName(utcDateKey())).increment(
+      {
+        serviceNowRequests: snapshot.serviceNowRequests ?? 0,
+        outboundBytesSent: snapshot.outboundBytesSent ?? 0,
+      },
+      userId,
+    );
+  } catch (e) {
+    console.error(
+      JSON.stringify({
+        event: "servicenow_callback_budget_increment_failed",
+        severity: "alert",
+        note: "ServiceNow callback auth/principal traffic was not accrued to BUDGET_DO; request processing continued",
+        error: e instanceof Error ? e.message : String(e),
+      }),
+    );
+  }
 }
 
 function textResponse(body: string, status: number): Response {
@@ -212,47 +250,52 @@ async function handleCallback(request: Request, env: CallbackHandlerEnv): Promis
   const cfg = oauthConfig(env, instanceHost);
   const publicOrigin = canonicalPublicOrigin(env.WORKER_PUBLIC_ORIGIN)!;
   const now = Date.now();
-  let tokens;
+  const callbackBudget = env.BUDGET_DO ? new RunBudget() : undefined;
   try {
-    tokens = await authorizationCodeGrant(cfg, code, record.pkceVerifier, redirectUri(publicOrigin), now);
-  } catch (e) {
-    console.error("servicenow callback: code exchange failed:", redactString(e instanceof Error ? e.message : String(e)));
-    return textResponse("ServiceNow token exchange failed.", 400);
-  }
+    let tokens;
+    try {
+      tokens = await authorizationCodeGrant(cfg, code, record.pkceVerifier, redirectUri(publicOrigin), now, callbackBudget);
+    } catch (e) {
+      console.error("servicenow callback: code exchange failed:", redactString(e instanceof Error ? e.message : String(e)));
+      return textResponse("ServiceNow token exchange failed.", 400);
+    }
 
-  // Resolve + persist the SN principal alongside the token. Fail closed: a per-user token without
-  // a resolved ServiceNow sys_id cannot provide trustworthy admin_script attribution.
-  const principal = await resolveSnPrincipal(cfg, tokens.access_token);
-  if (!principal) {
-    return textResponse("ServiceNow principal resolution failed.", 400);
-  }
+    // Resolve + persist the SN principal alongside the token. Fail closed: a per-user token without
+    // a resolved ServiceNow sys_id cannot provide trustworthy admin_script attribution.
+    const principal = await resolveSnPrincipal(cfg, tokens.access_token, { budget: callbackBudget });
+    if (!principal) {
+      return textResponse("ServiceNow principal resolution failed.", 400);
+    }
 
-  const ring = await buildKekRing(env.TOKEN_KEK_CURRENT!, env.TOKEN_KEK_PREV);
-  const tokStub = env.TOKEN_DO.get(env.TOKEN_DO.idFromName(`${record.userId}|${instanceHost}`));
-  const store = new TokenStore(tokStub, ring, record.userId, instanceHost);
-  let existing: SnTokens | null = null;
-  try {
-    existing = await store.get("servicenow");
-  } catch (e) {
-    console.warn(JSON.stringify({
-      event: "servicenow_token_binding_unreadable",
-      userId: record.userId,
-      instanceHost,
-      reason: redactString(e instanceof Error ? e.message : String(e)),
-    }));
-  }
-  if (!principalMatchesBinding(principal, record, existing)) {
-    return textResponse("ServiceNow principal does not match the MCP actor binding.", 403);
-  }
+    const ring = await buildKekRing(env.TOKEN_KEK_CURRENT!, env.TOKEN_KEK_PREV);
+    const tokStub = env.TOKEN_DO.get(env.TOKEN_DO.idFromName(`${record.userId}|${instanceHost}`));
+    const store = new TokenStore(tokStub, ring, record.userId, instanceHost);
+    let existing: SnTokens | null = null;
+    try {
+      existing = await store.get("servicenow");
+    } catch (e) {
+      console.warn(JSON.stringify({
+        event: "servicenow_token_binding_unreadable",
+        userId: record.userId,
+        instanceHost,
+        reason: redactString(e instanceof Error ? e.message : String(e)),
+      }));
+    }
+    if (!principalMatchesBinding(principal, record, existing)) {
+      return textResponse("ServiceNow principal does not match the MCP actor binding.", 403);
+    }
 
-  tokens.sys_id = principal.sys_id;
-  tokens.roles = principal.roles;
-  if (principal.user_name) tokens.user_name = principal.user_name;
-  if (principal.email) tokens.email = principal.email;
-  tokens.principal_resolved_at = now;
-  await store.put("servicenow", tokens);
+    tokens.sys_id = principal.sys_id;
+    tokens.roles = principal.roles;
+    if (principal.user_name) tokens.user_name = principal.user_name;
+    if (principal.email) tokens.email = principal.email;
+    tokens.principal_resolved_at = now;
+    await store.put("servicenow", tokens);
 
-  return textResponse("ServiceNow authorization complete. You may close this window.", 200);
+    return textResponse("ServiceNow authorization complete. You may close this window.", 200);
+  } finally {
+    await accrueCallbackBudget(env, record.userId, callbackBudget);
+  }
 }
 
 /** Route the /servicenow/* surface. Returns null when the path is not one of ours (so the

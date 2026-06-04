@@ -70,7 +70,7 @@ export interface ServiceNowRpcDeps {
     hmacKey: Uint8Array;
     nonce: () => string;
     now: () => number;
-    resolveEffectiveUserSysId?: () => Promise<string>;
+    resolveEffectiveUserSysId?: (budget: RunBudget) => Promise<string>;
   };
   /** Executor endpoint path (instance-specific; global-scope APIs get a numeric namespace). */
   executorPath?: string;
@@ -153,7 +153,10 @@ export interface HostSignals {
  */
 function isPostSendUnknown(err: unknown): boolean {
   if (err instanceof McpToolError) {
-    if (err.code === "budget_exceeded" && err.detail?.dimension === "outboundBytesSent") return false;
+    if (
+      err.code === "budget_exceeded" &&
+      (err.detail?.dimension === "outboundBytesSent" || err.detail?.dimension === "serviceNowRequests")
+    ) return false;
     switch (err.code) {
       case "reauth_required":
       case "actor_policy_denied":
@@ -549,14 +552,7 @@ export class ServiceNowRPC {
     // Host-authoritative justification: the operator-supplied tool-level reason. Used for the
     // executor-side audit (P7) POST body, the requestHash, the approval context, and the host
     // audit row.
-    const sendScript = async (reason: string): Promise<unknown> => {
-      // §6b: in per_user_oauth, resolve the effective user's sys_id at sign time and bind it into
-      // the signed claims (the executor verifies it). Unresolved per-user attribution fails closed;
-      // integration_user has no resolver and keeps the base shared-credential claim.
-      const effectiveSysId = signing.resolveEffectiveUserSysId ? await signing.resolveEffectiveUserSysId() : "";
-      if (signing.resolveEffectiveUserSysId && !effectiveSysId) {
-        throw new McpToolError("reauth_required", "ServiceNow principal could not be resolved — re-authenticate.");
-      }
+    const sendScript = async (reason: string, effectiveSysId: string): Promise<unknown> => {
       const signed = await signActor({
         claims: effectiveSysId ? { ...signing.claims, snow_effective_user_sys_id: effectiveSysId } : signing.claims,
         script: args.script,
@@ -617,11 +613,21 @@ export class ServiceNowRPC {
         approvalToken: mutation.runContext.approvalToken,
       });
 
+    let effectiveSysId = "";
     const preflight = () => {
       approvalPreflight();
-      // Per-run SN-request budget for the executor POST — counted inside the normal preflight so
-      // completed idempotency replays re-check approval without burning a ServiceNow request slot.
-      this.deps.runBudget.countServiceNowRequest();
+      // §6b: in per_user_oauth, resolve the effective user's sys_id before the executor POST and
+      // bind it into the signed claims. Doing this in preflight keeps budget/reauth failures clean
+      // pre-send denials instead of poisoning the mutation ledger as indeterminate executor sends.
+      return Promise.resolve(signing.resolveEffectiveUserSysId?.(this.deps.runBudget) ?? "").then((resolved) => {
+        effectiveSysId = resolved;
+        if (signing.resolveEffectiveUserSysId && !effectiveSysId) {
+          throw new McpToolError("reauth_required", "ServiceNow principal could not be resolved — re-authenticate.");
+        }
+        // Per-run SN-request budget for the executor POST — counted inside the normal preflight so
+        // completed idempotency replays re-check approval without burning a ServiceNow request slot.
+        this.deps.runBudget.countServiceNowRequest();
+      });
     };
 
     const guarded = await guardMutation<unknown>(
@@ -644,7 +650,7 @@ export class ServiceNowRPC {
         // runServerScript is NON-RECOVERABLE (recovery/policy.ts) — no snapshot.
         effect: async () => {
           this.deps.runBudget.countOutboundBytes(outboundUpperBoundBytes);
-          return { result: replaySafeResult(await sendScript(reason)) };
+          return { result: replaySafeResult(await sendScript(reason, effectiveSysId)) };
         },
         isIndeterminate: isPostSendUnknown,
       },

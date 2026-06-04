@@ -136,6 +136,30 @@ describe("§6b authorize → callback stores a per-user token", () => {
     expect(tok?.principal_resolved_at).toEqual(expect.any(Number));
   });
 
+  it("accrues callback token-exchange and principal traffic to the daily budget", async () => {
+    const { fetchImpl } = mockSn();
+    const increments: Array<{ req: Record<string, number>; userId?: string }> = [];
+    const hEnv: CallbackHandlerEnv = {
+      ...handlerEnv(fetchImpl),
+      BUDGET_DO: {
+        idFromName: (name: string) => name as unknown as DurableObjectId,
+        get: () => ({
+          increment: async (req: Record<string, number>, userId?: string) => {
+            increments.push({ req, userId });
+          },
+        }),
+      },
+    };
+
+    const state = await authorize("userCallbackBudget", hEnv);
+    const res = await callback(state, hEnv);
+    expect(res!.status).toBe(200);
+    expect(increments).toHaveLength(1);
+    expect(increments[0]!.userId).toBe("userCallbackBudget");
+    expect(increments[0]!.req.serviceNowRequests).toBe(3);
+    expect(increments[0]!.req.outboundBytesSent).toBeGreaterThan(0);
+  });
+
   it("rejects a first-time binding when neither actor email nor expected sys_id is available", async () => {
     const { fetchImpl } = mockSn({
       principal: { user_sys_id: "EMAILLESS_SYS", user_name: "sn-user", email: "" },

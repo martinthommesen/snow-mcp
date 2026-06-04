@@ -20,7 +20,7 @@ import {
   type PolicyEnv,
 } from "../authz/actor-policy.js";
 import { McpToolError, toToolResult } from "../sn/errors.js";
-import { RunBudget } from "../sn/run-budget.js";
+import { RunBudget, type ServiceNowRequestBudget } from "../sn/run-budget.js";
 import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
 import { SchemaCache, roleHash, type SchemaCachePrincipalIdentity } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
@@ -148,7 +148,7 @@ export interface AuthContext {
   /** ServiceNow principal identity for the SchemaCache key (§6b). */
   schemaIdentity?: SchemaCachePrincipalIdentity;
   /** Lazy schema identity resolver. Non-schema calls should not pay a TokenStore read. */
-  schemaIdentityResolver?: () => Promise<SchemaCachePrincipalIdentity | undefined>;
+  schemaIdentityResolver?: (budget?: ServiceNowRequestBudget) => Promise<SchemaCachePrincipalIdentity | undefined>;
   /** Lazy, zero-network resolver used to check SchemaCache hits before spending discovery budget. */
   schemaIdentityFreshResolver?: () => Promise<SchemaCachePrincipalIdentity | undefined>;
 }
@@ -207,7 +207,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   let http: SnHttpClient;
   let oauthStore: (() => Promise<TokenStore>) | undefined;
   let oauthCfg: SnOAuthConfig | undefined;
-  let requestAuthorization: (() => Promise<string>) | undefined;
+  let requestAuthorization: ((budget?: ServiceNowRequestBudget) => Promise<string>) | undefined;
   let perUserConfigurationError: string | undefined;
   let authorizeUrlPromise: Promise<string | undefined> | undefined;
   const reauthAuthorizeUrl = (): Promise<string | undefined> => {
@@ -262,10 +262,10 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       return storePromise;
     };
     let authorizationPromise: Promise<string> | undefined;
-    requestAuthorization = (): Promise<string> => {
+    requestAuthorization = (budget?: ServiceNowRequestBudget): Promise<string> => {
       authorizationPromise ??= (async () => {
         const store = await oauthStore!();
-        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), serviceNowCredentialMode!, await reauthAuthorizeUrl()));
+        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), serviceNowCredentialMode!, await reauthAuthorizeUrl(), budget));
       })();
       return authorizationPromise;
     };
@@ -371,11 +371,12 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // resolve); if absent or stale, resolves it live with the current bearer and persists it. Only
   // in per_user_oauth — integration_user has no per-user principal (stays "").
   const resolveEffectiveSysId = oauthReady && oauthStore && oauthCfg && credentialMode === "per_user_oauth"
-    ? async (): Promise<string> => {
+    ? async (budget?: ServiceNowRequestBudget): Promise<string> => {
         const store = await oauthStore!();
-        const authorization = requestAuthorization ? await requestAuthorization() : "";
+        const authorization = requestAuthorization ? await requestAuthorization(budget) : "";
         const principal = await resolveStoredSnPrincipal(oauthCfg!, store, Date.now(), {
           accessToken: authorization.replace(/^Bearer\s+/i, ""),
+          budget,
         });
         return principal?.sys_id ?? "";
       }
@@ -517,7 +518,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun }),
     buildRpc: (effectiveMode: Mode, runBudget: RunBudget, runContext: RunContext) =>
       new ServiceNowRPC({
-        http, instanceHost, effectiveMode, actorPolicy: policy, runBudget,
+        http: budgetedHttp(runBudget), instanceHost, effectiveMode, actorPolicy: policy, runBudget,
         ...(signing ? { signing, executorPath: env.SNOW_EXECUTOR_PATH! } : {}),
         mutation: buildMutationDeps(runContext),
       }),
@@ -530,8 +531,14 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     return new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun });
   }
 
+  function budgetedHttp(runBudget: ServiceNowRequestBudget): SnHttpClient {
+    return {
+      request: (req) => http.request({ ...req, budget: runBudget }),
+    };
+  }
+
   function discoveryDeps(runBudget: RunBudget): DiscoveryDeps {
-    return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget, credentialMode: serviceNowCredentialMode };
+    return { http: budgetedHttp(runBudget), instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget, credentialMode: serviceNowCredentialMode };
   }
 
   async function runDiscoveryWithBudget<T>(runBudget: RunBudget, fn: () => Promise<T>): Promise<T> {
@@ -552,7 +559,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     }
     try {
       if (requestAuthorization) {
-        await requestAuthorization();
+        await requestAuthorization(runBudget);
       }
       return await fn();
     } finally {
@@ -579,17 +586,17 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // for this request rather than keying ACL-filtered schema under the wrong identity.
   let schemaCachePromise: Promise<SchemaCache | undefined> | undefined;
   let freshSchemaCachePromise: Promise<SchemaCache | undefined> | undefined;
-  async function schemaCacheIdentity(freshOnly: boolean): Promise<SchemaCachePrincipalIdentity | undefined> {
+  async function schemaCacheIdentity(freshOnly: boolean, runBudget?: ServiceNowRequestBudget): Promise<SchemaCachePrincipalIdentity | undefined> {
     if (auth.schemaIdentity) return auth.schemaIdentity;
     if (freshOnly) {
       if (auth.schemaIdentityFreshResolver) return auth.schemaIdentityFreshResolver();
       return auth.schemaIdentityResolver ? undefined : { principalId: userId, roleHash: "default" };
     }
-    return auth.schemaIdentityResolver ? auth.schemaIdentityResolver() : { principalId: userId, roleHash: "default" };
+    return auth.schemaIdentityResolver ? auth.schemaIdentityResolver(runBudget) : { principalId: userId, roleHash: "default" };
   }
-  async function buildSchemaCache(freshOnly: boolean): Promise<SchemaCache | undefined> {
+  async function buildSchemaCache(freshOnly: boolean, runBudget?: ServiceNowRequestBudget): Promise<SchemaCache | undefined> {
     if (!env.SCHEMA_KV) return undefined;
-    const identity = await schemaCacheIdentity(freshOnly);
+    const identity = await schemaCacheIdentity(freshOnly, runBudget);
     return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity, policyHash: await actorPolicyHash(policy) }) : undefined;
   }
   async function buildFreshSchemaCache(): Promise<SchemaCache | undefined> {
@@ -604,18 +611,18 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       throw e;
     }
   }
-  const schemaCache = (opts: { freshOnly?: boolean } = {}): Promise<SchemaCache | undefined> => {
+  const schemaCache = (opts: { freshOnly?: boolean; runBudget?: ServiceNowRequestBudget } = {}): Promise<SchemaCache | undefined> => {
     if (opts.freshOnly) {
       return freshSchemaCachePromise ?? buildFreshSchemaCache();
     }
-    schemaCachePromise ??= buildSchemaCache(false);
+    schemaCachePromise ??= buildSchemaCache(false, opts.runBudget);
     return schemaCachePromise;
   };
 
   async function budgetedDescribeTable(table: string): Promise<{ fields: Awaited<ReturnType<typeof describeTable>>; cached: boolean }> {
     const runBudget = makeDiscoveryRunBudget();
     return runDiscoveryWithBudget(runBudget, async () => {
-      const cache = await schemaCache();
+      const cache = await schemaCache({ runBudget });
       const fetcher = () => describeTable(discoveryDeps(runBudget), table);
       return cache ? cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
     });
@@ -624,7 +631,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   async function budgetedListTables(filter: string | undefined): Promise<Awaited<ReturnType<typeof listTables>> & { cached: boolean }> {
     const runBudget = makeDiscoveryRunBudget();
     return runDiscoveryWithBudget(runBudget, async () => {
-      const cache = await schemaCache();
+      const cache = await schemaCache({ runBudget });
       const fetcher = () => listTables(discoveryDeps(runBudget), filter);
       return cache ? cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
     });
@@ -685,7 +692,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
 export async function resolveSchemaIdentity(
   env: HandlerEnv,
   userId: string,
-  opts: { freshOnly?: boolean } = {},
+  opts: { freshOnly?: boolean; budget?: ServiceNowRequestBudget } = {},
 ): Promise<SchemaCachePrincipalIdentity | undefined> {
   const tokenKekSecret = env.TOKEN_KEK_CURRENT;
   const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
@@ -716,6 +723,7 @@ export async function resolveSchemaIdentity(
         },
         store,
         Date.now(),
+        { budget: opts.budget },
       );
     if (!principal) return undefined;
     const roles = principal.roles;

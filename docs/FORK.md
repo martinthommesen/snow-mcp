@@ -109,9 +109,10 @@ shared operator-secret consent flow:
   ID token also carries `email_verified=true`. IdPs that omit verified email can still authenticate
   the MCP user by `sub`, but first-time per-user ServiceNow linking needs an admin-seeded expected
   ServiceNow sys_id/token or an IdP configuration change that emits a verified email.
-- `ACTOR_POLICIES_JSON` — optional named ActorPolicies selected from the OIDC group mapping. Include
-  a restrictive `"default"` entry if OIDC groups should fall back to a usable default policy. If no
-  flat `ACTOR_POLICY_*` default and no JSON `"default"` are configured, the implicit default is
+- `ACTOR_POLICIES_JSON` — optional named ActorPolicies selected from the OIDC group mapping. Set
+  `OIDC_DEFAULT_POLICY_NAME` to a restrictive named policy when OIDC groups should fall back to a
+  usable default without requiring a literal `"default"` entry. If neither a flat
+  `ACTOR_POLICY_*` default nor the referenced named default is configured, the implicit default is
   deny-all; a grant naming any other missing policy is also deny-all.
 
 In `DEPLOYMENT_PROFILE=production`, leave `MCP_OPERATOR_SECRET` unset. The production preflight
@@ -134,9 +135,10 @@ rejects the shared-secret path entirely so it cannot remain accidentally enabled
 > `admin_script` is **default-deny**. `run_code` in `admin_script` mode is rejected
 > (`capability_denied`) unless the acting MCP user is in `ADMIN_SCRIPT_ALLOWLIST`. `read_only` and
 > `write` modes are unaffected. Leaving the `ACTOR_POLICY_*` vars empty denies all ServiceNow
-> tables. Configure a restrictive default ActorPolicy via the flat `ACTOR_POLICY_*` vars or an
-> explicit JSON `"default"` policy before connecting the Worker to an instance; production posture
-> preflight rejects deploy/boot without one.
+> tables. Configure a restrictive ActorPolicy for the policy that OIDC can select (the flat
+> `ACTOR_POLICY_*` default, a JSON `"default"` policy, or the policy named by
+> `OIDC_DEFAULT_POLICY_NAME`) before connecting the Worker to an instance; production posture
+> preflight rejects deploy/boot when the selected policy has no table allowlist.
 > If you use `ADMIN_SCRIPT_APPROVAL_TOKENS`, generate each token with `openssl rand -base64 32`;
 > production posture rejects weak approval tokens and the runtime caps incoming token length.
 > Production posture also rejects `ALLOW_ADMIN_SCRIPT_CEILING=true` unless

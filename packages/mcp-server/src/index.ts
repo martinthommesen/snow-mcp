@@ -212,7 +212,7 @@ const apiHandler = {
         scopeMaxMode,
         props,
         ...(workerOrigin ? { workerOrigin } : {}),
-        schemaIdentityResolver: () => resolveSchemaIdentity(env, userId),
+        schemaIdentityResolver: (budget) => resolveSchemaIdentity(env, userId, { budget }),
         schemaIdentityFreshResolver: () => resolveSchemaIdentity(env, userId, { freshOnly: true }),
       })), {
         authContext: { props },

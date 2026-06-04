@@ -13,6 +13,7 @@ import {
 import { TokenStore } from "../src/auth/token-store.js";
 import { McpToolError } from "../src/sn/errors.js";
 import type { KekRing } from "../src/auth/crypto.js";
+import { RunBudget } from "../src/sn/run-budget.js";
 
 // ─── §2.8 / §7.5 — ServiceNow OAuth token mint / reuse / refresh ──────────────
 interface TestEnv { TOKEN_DO: DurableObjectNamespace<import("../src/do/token-store.js").TokenStoreDO>; }
@@ -81,9 +82,12 @@ describe("§2.8 getServiceNowBearer", () => {
 
   it("exchanges authorization-code tokens with redirect following disabled", async () => {
     const { fetchImpl, calls } = mockFetch({ authorization_code: { access_token: "AT-CODE", expires_in: 1800 } });
-    const tok = await authorizationCodeGrant(baseCfg(fetchImpl), "code-1", "verifier-1", "https://worker/cb", 1000);
+    const budget = new RunBudget();
+    const tok = await authorizationCodeGrant(baseCfg(fetchImpl), "code-1", "verifier-1", "https://worker/cb", 1000, budget);
     expect(tok.access_token).toBe("AT-CODE");
     expect(calls).toEqual([{ grant: "authorization_code", redirect: "manual" }]);
+    expect(budget.serviceNowRequests).toBe(1);
+    expect(budget.outboundBytesSent).toBeGreaterThan(0);
   });
 
   it("aborts a hung token endpoint instead of waiting forever", async () => {
@@ -177,6 +181,19 @@ describe("§6b getServiceNowBearer — per_user_oauth missing token reauths (nev
     expect(after?.roles).toEqual(["itil"]);
     expect(after?.principal_resolved_at).toBe(1_000);
   });
+
+  it("per_user_oauth: a failed token refresh is still charged to the host-side budget", async () => {
+    const s = store("oaRefreshBudget");
+    await s.put("servicenow", { access_token: "OLD", refresh_token: "RT", expires_at: 1_000 });
+    const { fetchImpl, calls } = mockFetch({ refresh_token: { error: "invalid_grant" } });
+    const budget = new RunBudget();
+    const err = await getServiceNowBearer(baseCfg(fetchImpl), s, 5_000, "per_user_oauth", undefined, budget).catch((e) => e);
+    expect(err).toBeInstanceOf(McpToolError);
+    expect((err as McpToolError).code).toBe("reauth_required");
+    expect(calls).toEqual([{ grant: "refresh_token", redirect: "manual" }]);
+    expect(budget.serviceNowRequests).toBe(1);
+    expect(budget.outboundBytesSent).toBeGreaterThan(0);
+  });
 });
 
 describe("§6b resolveStoredSnPrincipal freshness", () => {
@@ -230,6 +247,36 @@ describe("§6b resolveStoredSnPrincipal freshness", () => {
       roles: ["admin"],
       principal_resolved_at: now,
     });
+  });
+
+  it("charges current-user and role lookups to the supplied host-side budget", async () => {
+    const s = store("oaPrincipalBudget");
+    const now = 1_000_000;
+    await s.put("servicenow", {
+      access_token: "AT",
+      refresh_token: "RT",
+      expires_at: now + 60_000,
+      sys_id: "OLD_SYS",
+      roles: ["old_role"],
+      principal_resolved_at: now - SN_PRINCIPAL_TTL_MS - 1,
+    });
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      expect((init?.headers as Record<string, string>).authorization).toBe("Bearer AT");
+      if (url.includes("/api/now/ui/user/current_user")) {
+        return new Response(JSON.stringify({ result: { user_sys_id: "BUDGET_SYS" } }), { headers: { "content-type": "application/json" } });
+      }
+      if (url.includes("/api/now/table/sys_user_has_role")) {
+        return new Response(JSON.stringify({ result: [{ "role.name": "itil" }, { "role.name": "admin" }] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const budget = new RunBudget();
+    const principal = await resolveStoredSnPrincipal(baseCfg(fetchImpl), s, now, { accessToken: "AT", budget });
+    expect(principal).toEqual({ sys_id: "BUDGET_SYS", roles: ["itil", "admin"] });
+    expect(budget.serviceNowRequests).toBe(2);
+    expect(budget.outboundBytesSent).toBeGreaterThan(0);
   });
 });
 

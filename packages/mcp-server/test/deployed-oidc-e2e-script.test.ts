@@ -15,7 +15,11 @@ describe("production deployed OIDC E2E script", () => {
     expect(scriptText).toContain("negative OIDC code-injection attempt is rejected");
     expect(scriptText).toContain("OIDC auth-code + MCP PKCE exchange issues an access token");
     expect(scriptText).toContain("MCP refresh-token exchange reissues an access token");
-    expect(scriptText).toContain("refreshed token reflects group-policy downgrade/removal and denies write");
+    expect(scriptText).toContain("refreshed token denies write under current OIDC policy");
+  });
+
+  it("does not auto-click a generic No button by default", () => {
+    expect(scriptText).not.toContain('button:has-text("No")');
   });
 
   it("fails closed if the operator-secret path is accidentally configured", () => {

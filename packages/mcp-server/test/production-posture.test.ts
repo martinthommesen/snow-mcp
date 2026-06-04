@@ -92,13 +92,13 @@ describe("Phase 1B production posture", () => {
     expect(collectPostureViolations(productionEnv())).toEqual([]);
   });
 
-  it("requires a restrictive default ActorPolicy table allowlist in production", () => {
+  it("requires a restrictive table allowlist on the OIDC default ActorPolicy in production", () => {
     expect(collectPostureViolations(productionEnv({
       ACTOR_POLICY_TABLE_ALLOWLIST: undefined,
       ACTOR_POLICIES_JSON: JSON.stringify({
         admin: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident", ACTOR_POLICY_MAX_MODE: "write" },
       }),
-    }))).toContain("ActorPolicy default table allowlist must be set in production.");
+    }))).toContain('Referenced ActorPolicy "default" table allowlist must be set in production.');
   });
 
   it("accepts an explicit restrictive JSON default ActorPolicy in production", () => {
@@ -108,6 +108,21 @@ describe("Phase 1B production posture", () => {
       ACTOR_POLICIES_JSON: JSON.stringify({
         default: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident", ACTOR_POLICY_MAX_MODE: "read_only" },
         admin: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident,problem", ACTOR_POLICY_MAX_MODE: "write" },
+      }),
+    }))).toEqual([]);
+  });
+
+  it("accepts a named restrictive OIDC default ActorPolicy without forcing a literal default policy", () => {
+    expect(collectPostureViolations(productionEnv({
+      ACTOR_POLICY_TABLE_ALLOWLIST: undefined,
+      ACTOR_POLICY_MAX_MODE: undefined,
+      OIDC_DEFAULT_POLICY_NAME: "reader",
+      OIDC_GROUP_POLICY_MAP: JSON.stringify({
+        admins: { maxMode: "write", policy: "writer" },
+      }),
+      ACTOR_POLICIES_JSON: JSON.stringify({
+        reader: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident", ACTOR_POLICY_MAX_MODE: "read_only" },
+        writer: { ACTOR_POLICY_TABLE_ALLOWLIST: "incident,problem", ACTOR_POLICY_MAX_MODE: "write" },
       }),
     }))).toEqual([]);
   });
@@ -151,7 +166,7 @@ describe("Phase 1B production posture", () => {
     expect(err).toBeInstanceOf(ProductionPostureError);
     expect(err.violations.length).toBeGreaterThan(10);
     expect(err.violations).toEqual(expect.arrayContaining([
-      "ActorPolicy default table allowlist must be set in production.",
+      'Referenced ActorPolicy "default" table allowlist must be set in production.',
       "ALLOWED_ORIGINS must include at least one origin in production.",
       "BUDGET_DO binding is required in production.",
       "SNOW_INSTANCE_HOST must be pinned in production.",
@@ -232,6 +247,7 @@ describe("Phase 1B production posture", () => {
       OIDC_ISSUER: "https://idp.example.com",
       OIDC_CLIENT_ID: "mcp-client",
       OIDC_CLIENT_SECRET: "client-secret",
+      OIDC_DEFAULT_POLICY_NAME: "admin",
       OIDC_GROUP_POLICY_MAP: "{\"admins\":{\"maxMode\":\"write\",\"policy\":\"admin\"}}",
       ACTOR_POLICIES_JSON: "{\"admin\":{\"ACTOR_POLICY_TABLE_ALLOWLIST\":\"incident\",\"ACTOR_POLICY_MAX_MODE\":\"write\"}}",
     }))).toEqual([]);

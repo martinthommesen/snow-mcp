@@ -39,7 +39,6 @@ const CONTINUE_SELECTORS = [
   'button:has-text("Accept")',
   'button:has-text("Approve")',
   'button:has-text("Yes")',
-  'button:has-text("No")',
 ];
 
 let pass = 0;
@@ -458,7 +457,7 @@ async function assertMcpAuthenticated(config, token, label) {
 
 async function assertRefreshedWriteDenied(config, token) {
   if (!config.expectRefreshWriteDenied) {
-    skip("refresh group-policy downgrade/removal assertion", "OIDC_E2E_EXPECT_REFRESH_WRITE_DENIED=0");
+    skip("refresh write-denial assertion", "OIDC_E2E_EXPECT_REFRESH_WRITE_DENIED=0");
     return;
   }
   if (!config.scopes.includes("servicenow:write") && !config.scopes.includes("servicenow:admin_script")) {
@@ -473,7 +472,7 @@ async function assertRefreshedWriteDenied(config, token) {
       },
     });
     check(
-      "refreshed token reflects group-policy downgrade/removal and denies write",
+      "refreshed token denies write under current OIDC policy",
       out.isError === true && out.structuredContent?.code === "mode_not_permitted",
       JSON.stringify(out.structuredContent ?? {}).slice(0, 300),
     );

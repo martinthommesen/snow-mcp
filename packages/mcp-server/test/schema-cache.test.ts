@@ -5,6 +5,7 @@ import type { FieldInfo, ListTablesResult, TableInfo } from "../src/sn/discovery
 import { buildHandlers, resolveSchemaIdentity, type HandlerEnv } from "../src/tools/handlers.js";
 import { TokenStore } from "../src/auth/token-store.js";
 import { buildKekRing } from "../src/auth/crypto.js";
+import { BUDGETS } from "../src/config.js";
 
 // ─── §2.6 / S6 — user-aware schema cache ──────────────────────────────────────
 interface TestEnv {
@@ -654,7 +655,8 @@ describe("§6b resolveSchemaIdentity wiring", () => {
     expect(fetches).toBe(1);
     expect(reconciles).toHaveLength(1);
     expect(reconciles[0]!.userId).toBe(userId);
-    expect(reconciles[0]!.delta.serviceNowRequests).toBeLessThan(0);
+    expect(reconciles[0]!.delta.serviceNowRequests).toBe(1 - BUDGETS.perRun.serviceNowRequestLimit);
+    expect(reconciles[0]!.delta.outboundBytesSent).toBeGreaterThan(-BUDGETS.perRun.maxOutboundBytes);
     expect(reconciles[0]!.delta.outboundBytesSent).toBeLessThan(0);
   });
 

@@ -303,23 +303,28 @@ function validateActorPolicyEnv(violations: string[], label: string, policy: Rec
   validateActorPolicyMode(violations, `${label}.ACTOR_POLICY_MAX_MODE`, policy.ACTOR_POLICY_MAX_MODE);
 }
 
-function validateActorPolicy(violations: string[], env: PostureEnv): Set<string> {
+interface ActorPolicyValidation {
+  names: Set<string>;
+  tableAllowlists: Map<string, boolean>;
+}
+
+function validateActorPolicy(violations: string[], env: PostureEnv): ActorPolicyValidation {
   const policyNames = new Set<string>(["default"]);
+  const tableAllowlists = new Map<string, boolean>();
+  if (hasText(env.ACTOR_POLICY_TABLE_ALLOWLIST)) tableAllowlists.set("default", true);
   const namedPolicies = parseJsonObject(violations, "ACTOR_POLICIES_JSON", env.ACTOR_POLICIES_JSON);
   const jsonDefault = namedPolicies?.default;
   const jsonDefaultAllowlist = isRecord(jsonDefault) && typeof jsonDefault.ACTOR_POLICY_TABLE_ALLOWLIST === "string"
     ? jsonDefault.ACTOR_POLICY_TABLE_ALLOWLIST
     : undefined;
-  if (!hasText(env.ACTOR_POLICY_TABLE_ALLOWLIST) && !hasText(jsonDefaultAllowlist)) {
-    violations.push("ActorPolicy default table allowlist must be set in production.");
-  }
+  if (hasText(jsonDefaultAllowlist)) tableAllowlists.set("default", true);
   validateActorPolicyEnv(violations, "ACTOR_POLICY", env as Record<string, unknown>);
   if (namedPolicies) {
     for (const name of Object.keys(namedPolicies)) {
       if (/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) policyNames.add(name);
     }
   }
-  if (!namedPolicies) return policyNames;
+  if (!namedPolicies) return { names: policyNames, tableAllowlists };
   for (const [name, policy] of Object.entries(namedPolicies)) {
     if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) {
       violations.push(`ACTOR_POLICIES_JSON contains invalid policy name "${name}".`);
@@ -334,15 +339,16 @@ function validateActorPolicy(violations: string[], env: PostureEnv): Set<string>
       violations.push(`ACTOR_POLICIES_JSON.${name} must configure at least one ACTOR_POLICY_* setting.`);
     }
     const tableAllowlist = typeof policy.ACTOR_POLICY_TABLE_ALLOWLIST === "string" ? policy.ACTOR_POLICY_TABLE_ALLOWLIST : undefined;
+    if (hasText(tableAllowlist)) tableAllowlists.set(name, true);
     if (!hasText(tableAllowlist)) {
       violations.push(`ACTOR_POLICIES_JSON.${name}.ACTOR_POLICY_TABLE_ALLOWLIST must be set in production.`);
     }
     validateActorPolicyEnv(violations, `ACTOR_POLICIES_JSON.${name}`, policy);
   }
-  return policyNames;
+  return { names: policyNames, tableAllowlists };
 }
 
-function validateOidcPolicyReferences(violations: string[], env: PostureEnv, policyNames: ReadonlySet<string>): void {
+function validateOidcPolicyReferences(violations: string[], env: PostureEnv, policyNames: ReadonlySet<string>): Set<string> {
   const defaultPolicy = env.OIDC_DEFAULT_POLICY_NAME?.trim() || "default";
   const referenced = new Set<string>([defaultPolicy]);
   const groupMap = parseJsonObject(violations, "OIDC_GROUP_POLICY_MAP", env.OIDC_GROUP_POLICY_MAP);
@@ -368,6 +374,20 @@ function validateOidcPolicyReferences(violations: string[], env: PostureEnv, pol
   for (const policyName of referenced) {
     if (!policyNames.has(policyName)) {
       violations.push(`OIDC_GROUP_POLICY_MAP references unknown ActorPolicy "${policyName}".`);
+    }
+  }
+  return referenced;
+}
+
+function validateReferencedActorPolicyAllowlists(
+  violations: string[],
+  referenced: ReadonlySet<string>,
+  actorPolicies: ActorPolicyValidation,
+): void {
+  for (const policyName of referenced) {
+    if (!actorPolicies.names.has(policyName)) continue;
+    if (!actorPolicies.tableAllowlists.get(policyName)) {
+      violations.push(`Referenced ActorPolicy "${policyName}" table allowlist must be set in production.`);
     }
   }
 }
@@ -412,7 +432,8 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     return [];
   }
 
-  const actorPolicyNames = validateActorPolicy(violations, env);
+  const actorPolicies = validateActorPolicy(violations, env);
+  let referencedActorPolicies = new Set<string>(["default"]);
 
   if (env.SERVICENOW_CREDENTIAL_MODE !== "per_user_oauth") {
     violations.push('SERVICENOW_CREDENTIAL_MODE must be "per_user_oauth" in production.');
@@ -445,8 +466,9 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     if (!hasText(env.OIDC_CLIENT_ID)) violations.push("OIDC_CLIENT_ID is required when AUTH_MODE=oidc.");
     if (!hasText(env.OIDC_CLIENT_SECRET)) violations.push("OIDC_CLIENT_SECRET is required when AUTH_MODE=oidc.");
     if (!hasText(env.OIDC_GROUP_POLICY_MAP)) violations.push("OIDC_GROUP_POLICY_MAP is required when AUTH_MODE=oidc.");
-    validateOidcPolicyReferences(violations, env, actorPolicyNames);
+    referencedActorPolicies = validateOidcPolicyReferences(violations, env, actorPolicies.names);
   }
+  validateReferencedActorPolicyAllowlists(violations, referencedActorPolicies, actorPolicies);
 
   const allowAdminScript = env.ALLOW_ADMIN_SCRIPT_CEILING === "true";
   if (allowAdminScript && env.SNOW_EXECUTOR_VERIFIER_ATTESTED !== "true") {
