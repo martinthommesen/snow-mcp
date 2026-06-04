@@ -8,7 +8,7 @@ import type { SnHttpClient } from "./http.js";
 import { McpToolError, throwMappedServiceNowError } from "./errors.js";
 import { requireCapability, SN_REQUEST_LIMITS, TABLE_PAGE_CAP } from "../config.js";
 import { assertActorPolicy, isFieldMasked, isTableAllowed, type ActorPolicy } from "../authz/actor-policy.js";
-import { validateDiscoveryFilter, validateTableName } from "./validate.js";
+import { TABLE_NAME_RE, validateDiscoveryFilter, validateTableName } from "./validate.js";
 import { utf8Len } from "../sandbox/serialize.js";
 import type { RunBudget } from "./run-budget.js";
 import type { Mode } from "@servicenow-codemode/shared";
@@ -44,10 +44,6 @@ export interface ListTablesResult {
   warning?: string;
 }
 
-// Mirror of the validate.ts table-name grammar; used to gate hierarchy parents so a
-// malformed super_class.name never reaches the `nameIN` join.
-const TABLE_NAME_RE = /^[a-z0-9_]{1,80}$/;
-
 function esc(v: string): string {
   // Encoded-query value sanitation: strip ^ and = which would break the query grammar.
   return v.replace(/[\^=]/g, "");
@@ -55,7 +51,7 @@ function esc(v: string): string {
 
 function exactAllowlistNames(policy: ActorPolicy): string[] | undefined {
   const allow = policy.tables.allow;
-  if (!allow || allow.length === 0) return undefined;
+  if (!allow) return undefined;
   const names = allow.filter((rule): rule is string => typeof rule === "string");
   return names.length === allow.length ? [...new Set(names)].sort() : undefined;
 }
@@ -203,6 +199,9 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
   deps.runBudget.countRpcCall();
 
   const exactAllowlist = exactAllowlistNames(deps.actorPolicy);
+  if (exactAllowlist && exactAllowlist.length === 0) {
+    return { tables: [], partial: false };
+  }
   if (exactAllowlist && exactAllowlist.length > 0) {
     const rows: Record<string, unknown>[] = [];
     let partial = false;
@@ -223,9 +222,7 @@ export async function listTables(deps: DiscoveryDeps, filter?: string): Promise<
     return { tables, partial };
   }
 
-  const query = exactAllowlist && exactAllowlist.length > 0
-    ? `nameIN${exactAllowlist.map(esc).join(",")}^ORDERBYname`
-    : validFilter
+  const query = validFilter
       ? `nameLIKE${esc(validFilter)}^ORlabelLIKE${esc(validFilter)}`
       : "ORDERBYname";
   const q = tableListQuery(query);

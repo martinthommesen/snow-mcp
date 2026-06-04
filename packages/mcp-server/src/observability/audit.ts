@@ -3,8 +3,14 @@
 // never the raw values. Pure host logic; the sink (DO/KV/log) is injected.
 
 import { redactValue } from "./redact.js";
+import type { ErrorCode } from "@servicenow-codemode/shared";
 
 export type MutationOp = "update" | "runServerScript";
+
+/** Audited error taxonomy: a typed {@link ErrorCode}, or that code suffixed `:indeterminate` for a
+ *  post-send-unknown outcome (a write that may have applied). A closed union so the durable audit
+ *  taxonomy cannot silently drift from ErrorCode. */
+export type AuditErrorClass = ErrorCode | `${ErrorCode}:indeterminate`;
 
 export interface AuditActor {
   mcpActorUserId: string;
@@ -38,7 +44,7 @@ export interface AuditRecord {
    *  at the same ordinal key by "ok" (success) or "error" (effect threw). A durable trail
    *  left at "intent" reads as an UNRESOLVED intent — never a false success (plan §P4). */
   status: "intent" | "ok" | "error" | "denied";
-  errorClass?: string;
+  errorClass?: AuditErrorClass;
 }
 
 const enc = new TextEncoder();
@@ -66,7 +72,7 @@ export interface BuildAuditInput {
   after?: unknown;
   reason?: string;
   status: AuditRecord["status"];
-  errorClass?: string;
+  errorClass?: AuditErrorClass;
 }
 
 /** Build an audit record, hashing before/after (no raw content stored). */

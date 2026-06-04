@@ -6,9 +6,9 @@
 
 > Per the Code Mode contract (see [`../DESIGN.md`](../DESIGN.md) § Architecture; original wording in [`../archive/DEVELOPMENT_PLAN.md`](../archive/DEVELOPMENT_PLAN.md) §3.4): "Phase 0.8 proves the exact `execute()` contract and the TS pipeline before this is built … Every sample then conforms to that one shape." This ADR is that shape, derived from the **installed** package, not from prose. Where the two differ, this ADR (and the installed package) win; differences are logged in `docs/DELTAS.md`.
 
-## Decision 1 — Primary pipeline confirmed; no worker-bundler fallback
+## Decision 1 — Primary pipeline confirmed; no worker-bundler alternate path
 
-The plan's **primary** path holds: `esbuild-wasm.transform(userTs) → JS string → DynamicWorkerExecutor.execute(jsString, providers)`. All six 0.8a assertions pass under workerd (see `test/sandbox-contract.test.ts`). **`@cloudflare/worker-bundler` is NOT installed and NOT needed** — the fallback in plan §2.2/§3.4 is not taken. Re-open only if a future codemode version rejects the transformed string.
+The plan's **primary** path holds: `esbuild-wasm.transform(userTs) → JS string → DynamicWorkerExecutor.execute(jsString, providers)`. All six 0.8a assertions pass under workerd (see `test/sandbox-contract.test.ts`). **`@cloudflare/worker-bundler` is NOT installed and NOT needed** — the alternate path in plan §2.2/§3.4 is not taken. Re-open only if a future codemode version rejects the transformed string.
 
 ## Decision 2 — The exact code shape the model writes
 

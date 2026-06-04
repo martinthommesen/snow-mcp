@@ -9,7 +9,7 @@
 // caller query for masked fields (assertQueryFieldsAllowed). runServerScript is TABLE-LESS, so it
 // applies the ActorPolicy MODE CEILING explicitly (H-1) — there is no table allowlist to run.
 // The enforcement is unit-verified locally against a mock
-// SnHttpClient; live ServiceNow behavior is not (see OPEN_QUESTIONS.md).
+// SnHttpClient; live ServiceNow behavior is not (see docs/DELTAS.md).
 //
 // NOTE: the plan writes `class ServiceNowRPC extends RpcTarget`. We expose plain
 // methods and hand `fns()` to codemode, whose ToolDispatcher is itself the RpcTarget
@@ -54,7 +54,7 @@ import {
 import type { AuditSink, AuditIdentity } from "./mutation-guard.js";
 import { assertAdminScriptApproved, type ApprovalContext } from "../authz/approval.js";
 import { recoverability } from "../recovery/policy.js";
-import { isReplaySafeWrapper, replaySafeResult } from "./replay-payload.js";
+import { isReplaySafeWrapper, replaySafeResult, visibleReplayResult } from "./replay-payload.js";
 
 export interface ServiceNowRpcDeps {
   http: SnHttpClient;
@@ -70,7 +70,7 @@ export interface ServiceNowRpcDeps {
     hmacKey: Uint8Array;
     nonce: () => string;
     now: () => number;
-    resolveEffectiveUserSysId?: () => Promise<string>;
+    resolveEffectiveUserSysId?: (budget: RunBudget) => Promise<string>;
   };
   /** Executor endpoint path (instance-specific; global-scope APIs get a numeric namespace). */
   executorPath?: string;
@@ -96,7 +96,7 @@ export interface MutationDeps {
   audit?: AuditSink;
   /**
    * Recovery snapshot capture for a reversible-class tableUpdate. Owns the (lazily-built)
-   * SNAPSHOT_KEK ring, the enabled-table classification, encryption (AAD-bound), and the
+   * SNAPSHOT_KEK_CURRENT ring, the enabled-table classification, encryption (AAD-bound), and the
    * durable persist (SNAPSHOT_KV). Returns true when a snapshot was persisted, false when
    * the table is opted out (claim narrowed). THROWS if it cannot persist — the caller then
    * fails the mutation CLOSED (no recovery row => no mutate). The integration user never
@@ -153,7 +153,10 @@ export interface HostSignals {
  */
 function isPostSendUnknown(err: unknown): boolean {
   if (err instanceof McpToolError) {
-    if (err.code === "budget_exceeded" && err.detail?.dimension === "outboundBytesSent") return false;
+    if (
+      err.code === "budget_exceeded" &&
+      (err.detail?.dimension === "outboundBytesSent" || err.detail?.dimension === "serviceNowRequests")
+    ) return false;
     switch (err.code) {
       case "reauth_required":
       case "actor_policy_denied":
@@ -440,7 +443,7 @@ export class ServiceNowRPC {
       this.deps.runBudget.countServiceNowRequest();
     };
 
-    const result = await guardMutation<unknown>(
+    const guarded = await guardMutation<unknown>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -478,9 +481,10 @@ export class ServiceNowRPC {
         isIndeterminate: isPostSendUnknown,
       },
     );
-    const visibleResult = isReplaySafeWrapper(result)
-      ? result
-      : replaySafeResult(maskRow(this.deps.actorPolicy, table, (result ?? {}) as Record<string, unknown>));
+    if (!isReplaySafeWrapper(guarded.result)) {
+      throw new McpToolError("internal_error", "tableUpdate replay payload is not replay-safe.");
+    }
+    const visibleResult = visibleReplayResult(guarded.result);
     // Per-run byte enforcement (§P5): count the PATCH response AFTER guardMutation resolves.
     // Counting inside the effect closure would let a byte-cap throw classify as post-send
     // unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and poison the
@@ -548,14 +552,7 @@ export class ServiceNowRPC {
     // Host-authoritative justification: the operator-supplied tool-level reason. Used for the
     // executor-side audit (P7) POST body, the requestHash, the approval context, and the host
     // audit row.
-    const sendScript = async (reason: string): Promise<unknown> => {
-      // §6b: in per_user_oauth, resolve the effective user's sys_id at sign time and bind it into
-      // the signed claims (the executor verifies it). Unresolved per-user attribution fails closed;
-      // integration_user has no resolver and keeps the base shared-credential claim.
-      const effectiveSysId = signing.resolveEffectiveUserSysId ? await signing.resolveEffectiveUserSysId() : "";
-      if (signing.resolveEffectiveUserSysId && !effectiveSysId) {
-        throw new McpToolError("reauth_required", "ServiceNow principal could not be resolved — re-authenticate.");
-      }
+    const sendScript = async (reason: string, effectiveSysId: string): Promise<unknown> => {
       const signed = await signActor({
         claims: effectiveSysId ? { ...signing.claims, snow_effective_user_sys_id: effectiveSysId } : signing.claims,
         script: args.script,
@@ -599,6 +596,7 @@ export class ServiceNowRPC {
     const actorUserId = signing.claims.mcp_actor_user_id;
     const requestHash = await runServerScriptRequestHash({
       script: args.script, reason, mode: this.deps.effectiveMode, instance: this.deps.instanceHost, actorUserId,
+      policyScope: actorPolicyScopeFingerprint(this.deps.actorPolicy),
     });
     const outboundUpperBoundBytes = runServerScriptBodyUpperBoundBytes({ script: args.script, claims: signing.claims, reason });
 
@@ -615,14 +613,24 @@ export class ServiceNowRPC {
         approvalToken: mutation.runContext.approvalToken,
       });
 
+    let effectiveSysId = "";
     const preflight = () => {
       approvalPreflight();
-      // Per-run SN-request budget for the executor POST — counted inside the normal preflight so
-      // completed idempotency replays re-check approval without burning a ServiceNow request slot.
-      this.deps.runBudget.countServiceNowRequest();
+      // §6b: in per_user_oauth, resolve the effective user's sys_id before the executor POST and
+      // bind it into the signed claims. Doing this in preflight keeps budget/reauth failures clean
+      // pre-send denials instead of poisoning the mutation ledger as indeterminate executor sends.
+      return Promise.resolve(signing.resolveEffectiveUserSysId?.(this.deps.runBudget) ?? "").then((resolved) => {
+        effectiveSysId = resolved;
+        if (signing.resolveEffectiveUserSysId && !effectiveSysId) {
+          throw new McpToolError("reauth_required", "ServiceNow principal could not be resolved — re-authenticate.");
+        }
+        // Per-run SN-request budget for the executor POST — counted inside the normal preflight so
+        // completed idempotency replays re-check approval without burning a ServiceNow request slot.
+        this.deps.runBudget.countServiceNowRequest();
+      });
     };
 
-    const result = await guardMutation<unknown>(
+    const guarded = await guardMutation<unknown>(
       {
         run: mutation.runContext,
         instance: this.deps.instanceHost,
@@ -642,7 +650,7 @@ export class ServiceNowRPC {
         // runServerScript is NON-RECOVERABLE (recovery/policy.ts) — no snapshot.
         effect: async () => {
           this.deps.runBudget.countOutboundBytes(outboundUpperBoundBytes);
-          return { result: replaySafeResult(await sendScript(reason)) };
+          return { result: replaySafeResult(await sendScript(reason, effectiveSysId)) };
         },
         isIndeterminate: isPostSendUnknown,
       },
@@ -651,8 +659,12 @@ export class ServiceNowRPC {
     // resolves. Counting inside the effect closure would let a byte-cap throw classify as
     // post-send unknown (isPostSendUnknown(budget_exceeded)=true) → markIndeterminate() and
     // poison the ledger for a script that actually succeeded.
-    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(result ?? null)));
-    return result;
+    if (!isReplaySafeWrapper(guarded.result)) {
+      throw new McpToolError("internal_error", "runServerScript replay payload is not replay-safe.");
+    }
+    const visibleResult = visibleReplayResult(guarded.result);
+    this.deps.runBudget.countBytes(utf8Len(JSON.stringify(visibleResult ?? null)));
+    return visibleResult;
   }
 
   // Encode the typed error code into the thrown message so it survives the sandbox

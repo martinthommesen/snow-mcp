@@ -86,8 +86,42 @@ function authText(body: string, status: number): Response {
   return new Response(body, { status, headers: AUTH_BROWSER_HEADERS });
 }
 
-function authRedirect(location: string, status = 302): Response {
-  return new Response(null, { status, headers: { ...AUTH_BROWSER_HEADERS, location } });
+function authRedirect(location: string, status = 302, setCookie?: string): Response {
+  const headers: Record<string, string> = { ...AUTH_BROWSER_HEADERS, location };
+  if (setCookie) headers["set-cookie"] = setCookie;
+  return new Response(null, { status, headers });
+}
+
+const OIDC_STATE_COOKIE_PREFIX = "__Host-oidc_state_";
+
+function oidcStateCookieName(state: string): string {
+  return `${OIDC_STATE_COOKIE_PREFIX}${state}`;
+}
+
+/** Bind the OIDC flow to the initiating browser (OAuth 2.0 Security BCP §4.7). `__Host-` requires
+ *  Secure + Path=/ + no Domain; SameSite=Lax so the cookie rides the top-level cross-site GET
+ *  navigation back from the IdP to /oidc/callback (Strict would be withheld on that navigation).
+ *  The cookie name carries the opaque `state`, so parallel authorization flows do not overwrite
+ *  each other. An attacker who initiated the flow knows `state` but cannot set this `__Host-`
+ *  cookie in a victim's browser, so a planted-state callback arrives with no matching cookie and is
+ *  rejected — blocking authorization-code injection / login CSRF. */
+function oidcStateCookie(state: string): string {
+  return `${oidcStateCookieName(state)}=1; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(oidcStateTtlMs() / 1000)}`;
+}
+
+/** Expire the state cookie once the callback has consumed it (single-use hygiene). */
+function clearedOidcStateCookie(state: string): string {
+  return `${oidcStateCookieName(state)}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+function readCookie(request: Request, name: string): string | undefined {
+  const header = request.headers.get("cookie");
+  if (!header) return undefined;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return undefined;
 }
 
 function unsupportedScopesResponse(): Response {
@@ -195,7 +229,7 @@ ${error ? `<p class="err">${esc(error)}</p>` : ""}
   return new Response(html, { status: error ? 401 : 200, headers: CONSENT_HTML_HEADERS });
 }
 
-function oidcConsentPage(record: OidcConsentRecord, nonce: string): Response {
+function oidcConsentPage(record: OidcConsentRecord, nonce: string, setCookie?: string): Response {
   const subject =
     typeof record.grantProps.email === "string" && record.grantProps.email.trim()
       ? record.grantProps.email.trim()
@@ -212,7 +246,9 @@ ${record.grantedScopes.map((s) => `<div class="s">${esc(s)}</div>`).join("")}
   <input type="hidden" name="oidc_consent" value="${esc(nonce)}">
   <button type="submit">Approve</button>
 </form>`;
-  return new Response(html, { status: 200, headers: CONSENT_HTML_HEADERS });
+  const headers: Record<string, string> = { ...CONSENT_HTML_HEADERS };
+  if (setCookie) headers["set-cookie"] = setCookie;
+  return new Response(html, { status: 200, headers });
 }
 
 async function handleOidcAuthorize(request: Request, env: HandlerEnv): Promise<Response> {
@@ -232,7 +268,7 @@ async function handleOidcAuthorize(request: Request, env: HandlerEnv): Promise<R
     expiresAt: Date.now() + oidcStateTtlMs(),
   };
   await env.AUTH_DO.get(env.AUTH_DO.idFromName(`oidc:${state}`)).createOidcRecord(state, record);
-  return authRedirect(url, 302);
+  return authRedirect(url, 302, oidcStateCookie(state));
 }
 
 async function handleOidcCallback(request: Request, env: HandlerEnv): Promise<Response> {
@@ -242,6 +278,15 @@ async function handleOidcCallback(request: Request, env: HandlerEnv): Promise<Re
   const code = url.searchParams.get("code") ?? "";
   const state = url.searchParams.get("state") ?? "";
   if (!code || !state) return authText("Missing code or state.", 400);
+  // Bind to THIS browser session: the state-keyed cookie set at /authorize must be present. An
+  // attacker who started a flow knows `state` but cannot set this cookie in a victim's browser, so
+  // a planted-state callback has no matching cookie -> reject
+  // (OAuth 2.0 Security BCP §4.7 — authorization-code injection / login CSRF). Checked BEFORE the
+  // record is consumed and before any token exchange.
+  const boundState = readCookie(request, oidcStateCookieName(state));
+  if (boundState !== "1") {
+    return authText("OIDC state is not bound to this browser session.", 400);
+  }
   const record = await env.AUTH_DO.get(env.AUTH_DO.idFromName(`oidc:${state}`)).consumeOidcRecord(state);
   if (!record) return authText("Invalid or already-used OIDC state.", 400);
   if (Date.now() > record.expiresAt) return authText("OIDC state expired.", 400);
@@ -268,7 +313,7 @@ async function handleOidcCallback(request: Request, env: HandlerEnv): Promise<Re
     expiresAt: Date.now() + oidcStateTtlMs(),
   };
   await env.AUTH_DO.get(env.AUTH_DO.idFromName(`oidc-consent:${consentNonce}`)).createOidcConsentRecord(consentNonce, consent);
-  return oidcConsentPage(consent, consentNonce);
+  return oidcConsentPage(consent, consentNonce, clearedOidcStateCookie(state));
 }
 
 async function handleOidcConsent(request: Request, env: HandlerEnv): Promise<Response> {

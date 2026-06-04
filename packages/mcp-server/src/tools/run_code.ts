@@ -57,7 +57,7 @@ export interface RunCodeDeps {
   /**
    * Build the per-run budget meter (§P5). Handlers backs this with the actor's
    * maxRowsPerRun/maxBytesPerRun caps from ActorPolicy; absent (tests/read-only boots) =>
-   * an uncapped RunBudget (observability-only, legacy behavior). The instance is held by
+   * an uncapped RunBudget for local harnesses only. The instance is held by
    * run_code so its `snapshot()` of actual spend can be accrued post-run.
    */
   makeRunBudget?: () => RunBudget;

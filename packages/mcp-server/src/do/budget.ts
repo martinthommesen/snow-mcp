@@ -57,10 +57,11 @@ export class BudgetDO extends DurableObject {
     };
   }
 
-  // Serialize the read-check-write critical section. A DO's input gate does not keep a
-  // multi-await method atomic against other concurrent invocations, so we chain reserves
-  // through an in-instance promise mutex — the DO is single-threaded, so this guarantees
-  // no two reserves interleave and the global cap can never be over-committed (S14).
+  // Serialize the read-check-write critical section through an in-instance promise mutex. The DO
+  // is single-threaded and input gates serialize storage-only awaits, but chaining reserves here
+  // keeps the section atomic regardless of gate timing and even if a non-storage await is later
+  // introduced into the path — so no two reserves interleave and the global cap can never be
+  // over-committed (S14).
   private chain: Promise<unknown> = Promise.resolve();
 
   // Route a read-check-write through the in-instance promise-chain mutex (see `chain`

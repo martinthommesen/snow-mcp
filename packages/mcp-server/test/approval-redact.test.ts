@@ -52,6 +52,12 @@ describe("§7.1 redaction", () => {
     expect(redactString("accessToken=access-secret-value")).toContain(REDACTED);
     expect(redactString("approvalToken=approval-secret-value")).toContain(REDACTED);
     expect(redactString("operator_secret=operator-secret-value")).toContain(REDACTED);
+    // hmac/kek secret families redact in strings too (parity with DENY_FIELDS object redaction).
+    expect(redactString("X_MCP_EXECUTOR_HMAC_KEY=AABBCCDDEEFF0011")).toContain(REDACTED);
+    expect(redactString("SNAPSHOT_KEK_CURRENT=deadbeefcafef00d")).toContain(REDACTED);
+    expect(redactString("token_kek=passphrase-value")).toContain(REDACTED);
+    // the field name + separator are preserved; only the value is scrubbed.
+    expect(redactString("snapshot_kek=secret-value")).toBe(`snapshot_kek=${REDACTED}`);
     expect(redactString("nothing sensitive here")).toBe("nothing sensitive here");
   });
 

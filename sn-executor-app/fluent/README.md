@@ -12,7 +12,8 @@ S8 role-ACL enforced, B1 valid executes, forged→401, audit-first row written.
 - **REST_Endpoint ACL** requiring `x_1793136_mcp.executor` (S8), enforced by the API (`enforceAcl`).
 - **Scripted REST API** `x_mcp`, resource `executor/run` (`src/server/x_mcp_executor.js`).
 - **Properties** `x_1793136_mcp.executor.*` (kill switch, egress toggle, byte caps). Fresh installs
-  create the executor and run-server-script toggles disabled; upgrades preserve operator-set values.
+  and upgrades create the executor and run-server-script toggles disabled; operators re-enable them
+  after verifier and approval gates pass.
 
 ## Architecture: scoped wrapper + global core (plan §0.13a)
 

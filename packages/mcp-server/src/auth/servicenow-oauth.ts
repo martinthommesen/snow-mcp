@@ -6,6 +6,8 @@
 import type { SnTokens, TokenStore } from "./token-store.js";
 import { McpToolError } from "../sn/errors.js";
 import { bytesToBase64Url } from "./encoding.js";
+import { utf8Len } from "../sandbox/serialize.js";
+import type { ServiceNowRequestBudget } from "../sn/run-budget.js";
 
 /** Which ServiceNow credential model the bearer is sourced from (P3 corrupt/missing branch). */
 export type CredentialMode = "per_user_oauth" | "integration_user";
@@ -57,13 +59,26 @@ async function fetchWithTimeout(cfg: SnOAuthConfig, input: RequestInfo | URL, in
   }
 }
 
-async function tokenRequest(cfg: SnOAuthConfig, params: Record<string, string>, now: number): Promise<SnTokens> {
+function accountHostServiceNowFetch(budget: ServiceNowRequestBudget | undefined, outboundBytes = 0): void {
+  if (!budget) return;
+  if (outboundBytes > 0) budget.countOutboundBytes(outboundBytes);
+  budget.countServiceNowRequest();
+}
+
+async function tokenRequest(
+  cfg: SnOAuthConfig,
+  params: Record<string, string>,
+  now: number,
+  budget?: ServiceNowRequestBudget,
+): Promise<SnTokens> {
   // cfg.instanceHost is the canonical, allowlisted host (canonicalized once in buildHandlers,
   // §6a), so this POST can never send the client secret off-allowlist.
+  const body = new URLSearchParams({ client_id: cfg.clientId, client_secret: cfg.clientSecret, ...params }).toString();
+  accountHostServiceNowFetch(budget, utf8Len(body));
   const res = await fetchWithTimeout(cfg, `https://${cfg.instanceHost}/oauth_token.do`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-    body: new URLSearchParams({ client_id: cfg.clientId, client_secret: cfg.clientSecret, ...params }).toString(),
+    body,
     redirect: "manual",
   });
   if (res.status >= 300 && res.status < 400) {
@@ -78,16 +93,16 @@ async function tokenRequest(cfg: SnOAuthConfig, params: Record<string, string>, 
 }
 
 /** ROPC grant (grant_type=password) — MFA-exempt dev/CI path, integration_user ONLY (§2.8). */
-export function ropcGrant(cfg: SnOAuthConfig, now: number): Promise<SnTokens> {
+export function ropcGrant(cfg: SnOAuthConfig, now: number, budget?: ServiceNowRequestBudget): Promise<SnTokens> {
   if (!cfg.ropcUsername || !cfg.ropcPassword) {
     throw reauthRequired("ServiceNow ROPC is disabled or not configured.");
   }
-  return tokenRequest(cfg, { grant_type: "password", username: cfg.ropcUsername ?? "", password: cfg.ropcPassword ?? "" }, now);
+  return tokenRequest(cfg, { grant_type: "password", username: cfg.ropcUsername ?? "", password: cfg.ropcPassword ?? "" }, now, budget);
 }
 
 /** Refresh grant. NOTE (B9 finding): this client type does NOT rotate the refresh token. */
-export function refreshGrant(cfg: SnOAuthConfig, refreshToken: string, now: number): Promise<SnTokens> {
-  return tokenRequest(cfg, { grant_type: "refresh_token", refresh_token: refreshToken }, now);
+export function refreshGrant(cfg: SnOAuthConfig, refreshToken: string, now: number, budget?: ServiceNowRequestBudget): Promise<SnTokens> {
+  return tokenRequest(cfg, { grant_type: "refresh_token", refresh_token: refreshToken }, now, budget);
 }
 
 /**
@@ -101,11 +116,13 @@ export function authorizationCodeGrant(
   pkceVerifier: string,
   redirectUri: string,
   now: number,
+  budget?: ServiceNowRequestBudget,
 ): Promise<SnTokens> {
   return tokenRequest(
     cfg,
     { grant_type: "authorization_code", code, code_verifier: pkceVerifier, redirect_uri: redirectUri },
     now,
+    budget,
   );
 }
 
@@ -188,9 +205,14 @@ function carryForwardPrincipal(target: SnTokens, source: SnTokens): void {
  * granted scope on the live PDI (and that `result.user_sys_id` is the field name). Unit tests
  * mock this boundary and cannot prove the live endpoint shape.
  */
-export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string): Promise<SnPrincipal | null> {
+export async function resolveSnPrincipal(
+  cfg: SnOAuthConfig,
+  accessToken: string,
+  opts: { budget?: ServiceNowRequestBudget } = {},
+): Promise<SnPrincipal | null> {
   const auth = { authorization: `Bearer ${accessToken}`, accept: "application/json" };
   try {
+    accountHostServiceNowFetch(opts.budget);
     const meRes = await fetchWithTimeout(
       cfg,
       `https://${cfg.instanceHost}/api/now/ui/user/current_user`,
@@ -202,9 +224,11 @@ export async function resolveSnPrincipal(cfg: SnOAuthConfig, accessToken: string
     if (!sys_id) return null;
     const user_name = stringClaim(me.result, ["user_name"]);
     const email = stringClaim(me.result, ["email", "user_email"]);
+    const rolesQuery = `sysparm_query=user=${encodeURIComponent(sys_id)}&sysparm_fields=role.name&sysparm_limit=200`;
+    accountHostServiceNowFetch(opts.budget, utf8Len(rolesQuery));
     const roleRes = await fetchWithTimeout(
       cfg,
-      `https://${cfg.instanceHost}/api/now/table/sys_user_has_role?sysparm_query=user=${encodeURIComponent(sys_id)}&sysparm_fields=role.name&sysparm_limit=200`,
+      `https://${cfg.instanceHost}/api/now/table/sys_user_has_role?${rolesQuery}`,
       { headers: auth, redirect: "manual" },
     );
     if (roleRes.status >= 300 && roleRes.status < 400) return buildPrincipal(sys_id, [], { user_name, email });
@@ -227,15 +251,15 @@ export async function resolveStoredSnPrincipal(
   cfg: SnOAuthConfig,
   store: TokenStore,
   now: number,
-  opts: { accessToken?: string; authorizeUrl?: string } = {},
+  opts: { accessToken?: string; authorizeUrl?: string; budget?: ServiceNowRequestBudget } = {},
 ): Promise<SnPrincipal | null> {
   const existing = await store.get("servicenow").catch(() => null);
   if (hasFreshPrincipal(existing, now)) {
     return buildPrincipal(existing.sys_id, existing.roles ?? [], existing);
   }
 
-  const accessToken = opts.accessToken ?? await getServiceNowBearer(cfg, store, now, "per_user_oauth", opts.authorizeUrl);
-  const principal = await resolveSnPrincipal(cfg, accessToken);
+  const accessToken = opts.accessToken ?? await getServiceNowBearer(cfg, store, now, "per_user_oauth", opts.authorizeUrl, opts.budget);
+  const principal = await resolveSnPrincipal(cfg, accessToken, { budget: opts.budget });
   if (!principal) return null;
 
   // Re-read before persisting so a concurrent refresh cannot be clobbered by stale token data.
@@ -245,6 +269,12 @@ export async function resolveStoredSnPrincipal(
     await store.rotate("servicenow", latest);
   }
   return principal;
+}
+
+/** Return only a still-fresh stored principal. Never refreshes tokens or calls ServiceNow. */
+export async function resolveFreshStoredSnPrincipal(store: TokenStore, now: number): Promise<SnPrincipal | null> {
+  const existing = await store.get("servicenow").catch(() => null);
+  return hasFreshPrincipal(existing, now) ? buildPrincipal(existing.sys_id, existing.roles ?? [], existing) : null;
 }
 
 /** Raise `reauth_required`, attaching the host-HMAC ticket URL (P2 detail channel) when one
@@ -259,7 +289,7 @@ function reauthRequired(message: string, authorizeUrl?: string): McpToolError {
  * or — for `integration_user` only — mint via ROPC if none.
  *
  * Mode-split (§6b):
- *  - `integration_user` (default): reuse → refresh → ROPC mint (shared credential, no per-user
+ *  - `integration_user`: reuse → refresh → ROPC mint (shared credential, no per-user
  *    principal). An undecryptable token is re-minted via ROPC (P3 fail-closed, no throw).
  *  - `per_user_oauth`: reuse → refresh → else `reauth_required` (NEVER ROPC). A missing,
  *    expired-unrefreshable, or undecryptable token raises `reauth_required` carrying
@@ -270,8 +300,9 @@ export async function getServiceNowBearer(
   cfg: SnOAuthConfig,
   store: TokenStore,
   now: number,
-  mode: CredentialMode = "integration_user",
+  mode: CredentialMode,
   authorizeUrl?: string,
+  budget?: ServiceNowRequestBudget,
 ): Promise<string> {
   // Fail-closed: an undecryptable stored token (e.g. after a botched KEK rotation) must not
   // propagate past recovery. Treat a decrypt failure as "no usable token".
@@ -295,7 +326,7 @@ export async function getServiceNowBearer(
   }
   if (existing?.refresh_token) {
     try {
-      const refreshed = await refreshGrant(cfg, existing.refresh_token, now);
+      const refreshed = await refreshGrant(cfg, existing.refresh_token, now, budget);
       // Carry forward the refresh token if the server didn't return a new one (B9), and the
       // resolved principal (sys_id/roles) so a refresh never drops the effective user.
       if (!refreshed.refresh_token && existing.refresh_token) refreshed.refresh_token = existing.refresh_token;
@@ -311,7 +342,7 @@ export async function getServiceNowBearer(
   if (mode === "per_user_oauth") {
     throw reauthRequired("No ServiceNow token for this user — re-authenticate.", authorizeUrl);
   }
-  const minted = await ropcGrant(cfg, now);
+  const minted = await ropcGrant(cfg, now, budget);
   await store.put("servicenow", minted);
   return minted.access_token;
 }

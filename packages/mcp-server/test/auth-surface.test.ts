@@ -2,7 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { serviceNowAuthHandler } from "../src/auth/servicenow-auth-handler.js";
 import { MissingOAuthKvError } from "../src/auth/oauth-kv.js";
-import { authenticatedUserId } from "../src/index.js";
+import { authenticatedGrantAllowedForDeploymentProfile, authenticatedUserId } from "../src/index.js";
 import type { OidcConsentRecord, OidcCorrelationRecord } from "../src/do/auth-correlation.js";
 import {
   OIDC_ISSUER,
@@ -107,6 +107,25 @@ describe("authenticated /mcp identity", () => {
     expect(authenticatedUserId({ userId: "" })).toBeUndefined();
     expect(authenticatedUserId({ userId: "   " })).toBeUndefined();
     expect(authenticatedUserId({ userId: 123 })).toBeUndefined();
+  });
+
+  it("rejects pre-OIDC grants in production before building the MCP handler", () => {
+    expect(authenticatedGrantAllowedForDeploymentProfile(
+      { DEPLOYMENT_PROFILE: "production" },
+      { userId: "legacy-operator", maxMode: "read_only", scopes: ["servicenow:read"] },
+    )).toBe(false);
+    expect(authenticatedGrantAllowedForDeploymentProfile(
+      { DEPLOYMENT_PROFILE: "production" },
+      { authMode: "oidc", userId: "oidc-u1", oidcSubject: "u1" },
+    )).toBe(true);
+    expect(authenticatedGrantAllowedForDeploymentProfile(
+      { DEPLOYMENT_PROFILE: "production" },
+      { authMode: "oidc", userId: "oidc-u1", oidcSubject: "   " },
+    )).toBe(false);
+    expect(authenticatedGrantAllowedForDeploymentProfile(
+      { DEPLOYMENT_PROFILE: "pilot" },
+      { userId: "pilot-operator", maxMode: "read_only", scopes: ["servicenow:read"] },
+    )).toBe(true);
   });
 });
 
@@ -360,6 +379,69 @@ describe("Phase 3 OIDC authorization surface", () => {
       authRequest: { clientId: "oidc-client" },
     });
     expect(authDo.records.get(state)?.nonce).toBe(redirect.searchParams.get("nonce"));
+    // I1: the redirect binds the flow to this browser via a state-keyed __Host- cookie.
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain(`__Host-oidc_state_${state}=1`);
+    expect(setCookie).toMatch(/HttpOnly/i);
+    expect(setCookie).toMatch(/Secure/i);
+    expect(setCookie).toMatch(/SameSite=Lax/i);
+  });
+
+  it("rejects /oidc/callback with no bound state cookie (login-CSRF / code injection)", async () => {
+    const authDo = fakeAuthDo();
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/oidc/callback?code=code-1&state=state-1"), // attacker-planted state, victim has no cookie
+      { AUTH_MODE: "oidc", AUTH_DO: authDo.ns } as never,
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toMatch(/not bound/i);
+  });
+
+  it("rejects /oidc/callback when the state cookie does not match the state param", async () => {
+    const authDo = fakeAuthDo();
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/oidc/callback?code=code-1&state=state-1", {
+        headers: { cookie: "__Host-oidc_state_state-2=1" },
+      }),
+      { AUTH_MODE: "oidc", AUTH_DO: authDo.ns } as never,
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toMatch(/not bound/i);
+  });
+
+  it("accepts one OIDC callback while another state cookie is still outstanding", async () => {
+    const keys = await oidcSigner();
+    const subject = "acct:concurrent@example.com";
+    const idToken = await oidcIdToken(keys.privateKey, { sub: subject, email: "concurrent@example.com", nonce: "nonce-1" });
+    const provider = fakeProvider({ clientId: "oidc-client", scope: ["servicenow:read"] });
+    const record: OidcCorrelationRecord = {
+      authRequest: await provider.helper.parseAuthRequest(new Request("http://localhost/authorize")),
+      grantedScopes: ["servicenow:read"],
+      nonce: "nonce-1",
+      pkceVerifier: "verifier-1",
+      expiresAt: Date.now() + 60_000,
+    };
+    const authDo = fakeAuthDo([["state-1", record]]);
+    const res = await serviceNowAuthHandler.fetch(
+      new Request("http://localhost/oidc/callback?code=code-1&state=state-1", {
+        headers: { cookie: "__Host-oidc_state_state-2=1; __Host-oidc_state_state-1=1" },
+      }),
+      {
+        OAUTH_PROVIDER: provider.helper as never,
+        AUTH_MODE: "oidc",
+        AUTH_DO: authDo.ns,
+        OAUTH_PROVIDER_SECRET: SECRET,
+        WORKER_PUBLIC_ORIGIN: "https://worker.example.com",
+        OIDC_ISSUER,
+        OIDC_CLIENT_ID,
+        OIDC_CLIENT_SECRET,
+        fetchImpl: fakeOidcFetch(keys.jwks, () => ({ id_token: idToken })),
+      },
+    );
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).toMatch(/__Host-oidc_state_state-1=;.*Max-Age=0/i);
+    expect(setCookie).not.toContain("__Host-oidc_state_state-2=;");
   });
 
   it("does not accept operator-secret POST consent when AUTH_MODE=oidc", async () => {
@@ -409,10 +491,14 @@ describe("Phase 3 OIDC authorization surface", () => {
       fetchImpl: fakeOidcFetch(keys.jwks, () => ({ id_token: idToken, refresh_token: "RT-oidc" })),
     };
     const res = await serviceNowAuthHandler.fetch(
-      new Request("http://localhost/oidc/callback?code=code-1&state=state-1"),
+      new Request("http://localhost/oidc/callback?code=code-1&state=state-1", {
+        headers: { cookie: "__Host-oidc_state_state-1=1" }, // browser carries the bound state cookie
+      }),
       hEnv,
     );
     expect(res.status).toBe(200);
+    // I1: the consumed state cookie is cleared on the consent response (single-use).
+    expect(res.headers.get("set-cookie") ?? "").toMatch(/__Host-oidc_state_state-1=;.*Max-Age=0/i);
     expectAuthBrowserHeaders(res);
     expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
     expect(res.headers.get("x-frame-options")).toBe("DENY");

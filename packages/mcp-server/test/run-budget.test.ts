@@ -38,7 +38,7 @@ describe("Phase P5 — RunBudget row/byte cap enforcement", () => {
     }
   });
 
-  it("an uncapped RunBudget (no caps) never trips on rows/bytes (legacy behavior preserved)", () => {
+  it("an uncapped RunBudget (no caps) never trips on rows/bytes", () => {
     const b = new RunBudget(); // permissive default — observability-only
     b.countRows(1_000_000);
     b.countBytes(1_000_000_000);

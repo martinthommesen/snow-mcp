@@ -49,12 +49,17 @@ export function canonicalHttpsOrigin(raw, label) {
 
 export function resolveDeployedE2eConfig({ argvBase, env, devVar }) {
   const configuredRaw = env.WORKER_PUBLIC_ORIGIN ?? devVar("WORKER_PUBLIC_ORIGIN");
+  const authMode = env.AUTH_MODE ?? devVar("AUTH_MODE") ?? "operator_secret";
+  const deploymentProfile = env.DEPLOYMENT_PROFILE ?? devVar("DEPLOYMENT_PROFILE") ?? "pilot";
+  if (deploymentProfile === "production" || authMode !== "operator_secret") {
+    throw new Error("scripts/deployed-e2e.mjs is pilot-only for the operator-secret consent flow; production AUTH_MODE=oidc needs a separate IdP-backed E2E gate.");
+  }
   const selectedRaw = argvBase ?? configuredRaw;
   if (!selectedRaw) {
-    throw new Error("usage: node scripts/deployed-e2e.mjs <worker-base-url>   (or set WORKER_PUBLIC_ORIGIN in env or .dev.vars)");
+    throw new Error("usage: node scripts/deployed-e2e.mjs <pilot-worker-base-url>   (or set WORKER_PUBLIC_ORIGIN in env or .dev.vars)");
   }
   if (!configuredRaw) {
-    throw new Error("WORKER_PUBLIC_ORIGIN is required before deployed E2E can use MCP_OPERATOR_SECRET.");
+    throw new Error("WORKER_PUBLIC_ORIGIN is required before pilot deployed E2E can use MCP_OPERATOR_SECRET.");
   }
   const configuredOrigin = canonicalHttpsOrigin(configuredRaw, "WORKER_PUBLIC_ORIGIN");
   const selectedOrigin = canonicalHttpsOrigin(selectedRaw, "worker base URL");

@@ -15,7 +15,7 @@ applies depends on the credential mode (§2.0, Decision 2).
 
 ## Credential-mode branch (Decision 2, §2.0)
 
-- **`integration_user` (single-operator default):** the broad role set applies to
+- **`integration_user` (explicit pilot/single-operator mode):** the broad role set applies to
   `mcp_integration_user`; host-side actor attribution is **mandatory + signed-and-verified**
   (§2.0). In **multi-user** deployments this mode additionally requires the **`ActorPolicy`**
   layer (§2.12, enforced before every RPC — implemented + unit-tested; configurable restrictive
@@ -34,7 +34,7 @@ applies depends on the credential mode (§2.0, Decision 2).
 - Per-user ServiceNow OAuth (`per_user_oauth`) is now **wired end-to-end in source** (P6b:
   signed-ticket → PKCE authorize → consume-once callback → per-user TokenStoreDO); the live
   authorize/callback dance on `dev374488` is **verified in P8**. `integration_user` (Basic-Auth
-  / ROPC dev path) remains the single-operator default.
+  / ROPC dev path) remains available only when explicitly configured.
 - `ActorPolicy` enforcement (instance/table/field/mode) is implemented + **unit-tested**
   (dot-aware field masking, P1; configurable restrictive policy is opt-in, P6b-2). The host-side
   enforcement was live-verified **pre-hardening** (B5) and is re-verified in P8.

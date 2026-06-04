@@ -10,7 +10,7 @@ Plan rule (§0 rule 2): *"If a documented API here no longer matches the install
 |---|---|---|---|
 | `@cloudflare/codemode` | `0.3.8` | `0.3.8` | match |
 | `esbuild-wasm` | "(latest, confirm)" | `0.28.0` | confirmed; primary TS transform, works in workerd |
-| `@cloudflare/worker-bundler` | `0.1.3` (fallback) | **not installed** | 0.8a passed → fallback not needed (ADR-0001 D1) |
+| `@cloudflare/worker-bundler` | `0.1.3` (alternate path) | **not installed** | 0.8a passed → alternate path not needed (ADR-0001 D1) |
 | `agents` | `0.13.3` | `0.13.3` | exports `createMcpHandler`, `getMcpAuthContext` confirmed |
 | `@modelcontextprotocol/sdk` | `1.29.0` | `1.29.0` | supports zod `^3.25 || ^4.0` |
 | `@cloudflare/workers-oauth-provider` | "(confirm)" | `0.7.0` | pinned |
@@ -167,7 +167,8 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
 - **Content-addressed versioned KEK ring (P3).** `buildKekRing(currentSecret, prevSecret?)` with
   version labels `kek-${sha256(keyBytes)[:8]}`, so a same-label rotation can no longer mask the
   previous key. Threaded for both the token ring (`handlers.ts`) and the snapshot ring (P4).
-  `TOKEN_KEK`/`SNAPSHOT_KEK` kept as one-release aliases. Migration runbook in RECOVERY.md.
+  `TOKEN_KEK_CURRENT` and `SNAPSHOT_KEK_CURRENT` are required; `*_PREV` is accepted only during
+  active rotation. Rotation runbook in RECOVERY.md.
 - **Host-attested error codes (P2).** `structuredContent.code` derives only from monotonic host
   signals (`budget_exceeded`/`reauth_required`); a forged `[[code]]` in a sandbox throw collapses
   to `run_error`. `truncateUtf8` replaces the UTF-16 `json.slice` (byte-safe output).

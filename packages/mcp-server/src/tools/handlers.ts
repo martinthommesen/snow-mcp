@@ -3,7 +3,7 @@
 // Two modes:
 //  - CONNECTED path: run_code reaches the real instance via ServiceNowRPC and
 //    describe_table/list_tables use the discovery module. ServiceNow credentials
-//    come from per-user OAuth or the explicit dev ROPC fallback.
+//    come from per-user OAuth or the explicit dev ROPC path.
 //  - NOT-CONNECTED: fail closed with `reauth_required` until creds exist.
 
 import type { ServerHandlers, ToolTextResult } from "../server.js";
@@ -20,13 +20,14 @@ import {
   type PolicyEnv,
 } from "../authz/actor-policy.js";
 import { McpToolError, toToolResult } from "../sn/errors.js";
-import { RunBudget } from "../sn/run-budget.js";
+import { RunBudget, type ServiceNowRequestBudget } from "../sn/run-budget.js";
 import { BUDGETS, DEFAULT_ALLOWED_HOST_SUFFIXES } from "../config.js";
 import { SchemaCache, roleHash, type SchemaCachePrincipalIdentity } from "../cache/schema.js";
 import { TokenStore } from "../auth/token-store.js";
 import {
   getServiceNowBearer,
   preflightAuth,
+  resolveFreshStoredSnPrincipal,
   resolveStoredSnPrincipal,
   type CredentialMode,
   type SnOAuthConfig,
@@ -72,19 +73,17 @@ export interface HandlerEnv extends PolicyEnv {
   // Host secret for the per-user OAuth reauth ticket (§6b). Reused (not a new required secret);
   // also the OAuthProvider state secret. Optional: absent + per_user_oauth ⇒ no ticket minted.
   OAUTH_PROVIDER_SECRET?: string;
-  TOKEN_KEK?: string; // one-release alias for TOKEN_KEK_CURRENT (P3 migration)
-  SNAPSHOT_KEK?: string; // one-release alias for SNAPSHOT_KEK_CURRENT (P3 migration)
   // Versioned KEK ring (P3): current + optional previous, for token + snapshot stores.
   TOKEN_KEK_CURRENT?: string;
   TOKEN_KEK_PREV?: string;
   SNAPSHOT_KEK_CURRENT?: string;
   SNAPSHOT_KEK_PREV?: string;
-  // Credential mode (P6) + mode ceilings (P5). All optional in P0.
+  // Credential mode (P6) + mode ceilings (P5).
   SERVICENOW_CREDENTIAL_MODE?: string;
   DEPLOYMENT_PROFILE?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
-  // Dev Basic-Auth fallback + ROPC creds, enabled only by explicit SNOW_DEV_ROPC=1.
+  // Dev Basic-Auth/ROPC path, enabled only by explicit SNOW_DEV_ROPC=1.
   SNOW_DEV_ROPC?: string;
   SNOW_DEV_ROPC_USERNAME?: string;
   SNOW_DEV_ROPC_PASSWORD?: string;
@@ -98,7 +97,7 @@ export interface HandlerEnv extends PolicyEnv {
   // an empty/unset ADMIN_SCRIPT_ALLOWLIST denies every admin_script request, so a live
   // deployment must set it to permit specific actors. ADMIN_SCRIPT_APPROVAL_TOKENS /
   // ADMIN_SCRIPT_REQUIRED_GROUP are the optional SECOND factor (token OR group) layered on top.
-  // (read_only / write are unaffected — those run under the permissive single-operator policy.)
+  // (read_only / write are unaffected.)
   ADMIN_SCRIPT_ALLOWLIST?: string; // comma-separated actor userIds permitted admin_script.
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string; // comma-separated valid approval tokens.
   ADMIN_SCRIPT_REQUIRED_GROUP?: string; // required access-group name (token OR group).
@@ -120,9 +119,13 @@ function utcDateKey(): string {
 type ParsedCredentialMode = CredentialMode | "invalid";
 
 function parseCredentialMode(value: string | undefined): ParsedCredentialMode {
-  if (value === undefined || value.trim() === "") return "integration_user";
+  if (value === undefined || value.trim() === "") return "invalid";
   if (value === "integration_user" || value === "per_user_oauth") return value;
   return "invalid";
+}
+
+function selectedCredentialMode(value: ParsedCredentialMode): CredentialMode | undefined {
+  return value === "invalid" ? undefined : value;
 }
 
 const defaultInstanceAllowlist = { allowedHostSuffixes: DEFAULT_ALLOWED_HOST_SUFFIXES } satisfies InstanceAllowlist;
@@ -145,7 +148,9 @@ export interface AuthContext {
   /** ServiceNow principal identity for the SchemaCache key (§6b). */
   schemaIdentity?: SchemaCachePrincipalIdentity;
   /** Lazy schema identity resolver. Non-schema calls should not pay a TokenStore read. */
-  schemaIdentityResolver?: () => Promise<SchemaCachePrincipalIdentity | undefined>;
+  schemaIdentityResolver?: (budget?: ServiceNowRequestBudget) => Promise<SchemaCachePrincipalIdentity | undefined>;
+  /** Lazy, zero-network resolver used to check SchemaCache hits before spending discovery budget. */
+  schemaIdentityFreshResolver?: () => Promise<SchemaCachePrincipalIdentity | undefined>;
 }
 
 export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandlers {
@@ -165,11 +170,8 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     : "unconfigured.invalid";
   const instanceAllowlist = instanceAllowlistForProfile(env, instanceHost);
   const userId = auth.userId;
-  // §6b: configurable RESTRICTIVE ActorPolicy. NON-BREAKING — with NO policy config set this
-  // returns the permissive single-operator policy (live deployment unchanged). When policy vars
-  // ARE set it builds a restrictive policy (table allowlist + field masks + row filters + per-run
-  // row/byte ceilings) and validates the configured rowFilters at load (fail-closed). The dead
-  // maxRowsPerRun/maxBytesPerRun fields now bite via makeRunBudget below under a restrictive policy.
+  // §6b: configurable restrictive ActorPolicy. With no policy config the default policy denies
+  // all tables; configured policies add allowlists, masks, row filters, and per-run ceilings.
   const actorPolicies = loadNamedActorPolicies(env, instanceHost);
   const requestedPolicyName = typeof auth.props.actorPolicyName === "string" ? auth.props.actorPolicyName : "default";
   const selectedPolicy = actorPolicies.get(requestedPolicyName);
@@ -187,12 +189,11 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // Authorization header strategy (preference order):
   //  1. Per-user ServiceNow OAuth Bearer — tokens minted/refreshed and stored encrypted in
   //     TokenStoreDO (§2.7, §7.5). Preferred.
-  //  2. Explicit dev Basic-Auth fallback (SNOW_DEV_ROPC=1).
+  //  2. Explicit dev Basic-Auth/ROPC path (SNOW_DEV_ROPC=1).
   //  3. Not connected -> fail closed.
-  // TOKEN_KEK is a one-release alias for TOKEN_KEK_CURRENT (P3 migration).
-  const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
+  const tokenKekSecret = env.TOKEN_KEK_CURRENT;
   const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
-  const serviceNowCredentialMode: CredentialMode = credentialMode === "per_user_oauth" ? "per_user_oauth" : "integration_user";
+  const serviceNowCredentialMode = selectedCredentialMode(credentialMode);
   const devRopcEnabled = env.SNOW_DEV_ROPC === "1";
   const oauthReady = Boolean(env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST && (credentialMode !== "per_user_oauth" || auth.workerOrigin));
   const devConnected = Boolean(devRopcEnabled && env.SNOW_INSTANCE_HOST && env.SNOW_DEV_ROPC_USERNAME && env.SNOW_DEV_ROPC_PASSWORD);
@@ -206,7 +207,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   let http: SnHttpClient;
   let oauthStore: (() => Promise<TokenStore>) | undefined;
   let oauthCfg: SnOAuthConfig | undefined;
-  let requestAuthorization: (() => Promise<string>) | undefined;
+  let requestAuthorization: ((budget?: ServiceNowRequestBudget) => Promise<string>) | undefined;
   let perUserConfigurationError: string | undefined;
   let authorizeUrlPromise: Promise<string | undefined> | undefined;
   const reauthAuthorizeUrl = (): Promise<string | undefined> => {
@@ -261,10 +262,10 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       return storePromise;
     };
     let authorizationPromise: Promise<string> | undefined;
-    requestAuthorization = (): Promise<string> => {
+    requestAuthorization = (budget?: ServiceNowRequestBudget): Promise<string> => {
       authorizationPromise ??= (async () => {
         const store = await oauthStore!();
-        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), serviceNowCredentialMode, await reauthAuthorizeUrl()));
+        return "Bearer " + (await getServiceNowBearer(cfg, store, Date.now(), serviceNowCredentialMode!, await reauthAuthorizeUrl(), budget));
       })();
       return authorizationPromise;
     };
@@ -370,11 +371,12 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // resolve); if absent or stale, resolves it live with the current bearer and persists it. Only
   // in per_user_oauth — integration_user has no per-user principal (stays "").
   const resolveEffectiveSysId = oauthReady && oauthStore && oauthCfg && credentialMode === "per_user_oauth"
-    ? async (): Promise<string> => {
+    ? async (budget?: ServiceNowRequestBudget): Promise<string> => {
         const store = await oauthStore!();
-        const authorization = requestAuthorization ? await requestAuthorization() : "";
+        const authorization = requestAuthorization ? await requestAuthorization(budget) : "";
         const principal = await resolveStoredSnPrincipal(oauthCfg!, store, Date.now(), {
           accessToken: authorization.replace(/^Bearer\s+/i, ""),
+          budget,
         });
         return principal?.sys_id ?? "";
       }
@@ -433,11 +435,11 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       }
     : undefined;
 
-  // Recovery snapshots (§7.7): encrypt under the SNAPSHOT_KEK ring (same buildKekRing scheme
+  // Recovery snapshots (§7.7): encrypt under the SNAPSHOT_KEK_CURRENT ring (same buildKekRing scheme
   // as the token ring, P3) and persist to SNAPSHOT_KV with a 30-day TTL. No enabled tables means
   // no snapshots, so the recovery claim is narrowed. The integration user never decrypts
   // (the KEK lives only host-side). The ring is built lazily + cached.
-  const snapshotKekSecret = env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK;
+  const snapshotKekSecret = env.SNAPSHOT_KEK_CURRENT;
   const snapshotEnabledTables = csv(env.SNAPSHOT_ENABLED_TABLES);
   const snapshotReady = Boolean(env.SNAPSHOT_KV && snapshotKekSecret && snapshotEnabledTables.length > 0);
   const snapshotConfig: SnapshotConfig = { enabledTables: snapshotEnabledTables };
@@ -500,15 +502,14 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   const preflightAuthDep = perUserConfigurationError
     ? async (): Promise<never> => { throw new McpToolError("reauth_required", perUserConfigurationError); }
     : oauthStore
-    ? async (): Promise<void> => preflightAuth(await oauthStore!(), serviceNowCredentialMode, await reauthAuthorizeUrl())
+    ? async (): Promise<void> => preflightAuth(await oauthStore!(), serviceNowCredentialMode!, await reauthAuthorizeUrl())
     : undefined;
 
   const runCodeDeps: RunCodeDeps = {
     loader: env.LOADER,
     scopeMaxMode, // from the client's OAuth scope (§2.0.1)
-    // Mode ceilings (§P5): env-configurable. UNSET defaults to admin_script (preserves today's
-    // "scope is the cap" behavior); a SET-but-invalid value fails closed to read_only — never
-    // widens the ceiling (parseMaxMode).
+    // Mode ceilings (§P5): env-configurable. UNSET leaves the OAuth scope as the cap; a
+    // SET-but-invalid value fails closed to read_only and never widens the ceiling.
     tenantMaxMode: parseMaxMode(env.TENANT_MAX_MODE),
     instanceMaxMode: parseMaxMode(env.INSTANCE_MAX_MODE),
     // Per-run budget meter carrying the actor's row/byte caps (§P5). The dead
@@ -517,7 +518,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     makeRunBudget: () => new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun }),
     buildRpc: (effectiveMode: Mode, runBudget: RunBudget, runContext: RunContext) =>
       new ServiceNowRPC({
-        http, instanceHost, effectiveMode, actorPolicy: policy, runBudget,
+        http: budgetedHttp(runBudget), instanceHost, effectiveMode, actorPolicy: policy, runBudget,
         ...(signing ? { signing, executorPath: env.SNOW_EXECUTOR_PATH! } : {}),
         mutation: buildMutationDeps(runContext),
       }),
@@ -530,11 +531,22 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     return new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun });
   }
 
+  function budgetedHttp(runBudget: ServiceNowRequestBudget): SnHttpClient {
+    return {
+      request: (req) => http.request({ ...req, budget: runBudget }),
+    };
+  }
+
   function discoveryDeps(runBudget: RunBudget): DiscoveryDeps {
-    return { http, instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget, credentialMode: serviceNowCredentialMode };
+    return { http: budgetedHttp(runBudget), instanceHost, effectiveMode: "read_only", actorPolicy: policy, runBudget, credentialMode: serviceNowCredentialMode };
   }
 
   async function runDiscoveryWithBudget<T>(runBudget: RunBudget, fn: () => Promise<T>): Promise<T> {
+    if (reserveDiscoveryDailyBudget && preflightAuthDep) {
+      await preflightAuthDep();
+    } else if (!requestAuthorization && http instanceof NotConnectedHttpClient) {
+      await http.request();
+    }
     let reserved = false;
     if (reserveDiscoveryDailyBudget) {
       const reservation = await reserveDiscoveryDailyBudget();
@@ -546,6 +558,9 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       reserved = true;
     }
     try {
+      if (requestAuthorization) {
+        await requestAuthorization(runBudget);
+      }
       return await fn();
     } finally {
       if (reserved && reconcileDiscoveryDailyBudget) {
@@ -568,29 +583,70 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
   // User-aware schema cache (§2.6) when SCHEMA_KV is bound. Built lazily so run_code and other
   // non-schema calls do not pay a per-user TokenStore read/decrypt just to compute identity.
   // In per_user_oauth the resolver must return the ServiceNow sys_id; if it cannot, we skip cache
-  // for this request rather than keying ACL-filtered schema under a fallback identity.
+  // for this request rather than keying ACL-filtered schema under the wrong identity.
   let schemaCachePromise: Promise<SchemaCache | undefined> | undefined;
-  const schemaCache = (): Promise<SchemaCache | undefined> => {
-    if (!env.SCHEMA_KV) return Promise.resolve(undefined);
-    schemaCachePromise ??= (async () => {
-      const identity = auth.schemaIdentity ?? (auth.schemaIdentityResolver
-        ? await auth.schemaIdentityResolver()
-        : { principalId: userId, roleHash: "default" });
-      return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity, policyHash: await actorPolicyHash(policy) }) : undefined;
-    })();
+  let freshSchemaCachePromise: Promise<SchemaCache | undefined> | undefined;
+  async function schemaCacheIdentity(freshOnly: boolean, runBudget?: ServiceNowRequestBudget): Promise<SchemaCachePrincipalIdentity | undefined> {
+    if (auth.schemaIdentity) return auth.schemaIdentity;
+    if (freshOnly) {
+      if (auth.schemaIdentityFreshResolver) return auth.schemaIdentityFreshResolver();
+      return auth.schemaIdentityResolver ? undefined : { principalId: userId, roleHash: "default" };
+    }
+    return auth.schemaIdentityResolver ? auth.schemaIdentityResolver(runBudget) : { principalId: userId, roleHash: "default" };
+  }
+  async function buildSchemaCache(freshOnly: boolean, runBudget?: ServiceNowRequestBudget): Promise<SchemaCache | undefined> {
+    if (!env.SCHEMA_KV) return undefined;
+    const identity = await schemaCacheIdentity(freshOnly, runBudget);
+    return identity ? new SchemaCache(env.SCHEMA_KV!, { instanceHost, ...identity, policyHash: await actorPolicyHash(policy) }) : undefined;
+  }
+  async function buildFreshSchemaCache(): Promise<SchemaCache | undefined> {
+    const pending = buildSchemaCache(true);
+    freshSchemaCachePromise = pending;
+    try {
+      const cache = await pending;
+      if (!cache && freshSchemaCachePromise === pending) freshSchemaCachePromise = undefined;
+      return cache;
+    } catch (e) {
+      if (freshSchemaCachePromise === pending) freshSchemaCachePromise = undefined;
+      throw e;
+    }
+  }
+  const schemaCache = (opts: { freshOnly?: boolean; runBudget?: ServiceNowRequestBudget } = {}): Promise<SchemaCache | undefined> => {
+    if (opts.freshOnly) {
+      return freshSchemaCachePromise ?? buildFreshSchemaCache();
+    }
+    schemaCachePromise ??= buildSchemaCache(false, opts.runBudget);
     return schemaCachePromise;
   };
+
+  async function budgetedDescribeTable(table: string): Promise<{ fields: Awaited<ReturnType<typeof describeTable>>; cached: boolean }> {
+    const runBudget = makeDiscoveryRunBudget();
+    return runDiscoveryWithBudget(runBudget, async () => {
+      const cache = await schemaCache({ runBudget });
+      const fetcher = () => describeTable(discoveryDeps(runBudget), table);
+      return cache ? cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
+    });
+  }
+
+  async function budgetedListTables(filter: string | undefined): Promise<Awaited<ReturnType<typeof listTables>> & { cached: boolean }> {
+    const runBudget = makeDiscoveryRunBudget();
+    return runDiscoveryWithBudget(runBudget, async () => {
+      const cache = await schemaCache({ runBudget });
+      const fetcher = () => listTables(discoveryDeps(runBudget), filter);
+      return cache ? cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
+    });
+  }
 
   return {
     runCode: (input) => runCode(input, runCodeDeps),
     describeTable: async ({ table }): Promise<ToolTextResult> => {
       try {
-        const cache = await schemaCache();
+        const cache = await schemaCache({ freshOnly: true });
         const fetcher = () => {
           const runBudget = makeDiscoveryRunBudget();
           return runDiscoveryWithBudget(runBudget, () => describeTable(discoveryDeps(runBudget), table));
         };
-        const { fields, cached } = cache ? await cache.describeTable(table, fetcher) : { fields: await fetcher(), cached: false };
+        const { fields, cached } = cache ? await cache.describeTable(table, fetcher) : await budgetedDescribeTable(table);
         return { content: [{ type: "text", text: JSON.stringify({ table, fields }) }], isError: false, structuredContent: { table, fieldCount: fields.length, cached } };
       } catch (e) {
         return toToolResult(e);
@@ -598,12 +654,13 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
     },
     listTables: async ({ filter }): Promise<ToolTextResult> => {
       try {
-        const cache = await schemaCache();
+        const cache = await schemaCache({ freshOnly: true });
         const fetcher = () => {
           const runBudget = makeDiscoveryRunBudget();
           return runDiscoveryWithBudget(runBudget, () => listTables(discoveryDeps(runBudget), filter));
         };
-        const { tables, partial, total, policyFilteredPartial, warning, cached } = cache ? await cache.listTables(filter, fetcher) : { ...(await fetcher()), cached: false };
+        const result = cache ? await cache.listTables(filter, fetcher) : await budgetedListTables(filter);
+        const { tables, partial, total, policyFilteredPartial, warning, cached } = result;
         return {
           content: [{ type: "text", text: JSON.stringify({ tables, partial, ...(total !== undefined ? { total } : {}), ...(warning ? { warning } : {}) }) }],
           isError: false,
@@ -632,13 +689,18 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
  * absent, stale-unresolvable, or unreadable, returns undefined so schema tools bypass cache for
  * that request. It NEVER throws, so it cannot block the reauth_required path.
  */
-export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Promise<SchemaCachePrincipalIdentity | undefined> {
-  const tokenKekSecret = env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK;
+export async function resolveSchemaIdentity(
+  env: HandlerEnv,
+  userId: string,
+  opts: { freshOnly?: boolean; budget?: ServiceNowRequestBudget } = {},
+): Promise<SchemaCachePrincipalIdentity | undefined> {
+  const tokenKekSecret = env.TOKEN_KEK_CURRENT;
   const credentialMode = parseCredentialMode(env.SERVICENOW_CREDENTIAL_MODE);
   const oauthReady = Boolean(
     env.SNOW_OAUTH_CLIENT_ID && env.SNOW_OAUTH_CLIENT_SECRET && env.TOKEN_DO && tokenKekSecret && env.SNOW_INSTANCE_HOST,
   );
-  if (credentialMode !== "per_user_oauth") return { principalId: userId, roleHash: "default" };
+  if (credentialMode === "invalid") return undefined;
+  if (credentialMode === "integration_user") return { principalId: userId, roleHash: "default" };
   if (!oauthReady) return undefined;
   try {
     // Intentional two-step guard: normalize the configured ServiceNow host under the default
@@ -651,15 +713,18 @@ export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Pr
       putToken(t: string, v: string): Promise<void>; getToken(t: string): Promise<string | undefined>;
     };
     const store = new TokenStore(stub, await buildKekRing(tokenKekSecret!, env.TOKEN_KEK_PREV), userId, instanceHost);
-    const principal = await resolveStoredSnPrincipal(
-      {
-        instanceHost,
-        clientId: env.SNOW_OAUTH_CLIENT_ID!,
-        clientSecret: env.SNOW_OAUTH_CLIENT_SECRET!,
-      },
-      store,
-      Date.now(),
-    );
+    const principal = opts.freshOnly
+      ? await resolveFreshStoredSnPrincipal(store, Date.now())
+      : await resolveStoredSnPrincipal(
+        {
+          instanceHost,
+          clientId: env.SNOW_OAUTH_CLIENT_ID!,
+          clientSecret: env.SNOW_OAUTH_CLIENT_SECRET!,
+        },
+        store,
+        Date.now(),
+        { budget: opts.budget },
+      );
     if (!principal) return undefined;
     const roles = principal.roles;
     return {
@@ -668,7 +733,7 @@ export async function resolveSchemaIdentity(env: HandlerEnv, userId: string): Pr
     };
   } catch (e) {
     // Best-effort: an identity failure must NEVER block the request. Bypassing cache is safer than
-    // reusing a fallback key for ACL-filtered schema. Log only the error object (no token/key data).
+    // reusing the wrong key for ACL-filtered schema. Log only the error object (no token/key data).
     console.error("resolveSchemaIdentity failed; SchemaCache disabled for this request", e);
     return undefined;
   }

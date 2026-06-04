@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { describeTable, listTables, type DiscoveryDeps } from "../src/sn/discovery.js";
-import { permissivePolicy, type ActorPolicy } from "../src/authz/actor-policy.js";
+import { denyAllPolicy, permissivePolicy, type ActorPolicy } from "../src/authz/actor-policy.js";
 import { RunBudget } from "../src/sn/run-budget.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { McpToolError } from "../src/sn/errors.js";
@@ -132,6 +132,17 @@ describe("list_tables", () => {
     });
     expect(http.calls).toHaveLength(0);
     expect(budget.outboundBytesSent).toBe(0);
+  });
+
+  it("short-circuits deny-all ActorPolicy without broad ServiceNow discovery", async () => {
+    const http = new MockHttp();
+    const policy = denyAllPolicy(INSTANCE);
+    const out = await listTables({
+      ...deps(http, policy),
+      runBudget: new RunBudget(BUDGETS.perRun, { maxRows: policy.maxRowsPerRun, maxBytes: policy.maxBytesPerRun }),
+    });
+    expect(out).toEqual({ tables: [], partial: false });
+    expect(http.calls).toHaveLength(0);
   });
 
   it("fetches exact string allowlists directly instead of filtering a broad first page", async () => {

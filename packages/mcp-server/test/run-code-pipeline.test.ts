@@ -11,7 +11,7 @@ import type { Mode } from "@servicenow-codemode/shared";
 
 // ─── Phase 4 — run_code pipeline against a MOCK ServiceNowRPC ──────────────────
 // Proves the §3.1 enforced order end-to-end in workerd. ServiceNow itself is mocked;
-// live behavior is out of scope (OPEN_QUESTIONS.md). Verifies S1/S4-shape guardrails,
+// live behavior is out of scope (docs/DELTAS.md). Verifies S1/S4-shape guardrails,
 // B3/B4 mode capping, capability gating, ActorPolicy denial, and per-run budget.
 
 interface TestEnv { LOADER: WorkerLoader; }

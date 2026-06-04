@@ -10,7 +10,7 @@ describe("deployed E2E origin validation", () => {
     const devVarCalls: string[] = [];
     const out = resolveDeployedE2eConfig({
       argvBase: undefined,
-      env: {},
+      env: { AUTH_MODE: "operator_secret", DEPLOYMENT_PROFILE: "pilot" },
       devVar: (key: string) => {
         devVarCalls.push(key);
         return key === "WORKER_PUBLIC_ORIGIN" ? "https://worker.example.com" : "secret-value";
@@ -20,11 +20,24 @@ describe("deployed E2E origin validation", () => {
     expect(devVarCalls).toEqual(["WORKER_PUBLIC_ORIGIN", "MCP_OPERATOR_SECRET"]);
   });
 
+  it("refuses production or OIDC profiles before reading MCP_OPERATOR_SECRET", () => {
+    const devVarCalls: string[] = [];
+    expect(() => resolveDeployedE2eConfig({
+      argvBase: undefined,
+      env: { WORKER_PUBLIC_ORIGIN: "https://worker.example.com", AUTH_MODE: "oidc", DEPLOYMENT_PROFILE: "production" },
+      devVar: (key: string) => {
+        devVarCalls.push(key);
+        return "secret-value";
+      },
+    })).toThrow(/pilot-only/);
+    expect(devVarCalls).toEqual([]);
+  });
+
   it("refuses an argv base that differs from WORKER_PUBLIC_ORIGIN before reading MCP_OPERATOR_SECRET", () => {
     const devVarCalls: string[] = [];
     expect(() => resolveDeployedE2eConfig({
       argvBase: "https://evil.example.com",
-      env: { WORKER_PUBLIC_ORIGIN: "https://worker.example.com" },
+      env: { WORKER_PUBLIC_ORIGIN: "https://worker.example.com", AUTH_MODE: "operator_secret", DEPLOYMENT_PROFILE: "pilot" },
       devVar: (key: string) => {
         devVarCalls.push(key);
         return "secret-value";

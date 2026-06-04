@@ -6,7 +6,7 @@ import installerSource from "../../../scripts/executor-install.mjs?raw";
 import verifierSource from "../../../scripts/executor-scoped-verify.mjs?raw";
 
 describe("Phase 2 — admin_script executor defaults", () => {
-  it("creates fresh scoped Fluent kill-switch properties disabled on first install only", () => {
+  it("creates scoped Fluent kill-switch properties disabled on every deploy", () => {
     for (const name of [
       "x_1793136_mcp.executor.enabled",
       "x_1793136_mcp.executor.run_server_script_enabled",
@@ -14,22 +14,38 @@ describe("Phase 2 — admin_script executor defaults", () => {
       const start = fluentSource.indexOf(`name: '${name}'`);
       expect(start).toBeGreaterThan(-1);
       const block = fluentSource.slice(start, fluentSource.indexOf("})", start));
-      expect(block).toContain("$meta: { installMethod: 'first install' }");
+      expect(block).not.toContain("installMethod");
       expect(block).toContain("value: false");
+      expect(block).toContain("roles: runtimePropertyRoles");
+    }
+    expect(fluentSource).toContain("const runtimePropertyRoles = { read: [executorRole, adminRole], write: [adminRole] }");
+    expect(fluentSource).toContain("const secretPropertyRoles = { read: [executorRole, adminRole], write: [adminRole] }");
+  });
+
+  it("keeps executor HMAC secrets private with admin-only writes", () => {
+    for (const name of [
+      "x_1793136_mcp.executor.hmac_secret",
+      "x_1793136_mcp.executor.hmac_secret_prev",
+    ]) {
+      const start = fluentSource.indexOf(`name: '${name}'`);
+      expect(start).toBeGreaterThan(-1);
+      const block = fluentSource.slice(start, fluentSource.indexOf("})", start));
+      expect(block).toContain("isPrivate: true");
+      expect(block).toContain("roles: secretPropertyRoles");
+      expect(block).not.toContain("roles: runtimePropertyRoles");
     }
   });
 
-  it("the scoped runtime defaults fail closed while legacy compatibility remains neutral", () => {
+  it("the scoped runtime defaults fail closed with no legacy namespace compatibility", () => {
     expect(executorSource).toContain("gs.getProperty('x_1793136_mcp.executor.enabled', 'false')");
     expect(executorSource).toContain("gs.getProperty('x_1793136_mcp.executor.run_server_script_enabled', 'false')");
-    expect(executorSource).toContain("gs.getProperty('x_mcp.executor.enabled', 'true')");
-    expect(executorSource).toContain("gs.getProperty('x_mcp.executor.run_server_script_enabled', 'true')");
+    expect(executorSource).not.toContain("x_mcp.executor.enabled");
+    expect(executorSource).not.toContain("x_mcp.executor.run_server_script_enabled");
   });
 
-  it("the live helper installer creates disabled defaults without overwriting existing operator choices", () => {
-    expect(installerSource).toContain("async function ensurePropertyDefault");
-    expect(installerSource).toContain('ensurePropertyDefault("x_1793136_mcp.executor.enabled", "false", "true|false")');
-    expect(installerSource).toContain('ensurePropertyDefault("x_1793136_mcp.executor.run_server_script_enabled", "false", "true|false")');
+  it("the live helper installer re-arms disabled defaults on every run", () => {
+    expect(installerSource).toContain('setProperty("x_1793136_mcp.executor.enabled", "false", "true|false")');
+    expect(installerSource).toContain('setProperty("x_1793136_mcp.executor.run_server_script_enabled", "false", "true|false")');
     expect(installerSource).not.toContain('setProperty("x_1793136_mcp.executor.enabled", "true"');
     expect(installerSource).not.toContain('setProperty("x_1793136_mcp.executor.run_server_script_enabled", "true"');
   });

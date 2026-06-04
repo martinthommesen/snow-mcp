@@ -12,7 +12,7 @@ import { describeTable, type DiscoveryDeps } from "../src/sn/discovery.js";
 import { validateReason, validateUserQuery, assertMandatoryRowFilterSafe } from "../src/sn/validate.js";
 import { McpToolError } from "../src/sn/errors.js";
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
-import { canonicalObjectJson } from "../src/sn/mutation-guard.js";
+import { canonicalObjectJson, runServerScriptRequestHash } from "../src/sn/mutation-guard.js";
 import { BUDGETS, SN_REQUEST_LIMITS } from "../src/config.js";
 
 // ─── P1 — RPC input-validation boundary (closes findings 7/8/9 + comma-injection) ──
@@ -153,6 +153,17 @@ describe("P1 — identifier validation rejects malformed input", () => {
     ).rejects.toMatchObject({ code: "path_denied" });
   });
 
+  it("tableUpdate rejects prototype-pollution-adjacent reserved update keys", async () => {
+    const { rpc: r } = rpc();
+    // JSON.parse yields real own keys (a `{ __proto__: ... }` literal would set the prototype),
+    // mirroring how the sandbox delivers a deserialized fields object across the RPC edge.
+    for (const key of ["__proto__", "constructor", "prototype"]) {
+      await expect(
+        r.tableUpdate({ table: "incident", sys_id: HEX, fields: JSON.parse(`{"${key}":"x"}`) }),
+      ).rejects.toMatchObject({ code: "path_denied" });
+    }
+  });
+
   it("runServerScript rejects an empty/non-string script (path_denied)", async () => {
     const { rpc: r } = rpc();
     await expect(
@@ -166,6 +177,15 @@ describe("P1 — identifier validation rejects malformed input", () => {
   it("canonical update bodies reject undefined instead of serializing it as null", () => {
     expect(() => canonicalObjectJson({ short_description: undefined })).toThrow(/JSON-serializable/);
     expect(canonicalObjectJson({ short_description: null })).toBe('{"short_description":null}');
+  });
+
+  it("binds policy scope into the runServerScript request hash (replay binding)", async () => {
+    const base = { script: "gs.info('x')", reason: "r", mode: "admin_script" as const, instance: INSTANCE, actorUserId: "u1" };
+    const h1 = await runServerScriptRequestHash({ ...base, policyScope: "scopeA" });
+    const h2 = await runServerScriptRequestHash({ ...base, policyScope: "scopeB" });
+    const h1again = await runServerScriptRequestHash({ ...base, policyScope: "scopeA" });
+    expect(h1).not.toBe(h2); // an ActorPolicy change -> different hash -> a completed replay is blocked
+    expect(h1).toBe(h1again); // same logical effect + scope -> stable hash -> a legitimate retry replays
   });
 
   it("describeTable rejects a comma-injected table name", async () => {

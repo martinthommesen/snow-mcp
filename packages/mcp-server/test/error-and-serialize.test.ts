@@ -148,7 +148,7 @@ describe("truncateUtf8 / serializeResult — byte-safe truncation (§P2)", () =>
     expect(parsed.value.nested.self).toBe("[Circular]");
   });
 
-  it("serializeResult truncates the sanitized fallback within the byte cap", () => {
+  it("serializeResult truncates the sanitized replacement payload within the byte cap", () => {
     const value = { count: 1n, payload: "x".repeat(1000) };
     const ser = serializeResult(value, 80);
     expect(ser.truncated).toBe(true);

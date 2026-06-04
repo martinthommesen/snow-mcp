@@ -29,17 +29,39 @@ function reqEnv(k: string): string {
   return v;
 }
 
-const allowPilotDeploy = process.env.ALLOW_PILOT_DEPLOY === "1";
-if (process.env.DEPLOYMENT_PROFILE?.trim() !== "production" && !allowPilotDeploy) {
-  throw new Error('Alchemy deploy requires DEPLOYMENT_PROFILE="production"; use `npm run deploy:pilot` for pilot/dev profiles.');
+function envText(k: string): string | undefined {
+  return process.env[k]?.trim() || undefined;
+}
+
+const isDestroyMode = process.env.ALCHEMY_DESTROY === "1" || process.argv.includes("--destroy");
+
+function alchemyStatePassword(): string {
+  const explicit = envText("ALCHEMY_PASSWORD") ?? envText("ALCHEMY_STATE_PASSWORD");
+  if (explicit) return explicit;
+  if (isDestroyMode) {
+    const legacy = envText("OAUTH_PROVIDER_SECRET");
+    if (legacy) return legacy;
+    throw new Error("Missing Alchemy state password; set ALCHEMY_PASSWORD or the legacy OAUTH_PROVIDER_SECRET value before deploy:destroy.");
+  }
+  return reqEnv("OAUTH_PROVIDER_SECRET");
 }
 
 const app = await alchemy("servicenow-codemode-mcp", {
-  // Fail-closed (plan §P6a, finding 26): the Alchemy encrypted-state password MUST be the real
-  // OAUTH_PROVIDER_SECRET — never a hardcoded dev fallback. reqEnv throws when it is unset,
-  // matching the Worker-secret bindings below (which already fail closed via reqEnv).
-  password: reqEnv("OAUTH_PROVIDER_SECRET"),
+  // Fail-closed: the Alchemy encrypted-state password must be provided explicitly or, for
+  // existing deployments, be the same value previously supplied via OAUTH_PROVIDER_SECRET.
+  // Destroy mode accepts ALCHEMY_PASSWORD/ALCHEMY_STATE_PASSWORD so incident teardown does not
+  // depend on a valid production OIDC provider-secret configuration.
+  password: alchemyStatePassword(),
 });
+
+if (isDestroyMode) {
+  await app.finalize();
+  process.exit(0);
+}
+
+if (process.env.DEPLOYMENT_PROFILE?.trim() !== "production") {
+  throw new Error('Alchemy deploy requires DEPLOYMENT_PROFILE="production".');
+}
 
 // Adopt the KV namespaces already created in the account (by title).
 const SCHEMA_KV = await KVNamespace("SCHEMA_KV", { title: "servicenow-codemode-SCHEMA_KV", adopt: true });
@@ -110,13 +132,10 @@ const bindings = {
       }
     : {}),
   X_MCP_EXECUTOR_HMAC_KEY: alchemy.secret(reqEnv("X_MCP_EXECUTOR_HMAC_KEY")),
-  // Token KEK ring (P3): require TOKEN_KEK_CURRENT (preferred) or legacy TOKEN_KEK and bind
-  // whichever are present. The host reads `TOKEN_KEK_CURRENT ?? TOKEN_KEK`, so a versioned-only
-  // config (no legacy alias) must still deploy. See alchemy.bindings.ts.
+  // Token KEK ring (P3): require TOKEN_KEK_CURRENT and pass TOKEN_KEK_PREV only during rotation.
   ...tokenKekBindings(process.env, (v) => alchemy.secret(v)),
   OAUTH_PROVIDER_SECRET: alchemy.secret(reqEnv("OAUTH_PROVIDER_SECRET")),
   ...(process.env.OIDC_CLIENT_SECRET ? { OIDC_CLIENT_SECRET: alchemy.secret(process.env.OIDC_CLIENT_SECRET) } : {}),
-  ...(process.env.SNAPSHOT_KEK ? { SNAPSHOT_KEK: alchemy.secret(process.env.SNAPSHOT_KEK) } : {}),
   ...(process.env.SNOW_OAUTH_CLIENT_SECRET ? { SNOW_OAUTH_CLIENT_SECRET: alchemy.secret(process.env.SNOW_OAUTH_CLIENT_SECRET) } : {}),
   ...(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS ? { ADMIN_SCRIPT_APPROVAL_TOKENS: alchemy.secret(process.env.ADMIN_SCRIPT_APPROVAL_TOKENS) } : {}),
   // Versioned snapshot-KEK ring (P3). Optional until provisioned; never reqEnv yet so the
@@ -131,11 +150,9 @@ assertProductionPosture({
   ...bindings,
   MCP_OPERATOR_SECRET: process.env.MCP_OPERATOR_SECRET,
   X_MCP_EXECUTOR_HMAC_KEY: process.env.X_MCP_EXECUTOR_HMAC_KEY,
-  TOKEN_KEK: process.env.TOKEN_KEK,
   TOKEN_KEK_CURRENT: process.env.TOKEN_KEK_CURRENT,
   OAUTH_PROVIDER_SECRET: process.env.OAUTH_PROVIDER_SECRET,
   OIDC_CLIENT_SECRET: process.env.OIDC_CLIENT_SECRET,
-  SNAPSHOT_KEK: process.env.SNAPSHOT_KEK,
   SNAPSHOT_KEK_CURRENT: process.env.SNAPSHOT_KEK_CURRENT,
   SNOW_OAUTH_CLIENT_SECRET: process.env.SNOW_OAUTH_CLIENT_SECRET,
   ADMIN_SCRIPT_APPROVAL_TOKENS: process.env.ADMIN_SCRIPT_APPROVAL_TOKENS,

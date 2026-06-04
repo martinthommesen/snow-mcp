@@ -7,7 +7,7 @@ import { permissivePolicy, type ActorPolicy } from "../src/authz/actor-policy.js
 import type { SnHttpClient, SnRequest, SnResponse } from "../src/sn/http.js";
 import { mutationLedgerObjectName, type LedgerHandle, type RunContext } from "../src/sn/mutation-guard.js";
 import type { AuditRecord } from "../src/observability/audit.js";
-import { MUTATION_REPLAY_MAX_BYTES } from "../src/sn/replay-payload.js";
+import { MUTATION_REPLAY_MAX_BYTES, visibleReplayResult, type ReplaySafeWrapper } from "../src/sn/replay-payload.js";
 
 // ─── Phase P4 — the unwired safety layers, now WIRED into the live mutating path ─────
 // These exercise the real ServiceNowRPC.tableUpdate / runServerScript against a mock SN,
@@ -607,10 +607,12 @@ describe("Phase 1A — row filters are enforced on tableUpdate", () => {
 
     const out = await r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } });
     expect(out).toEqual({ sys_id: SYS_ID, state: "2" });
-    expect(completed).toEqual([{ sys_id: SYS_ID, state: "2" }]);
+    expect(completed).toHaveLength(1);
+    expect(visibleReplayResult(completed[0] as ReplaySafeWrapper)).toEqual({ sys_id: SYS_ID, state: "2" });
+    expect(JSON.stringify(completed[0])).not.toContain("raw-caller");
   });
 
-  it("masks legacy completed tableUpdate replay rows that were stored raw", async () => {
+  it("rejects raw completed tableUpdate replay rows that are not replay-safe", async () => {
     const ledger: LedgerHandle = {
       begin: async () => ({ state: "replay", result: { sys_id: SYS_ID, state: "2", caller_id: "raw-caller" } }),
       complete: async () => {},
@@ -623,9 +625,8 @@ describe("Phase 1A — row filters are enforced on tableUpdate", () => {
       ledger: () => ledger,
     });
 
-    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).resolves.toEqual({
-      sys_id: SYS_ID,
-      state: "2",
+    await expect(r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } })).rejects.toMatchObject({
+      code: "internal_error",
     });
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });

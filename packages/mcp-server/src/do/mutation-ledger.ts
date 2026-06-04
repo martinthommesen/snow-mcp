@@ -37,7 +37,8 @@ function nextExpiry(): number {
 
 export type NormalizedLedgerRecord =
   | { kind: "missing" | "expired" }
-  | { kind: "active" | "migrated"; record: LedgerRecord };
+  | { kind: "migrated"; record: LedgerRecord }
+  | { kind: "active"; record: LedgerRecord };
 
 export function normalizeLedgerRecordForStorage(
   rec: Partial<LedgerRecord> | undefined,
@@ -60,15 +61,30 @@ export function normalizeLedgerRecordForStorage(
       }
       return { kind: "expired" };
     }
+    if (rec.status === "completed") {
+      return {
+        kind: "migrated",
+        record: {
+          status: "completed",
+          requestHash: rec.requestHash,
+          expiresAt: rec.expiresAt,
+          result: replaySafeResult(rec.result),
+        },
+      };
+    }
     return { kind: "active", record: rec as LedgerRecord };
   }
-  const record: LedgerRecord = {
-    status: rec.status as LedgerStatus,
-    requestHash: rec.requestHash,
-    expiresAt: now + MUTATION_LEDGER_RETENTION_MS,
-    ...(rec.status === "completed" && "result" in rec ? { result: replaySafeResult(rec.result) } : {}),
+  if (rec.status === "failed") return { kind: "expired" };
+  const retainedStatus = rec.status as Exclude<LedgerStatus, "failed">;
+  return {
+    kind: "migrated",
+    record: {
+      status: retainedStatus,
+      requestHash: rec.requestHash,
+      expiresAt: now + MUTATION_LEDGER_RETENTION_MS,
+      ...(retainedStatus === "completed" ? { result: replaySafeResult(rec.result) } : {}),
+    },
   };
-  return { kind: "migrated", record };
 }
 
 export class MutationLedgerDO extends DurableObject {
@@ -79,12 +95,12 @@ export class MutationLedgerDO extends DurableObject {
       if (rec) await this.ctx.storage.delete(RECORD_KEY);
       return undefined;
     }
+    if (normalized.kind === "active") return normalized.record;
     if (normalized.kind === "migrated") {
       await this.ctx.storage.put(RECORD_KEY, normalized.record);
       await this.ctx.storage.setAlarm(normalized.record.expiresAt);
       return normalized.record;
     }
-    if (normalized.kind === "active") return normalized.record;
     return undefined;
   }
 
@@ -127,19 +143,19 @@ export class MutationLedgerDO extends DurableObject {
     // record (which would stamp a result under an empty requestHash, replaying it for
     // ANY future hash). A stray complete() is a no-op (P4 fix of the :56 fabrication bug).
     const rec = await this.getActiveRecord();
-    if (!rec) return;
+    if (!rec || rec.status !== "started") return;
     await this.putRecord({ status: "completed", requestHash: rec.requestHash, result: replaySafeResult(result) });
   }
 
   async fail(): Promise<void> {
     const rec = await this.getActiveRecord();
-    if (rec) await this.putRecord({ status: "failed", requestHash: rec.requestHash });
+    if (rec?.status === "started") await this.putRecord({ status: "failed", requestHash: rec.requestHash });
   }
 
   /** Mark an outcome unknown (e.g. runServerScript timed out). Blocks future retries (S17). */
   async markIndeterminate(): Promise<void> {
     const rec = await this.getActiveRecord();
-    if (rec) await this.putRecord({ status: "indeterminate", requestHash: rec.requestHash });
+    if (rec?.status === "started") await this.putRecord({ status: "indeterminate", requestHash: rec.requestHash });
   }
 
   async status(): Promise<LedgerStatus | "none"> {

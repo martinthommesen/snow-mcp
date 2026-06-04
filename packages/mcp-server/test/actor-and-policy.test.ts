@@ -6,6 +6,7 @@ import {
   maskRow,
   assertRequestedFieldsAllowed,
   assertQueryFieldsAllowed,
+  denyAllPolicy,
   permissivePolicy,
   loadActorPolicy,
   loadNamedActorPolicies,
@@ -167,15 +168,14 @@ describe("§2.12 ActorPolicy (B5)", () => {
   });
 });
 
-// ─── §6b — loadActorPolicy (config-driven restrictive policy; NON-BREAKING default) ──
+// ─── §6b — loadActorPolicy (config-driven restrictive policy; fail-closed default) ──
 describe("§6b loadActorPolicy", () => {
   const INSTANCE = "inst1.service-now.com";
 
-  it("falls back to the PERMISSIVE single-operator policy when NO policy config is set", () => {
+  it("denies all tables when NO policy config is set", () => {
     const p = loadActorPolicy({}, INSTANCE);
-    // Same shape as permissivePolicy: no allowlist, no masks, admin_script, unbounded ceilings.
-    expect(p).toEqual(permissivePolicy([INSTANCE]));
-    expect(() => assertActorPolicy(p, { instance: INSTANCE, table: "anything", mode: "admin_script" })).not.toThrow();
+    expect(p).toEqual(denyAllPolicy(INSTANCE));
+    expect(() => assertActorPolicy(p, { instance: INSTANCE, table: "anything", mode: "read_only" })).toThrow(McpToolError);
   });
 
   it("builds a RESTRICTIVE policy when config IS provided and denies a non-allowlisted table", () => {
@@ -183,6 +183,12 @@ describe("§6b loadActorPolicy", () => {
     const p = loadActorPolicy(env, INSTANCE);
     expect(() => assertActorPolicy(p, { instance: INSTANCE, table: "incident", mode: "read_only" })).not.toThrow();
     expect(() => assertActorPolicy(p, { instance: INSTANCE, table: "sys_user", mode: "read_only" })).toThrow(McpToolError);
+  });
+
+  it("keeps partial policy config without a table allowlist deny-all", () => {
+    const p = loadActorPolicy({ ACTOR_POLICY_MAX_MODE: "read_only" }, INSTANCE);
+    expect(p.tables).toEqual({ allow: [] });
+    expect(() => assertActorPolicy(p, { instance: INSTANCE, table: "incident", mode: "read_only" })).toThrow(McpToolError);
   });
 
   it("anchors allowlist entries to a WHOLE-name match (no substring leak)", () => {

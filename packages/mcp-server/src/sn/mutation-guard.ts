@@ -18,6 +18,7 @@
 import { McpToolError } from "./errors.js";
 import { buildAuditRecord, emitAudit, hashValue, type AuditSink, type MutationOp } from "../observability/audit.js";
 import type { Mode } from "@servicenow-codemode/shared";
+import type { LedgerStatus } from "../do/mutation-ledger.js";
 
 export type { AuditSink } from "../observability/audit.js";
 
@@ -87,14 +88,20 @@ export async function tableUpdateRequestHash(input: {
   ]);
 }
 
-/** runServerScript effect hash: method, script, reason, effectiveMode, instance, actor —
- *  EXCLUDING the volatile nonce/issued_at/signature the signing layer adds per send. */
+/** runServerScript effect hash: method, script, reason, effectiveMode, instance, actor, policy
+ *  scope — EXCLUDING the volatile nonce/issued_at/signature the signing layer adds per send.
+ *  `policyScope` is folded in (symmetric with tableUpdateRequestHash) so ANY ActorPolicy change
+ *  deterministically blocks a completed replay, not only the dimensions a side gate happens to
+ *  re-check. NOTE: this changes the hash derivation — an in-flight mutation recorded under the
+ *  prior (policy-scope-less) hash and retried across the deploy that ships this will see a
+ *  hash mismatch and be BLOCKED (idempotency_conflict), never double-applied (fail-safe). */
 export async function runServerScriptRequestHash(input: {
   script: string;
   reason: string;
   mode: Mode;
   instance: string;
   actorUserId: string;
+  policyScope: string;
 }): Promise<string> {
   return hashValue([
     "runServerScript",
@@ -103,6 +110,7 @@ export async function runServerScriptRequestHash(input: {
     input.mode,
     input.instance,
     input.actorUserId,
+    input.policyScope,
   ]);
 }
 
@@ -121,7 +129,11 @@ export interface LedgerHandle {
 export type LedgerBegin =
   | { state: "new" }
   | { state: "replay"; result: unknown }
-  | { state: "blocked"; status: string };
+  | { state: "blocked"; status: LedgerStatus };
+
+export type GuardMutationResult<T> =
+  | { state: "executed"; result: T }
+  | { state: "replay"; result: T };
 
 /** Host-authoritative per-run context threaded from run_code (never snippet-supplied). */
 export interface RunContext {
@@ -221,7 +233,7 @@ function auditEffectInput<T>(guard: MutationGuard, eff: GuardedEffect<T>, dateKe
  *      effect (it already applied) and does NOT mark indeterminate (the result IS known) — but
  *      the durable row then stays "intent", reading as unresolved, never a false success.
  */
-export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<T>): Promise<T> {
+export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<T>): Promise<GuardMutationResult<T>> {
   // L-2: pin the audit-key date ONCE at intent time and reuse it for the outcome (ok/error) row, so
   // intent + outcome share an AUDIT_KV key even if the effect straddles UTC midnight (deriving the
   // date from each row's own write-time `ts` would leave the day-D intent row orphaned/unresolved).
@@ -237,8 +249,8 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
       { ledger: Boolean(guard.ledger), audit: Boolean(guard.audit) },
     );
   }
-  // The tool-level idempotencyKey is mandatory for any mutation (no host-generated
-  // fallback). A missing key is itself a DENIAL and is audited as such.
+  // The tool-level idempotencyKey is mandatory for any mutation. A missing key is itself
+  // a DENIAL and is audited as such.
   if (!guard.run.runKey) {
     const err = new McpToolError("capability_denied", "mutations require an idempotencyKey.");
     await emitDenial(guard, eff, err);
@@ -263,7 +275,7 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
         await emitDenial(guard, eff, e);
         throw e;
       }
-      return claim.result as T;
+      return { state: "replay", result: claim.result as T };
     }
     if (claim.state === "blocked") {
       const err = new McpToolError("idempotency_conflict", `Idempotency conflict (${claim.status}) — retry blocked.`, {
@@ -326,10 +338,28 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
     outcome = await eff.effect();
   } catch (e) {
     const indeterminate = eff.isIndeterminate ? eff.isIndeterminate(e) : true;
-    if (indeterminate) {
-      await ledger?.markIndeterminate();
-    } else {
-      await ledger?.fail();
+    // A ledger write failing HERE must not mask the real effect error `e`. Safety is preserved
+    // either way: a markIndeterminate()/fail() that throws leaves the record "started" (a retry
+    // is BLOCKED, never double-applied — conservative even for the clean-fail case). Log + swallow
+    // the ledger error, then re-throw the original `e` so the caller/audit sees the true cause.
+    try {
+      if (indeterminate) {
+        await ledger?.markIndeterminate();
+      } else {
+        await ledger?.fail();
+      }
+    } catch (ledgerErr) {
+      console.error(
+        JSON.stringify({
+          event: "ledger_mark_failed_after_effect",
+          severity: "alert",
+          requestId: guard.run.requestId,
+          ordinal: eff.ordinal,
+          op: eff.op,
+          indeterminate,
+          error: ledgerErr instanceof Error ? ledgerErr.message : String(ledgerErr),
+        }),
+      );
     }
     // AUDIT THE OUTCOME: the effect threw — the durable intent row at this ordinal key must
     // NOT stay "ok". Supersede it with an "error" row (same key) carrying the error class +
@@ -342,6 +372,8 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
 
   // 6) Confirmed success — record the result, then audit the outcome. A post-effect
   // ledger.complete failure is a durability gap, not an unknown effect: the result is known.
+  // The record then stays "started", so a later retry of this idempotency key is BLOCKED
+  // (conflict) until its retention expires — the `alert` log below is the operator signal.
   try {
     await ledger?.complete(outcome.result);
   } catch (e) {
@@ -370,7 +402,7 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
       // A dropped success-audit row is a durability gap, not a correctness one.
     }
   }
-  return outcome.result;
+  return { state: "executed", result: outcome.result };
 }
 
 async function emitDenial<T>(guard: MutationGuard, eff: GuardedEffect<T>, err: unknown): Promise<void> {

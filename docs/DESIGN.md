@@ -1,8 +1,7 @@
 # DESIGN — ServiceNow Code Mode MCP Server
 
 The durable design: what this builds, why it is shaped this way, and the decisions that are
-settled. Phase-by-phase build history lives in [`archive/DEVELOPMENT_PLAN.md`](archive/DEVELOPMENT_PLAN.md);
-the per-control threat reasoning is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
+settled. The per-control threat reasoning is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 ## What this builds
 
@@ -39,7 +38,7 @@ Concretely:
 ```
 MCP client ──Streamable HTTP (Origin-validated)──▶
 OAuthProvider (workers-oauth-provider)            ← client↔Worker OAuth 2.1
-  ├─ /authorize /token /register  → operator-secret consent OR enterprise OIDC RP flow
+  ├─ /authorize /token /register  → pilot operator-secret consent OR enterprise OIDC RP flow
   ├─ /oidc/callback               → IdP code exchange + ID-token validation + grant props
   └─ apiRoute /mcp → apiHandler → createMcpHandler(createServer()) [per request]
         ├─ getMcpAuthContext() → mcp_actor {userId, email}; instanceHost
@@ -115,7 +114,7 @@ read-only default cannot be bypassed by asking for `admin_script`. `admin_script
 **fail-closed**: empty `ADMIN_SCRIPT_*` settings deny it; it additionally requires an allowlisted
 actor plus a Cloudflare Access-group membership or a tenant approval token, and a mandatory `reason`.
 
-Mutations **hard-require a tool-level `idempotencyKey`** (fail-closed, no host-generated fallback) —
+Mutations **hard-require a tool-level `idempotencyKey`** (fail-closed, no host-generated key) —
 this is the exactly-once anchor. The ledger is leveled: L1 replays return the original result; L2
 `indeterminate` blocks the retry; L3 is a documented limit (the host wraps the top-level call, not
 the script's internal GlideRecord operations).
@@ -140,8 +139,9 @@ the HMAC.
 > **Cautionary tale (why the scoped role-ACL path is the only canonical surface).** A now-deleted
 > *global* numeric REST endpoint had a dead verify-reject branch (`if (!verify(...))` is always false
 > because `verify()` returns an object), so it executed every request with **no signature check and
-> no role ACL**. That global install path was removed, and `SNOW_EXECUTOR_PATH` must point at the
-> two-segment scoped path `/api/<scope>/x_mcp/executor/run`.
+  > no role ACL**. That global install path was removed, and production preflight now requires
+  > `SNOW_EXECUTOR_PATH` to point at the two-segment scoped path
+  > `/api/<scope>/x_mcp/executor/run`.
 
 Role separation of duty and the credential-mode role footprint are in
 [`ROLE_MATRIX.md`](ROLE_MATRIX.md); the ServiceNow-side egress controls in
@@ -156,7 +156,7 @@ Settled. If evidence contradicts one, stop and record it in [`DELTAS.md`](DELTAS
 | MCP server shape | Stateless `createMcpHandler` (`agents/mcp`) | Cloudflare's current recommended shape |
 | MCP client auth | `@cloudflare/workers-oauth-provider` (OAuth 2.1); identity via `getMcpAuthContext()` | Distinct layer from ServiceNow OAuth; Worker issues its own client token |
 | Enterprise identity | In-Worker OIDC authorization-code + PKCE (`AUTH_MODE=oidc`) | MCP OAuth grants are backed by IdP `sub` + group-derived ceilings/policies |
-| ServiceNow credential mode | `integration_user` (single-operator) or `per_user_oauth` (multi-user) | Multi-user needs `per_user_oauth` **or** `integration_user`+`ActorPolicy` |
+| ServiceNow credential mode | `integration_user` (pilot/single-operator) or `per_user_oauth` (enterprise/multi-user) | Production preflight requires `per_user_oauth`; pilot still supports `integration_user`+`ActorPolicy` |
 | Actor attribution | Host HMAC-signs the actor payload; the scoped executor verifies it (freshness + nonce, fail-closed) | A claimed `body.actor` is forgeable; sign+verify makes integration-mode attribution real |
 | Authorization (mode) | `effectiveMode = min(requested, OAuth-scope, tenant, instance)`; `admin_script` gated by allowlist + approval | A requested mode must only narrow, never grant |
 | Per-actor policy | `ActorPolicy` enforced host-side before every RPC (instances / tables / fields / rows / bytes / mode) | In `integration_user` mode, audit ≠ access control; reads need a real boundary |
@@ -176,7 +176,7 @@ Settled. If evidence contradicts one, stop and record it in [`DELTAS.md`](DELTAS
 type ServiceNowCredentialMode = "integration_user" | "per_user_oauth";
 ```
 
-- **`integration_user` (single-operator default).** The Worker authenticates as one broad service
+- **`integration_user` (explicit pilot/single-operator mode).** The Worker authenticates as one broad service
   identity. This delivers maximum access, but ServiceNow-side audit then shows the service identity,
   not the human — so every mutating/executor call **must** record host-signed actor metadata, and
   **`ActorPolicy` gates every read**, because a broad identity otherwise lets any MCP user read
@@ -193,12 +193,14 @@ type ServiceNowCredentialMode = "integration_user" | "per_user_oauth";
 type AuthMode = "operator_secret" | "oidc";
 ```
 
-- **`operator_secret` (pilot/dev).** `/authorize` renders the local consent form and requires
-  `MCP_OPERATOR_SECRET` plus `MCP_OPERATOR_USER_ID`. This is retained for controlled pilot bring-up.
+- **`operator_secret` (pilot/dev only).** `/authorize` renders the local consent form and requires
+  `MCP_OPERATOR_SECRET` plus `MCP_OPERATOR_USER_ID`. `DEPLOYMENT_PROFILE=production` rejects this
+  mode and any configured `MCP_OPERATOR_SECRET`.
 - **`oidc` (enterprise).** `/authorize` redirects to the configured IdP with PKCE, `state`, and
   `nonce`; `/oidc/callback` consumes the stored state once, validates the signed ID token, and
-  completes the MCP OAuth grant with `userId=sub`. `props.maxMode` is
-  `min(MCP requested scopes, OIDC group policy maxMode)`, and `props.actorPolicyName` selects a
+  completes the MCP OAuth grant with a `userId` derived from `sub` (`oidc-<sub>`). `props.maxMode`
+  is `min(granted MCP scopes, OIDC group policy maxMode)` (each access token is further narrowed to
+  its requested scopes), and `props.actorPolicyName` selects a
   named host-side `ActorPolicy` loaded from `ACTOR_POLICIES_JSON`.
 
 OIDC `email` is treated as a ServiceNow-linking hint only when the signed ID token also carries
@@ -209,9 +211,14 @@ or an IdP-side verified-email configuration.
 OIDC grants persist the IdP refresh token in OAuth-provider grant props, but strip it from MCP
 access-token props. On MCP refresh-token exchange the Worker refreshes the IdP token and
 re-evaluates group-derived `maxMode` and `actorPolicyName`, so group removal downgrades both the
-capability ceiling and the table/row/field policy at the next MCP refresh. Equal-risk group
-mappings must agree on the named `ActorPolicy`; conflicting policies at the same risk are rejected
-instead of depending on JSON/object iteration order.
+capability ceiling and the table/row/field policy at the next MCP refresh. Re-evaluation is bound
+to the access-token lifetime (the OAuth provider's default TTL, ~1h): a removed group keeps its
+prior `maxMode` until the access token expires and the client refreshes, so revocation is
+eventually-consistent within that window, not instantaneous. Removal from ALL mapped groups
+DOWNGRADES to `read_only`/`default` (not a hard deny); a hard deny requires the IdP to deprovision
+the user so the refresh itself fails. Equal-risk group mappings must agree on the named
+`ActorPolicy`; conflicting policies at the same risk are rejected instead of depending on
+JSON/object iteration order.
 
 ## ServiceNow OAuth
 

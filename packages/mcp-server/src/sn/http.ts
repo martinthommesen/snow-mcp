@@ -4,6 +4,7 @@
 // instance (Phase 1.5 — NOT verified here).
 
 import { canonicalizeInstanceHost, type InstanceAllowlist } from "./url-allowlist.js";
+import type { ServiceNowRequestBudget } from "./run-budget.js";
 
 export interface SnRequest {
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -13,6 +14,8 @@ export interface SnRequest {
   body?: unknown;
   /** Pre-serialized JSON body; used when callers validate/count exact outbound bytes up front. */
   bodyJson?: string;
+  /** Current tool-run budget, used only by host-side authorization refresh/mint traffic. */
+  budget?: ServiceNowRequestBudget;
 }
 
 export interface SnResponse {
@@ -33,7 +36,7 @@ export interface SnFetchClientOptions {
    * Returns the full `Authorization` header value (e.g. "Bearer <tok>" for OAuth, or
    * "Basic <b64>" for the dev path). Called per request so rotation is transparent.
    */
-  getAuthorization: () => Promise<string>;
+  getAuthorization: (budget?: ServiceNowRequestBudget) => Promise<string>;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
@@ -41,7 +44,7 @@ export interface SnFetchClientOptions {
 /**
  * Concrete ServiceNow client. Validates host + path, injects the bearer host-side,
  * and applies a request timeout. Retry/jitter on 429/5xx is a Phase-1.5 addition.
- * NOTE: network behavior is unverified locally — see OPEN_QUESTIONS.md.
+ * NOTE: network behavior is unverified locally — see docs/DELTAS.md.
  */
 export class SnFetchClient implements SnHttpClient {
   private readonly host: string;
@@ -73,7 +76,7 @@ export class SnFetchClient implements SnHttpClient {
     }
     for (const [k, v] of Object.entries(req.query ?? {})) url.searchParams.set(k, v);
 
-    const authorization = await this.opts.getAuthorization();
+    const authorization = await this.opts.getAuthorization(req.budget);
     const fetchImpl = this.opts.fetchImpl ?? fetch;
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), this.opts.timeoutMs ?? 30_000);

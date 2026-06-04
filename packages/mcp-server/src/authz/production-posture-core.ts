@@ -1,4 +1,7 @@
-import { parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
+import { isValidMode, parseAuthMode, type AuthMode, type Mode } from "@servicenow-codemode/shared";
+import { decodeFixedBase64Secret } from "../auth/encoding.js";
+import { looksLikeStrongSecret } from "../auth/crypto.js";
+import { FIELD_NAME_RE, hasEncodedQueryStructuralOperator, TABLE_NAME_RE } from "../sn/validate.js";
 
 export type DeploymentProfile = "pilot" | "production";
 
@@ -12,18 +15,18 @@ export interface PostureEnv {
   WORKER_PUBLIC_ORIGIN?: string;
   MCP_OPERATOR_SECRET?: string;
   MCP_OPERATOR_USER_ID?: string;
-  TOKEN_KEK?: string;
   TOKEN_KEK_CURRENT?: string;
   OAUTH_PROVIDER_SECRET?: string;
   X_MCP_EXECUTOR_HMAC_KEY?: string;
   SNOW_EXECUTOR_VERIFIER_ATTESTED?: string;
   SNAPSHOT_ENABLED_TABLES?: string;
   SNAPSHOT_KV?: unknown;
-  SNAPSHOT_KEK?: string;
   SNAPSHOT_KEK_CURRENT?: string;
   ALLOW_LOCALHOST?: string;
   ALLOWED_ORIGINS?: string;
+  ADMIN_SCRIPT_ALLOWLIST?: string;
   ADMIN_SCRIPT_APPROVAL_TOKENS?: string;
+  ADMIN_SCRIPT_REQUIRED_GROUP?: string;
   SNOW_INSTANCE_HOST?: string;
   SNOW_EXECUTOR_PATH?: string;
   SNOW_DEV_ROPC?: string;
@@ -72,10 +75,7 @@ const coreBindings = [
   "CONSENT_RATE_DO",
 ] as const satisfies readonly (keyof PostureEnv)[];
 
-const modeSet = new Set(["read_only", "write", "admin_script"]);
 const scopedExecutorPath = /^\/api\/(x|sn)_[a-z0-9_]+\/x_mcp\/executor\/run$/;
-const actorPolicyTableNameRe = /^[a-z0-9_]{1,80}$/;
-const actorPolicyFieldNameRe = /^[a-z0-9_.]{1,80}$/;
 const onceCache = new WeakMap<object, true | ProductionPostureError>();
 let warnedPilot = false;
 
@@ -83,10 +83,6 @@ export function parseDeploymentProfile(value: string | undefined): DeploymentPro
   const trimmed = value?.trim();
   if (trimmed === "pilot" || trimmed === "production") return trimmed;
   return undefined;
-}
-
-function isValidMode(value: unknown): value is Mode {
-  return typeof value === "string" && modeSet.has(value);
 }
 
 function hasText(value: string | undefined): boolean {
@@ -145,13 +141,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function looksLikeStrongSecret(secret: string): boolean {
-  const s = secret.trim();
-  const base64ish = /^[A-Za-z0-9+/_-]+={0,2}$/.test(s) && s.replace(/=+$/, "").length >= 43;
-  const hexish = /^[0-9a-fA-F]+$/.test(s) && s.length >= 64;
-  return base64ish || hexish;
-}
-
 function strongSecret(value: string | undefined): boolean {
   return hasText(value) && looksLikeStrongSecret(value!);
 }
@@ -169,26 +158,6 @@ function validateStrongTokenList(violations: string[], label: string, value: str
   for (const token of tokens) {
     if (!looksLikeStrongSecret(token)) violations.push(`${label} entries must be strong CSPRNG secrets.`);
   }
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  const bin = atob(value);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function decodeFixedBase64Secret(value: string | undefined, expectedBytes: number): void {
-  const normalized = (value ?? "").trim();
-  if (
-    normalized.length === 0 ||
-    !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) ||
-    normalized.length % 4 === 1
-  ) {
-    throw new Error("invalid base64");
-  }
-  const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4)) % 4, "=");
-  if (base64ToBytes(padded).length !== expectedBytes) throw new Error("wrong length");
 }
 
 function validateModeCeiling(violations: string[], label: string, value: unknown, allowAdminScript: boolean): void {
@@ -233,14 +202,14 @@ function validateActorPolicyTableAllowlist(violations: string[], label: string, 
     violations.push(`${label} is set but contains no table names.`);
   }
   for (const table of tables) {
-    if (!actorPolicyTableNameRe.test(table)) {
+    if (!TABLE_NAME_RE.test(table)) {
       violations.push(`${label} contains invalid table name "${table}".`);
     }
   }
 }
 
 function validateUniqueActorPolicyTable(violations: string[], label: string, seen: Set<string>, table: string, entry: string): boolean {
-  if (!actorPolicyTableNameRe.test(table)) {
+  if (!TABLE_NAME_RE.test(table)) {
     violations.push(`${label} contains invalid table name "${table}" in entry "${entry}".`);
     return false;
   }
@@ -280,7 +249,7 @@ function validateActorPolicyFieldMasks(violations: string[], label: string, valu
     if (fields.length === 0) violations.push(`${label} entry must include at least one field, got "${entry}".`);
     if (validTable) {
       for (const field of fields) {
-        if (!actorPolicyFieldNameRe.test(field)) {
+        if (!FIELD_NAME_RE.test(field)) {
           violations.push(`${label} contains invalid field name "${field}" in entry "${entry}".`);
         }
       }
@@ -295,23 +264,10 @@ function validateActorPolicyRowFilters(violations: string[], label: string, valu
     const filter = rawValue.trim();
     if (!filter) {
       violations.push(`${label} entry must include a non-empty encoded query, got "${entry}".`);
-    } else if (hasActorPolicyStructuralOperator(filter)) {
+    } else if (hasEncodedQueryStructuralOperator(filter)) {
       violations.push(`${label} contains a self-defeating structural operator.`);
     }
   }
-}
-
-function hasActorPolicyStructuralOperator(query: string): boolean {
-  for (let i = 0; i < query.length; i++) {
-    const atStart = i === 0;
-    const afterCaret = query.charCodeAt(i) === 94; // ^
-    if (!atStart && !afterCaret) continue;
-    const tokenStart = afterCaret ? i + 1 : i;
-    if (query.startsWith("ORDERBYDESC", tokenStart) || query.startsWith("ORDERBY", tokenStart)) continue;
-    const op = query.slice(tokenStart, tokenStart + 2).toUpperCase();
-    if (op === "OR" || op === "NQ" || op === "EQ") return true;
-  }
-  return false;
 }
 
 function validateActorPolicyPositiveInt(violations: string[], label: string, value: unknown): void {
@@ -347,23 +303,28 @@ function validateActorPolicyEnv(violations: string[], label: string, policy: Rec
   validateActorPolicyMode(violations, `${label}.ACTOR_POLICY_MAX_MODE`, policy.ACTOR_POLICY_MAX_MODE);
 }
 
-function validateActorPolicy(violations: string[], env: PostureEnv): Set<string> {
+interface ActorPolicyValidation {
+  names: Set<string>;
+  tableAllowlists: Map<string, boolean>;
+}
+
+function validateActorPolicy(violations: string[], env: PostureEnv): ActorPolicyValidation {
   const policyNames = new Set<string>(["default"]);
+  const tableAllowlists = new Map<string, boolean>();
+  if (hasText(env.ACTOR_POLICY_TABLE_ALLOWLIST)) tableAllowlists.set("default", true);
   const namedPolicies = parseJsonObject(violations, "ACTOR_POLICIES_JSON", env.ACTOR_POLICIES_JSON);
   const jsonDefault = namedPolicies?.default;
   const jsonDefaultAllowlist = isRecord(jsonDefault) && typeof jsonDefault.ACTOR_POLICY_TABLE_ALLOWLIST === "string"
     ? jsonDefault.ACTOR_POLICY_TABLE_ALLOWLIST
     : undefined;
-  if (!hasText(env.ACTOR_POLICY_TABLE_ALLOWLIST) && !hasText(jsonDefaultAllowlist)) {
-    violations.push("ActorPolicy default table allowlist must be set in production.");
-  }
+  if (hasText(jsonDefaultAllowlist)) tableAllowlists.set("default", true);
   validateActorPolicyEnv(violations, "ACTOR_POLICY", env as Record<string, unknown>);
   if (namedPolicies) {
     for (const name of Object.keys(namedPolicies)) {
       if (/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) policyNames.add(name);
     }
   }
-  if (!namedPolicies) return policyNames;
+  if (!namedPolicies) return { names: policyNames, tableAllowlists };
   for (const [name, policy] of Object.entries(namedPolicies)) {
     if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) {
       violations.push(`ACTOR_POLICIES_JSON contains invalid policy name "${name}".`);
@@ -378,15 +339,16 @@ function validateActorPolicy(violations: string[], env: PostureEnv): Set<string>
       violations.push(`ACTOR_POLICIES_JSON.${name} must configure at least one ACTOR_POLICY_* setting.`);
     }
     const tableAllowlist = typeof policy.ACTOR_POLICY_TABLE_ALLOWLIST === "string" ? policy.ACTOR_POLICY_TABLE_ALLOWLIST : undefined;
+    if (hasText(tableAllowlist)) tableAllowlists.set(name, true);
     if (!hasText(tableAllowlist)) {
       violations.push(`ACTOR_POLICIES_JSON.${name}.ACTOR_POLICY_TABLE_ALLOWLIST must be set in production.`);
     }
     validateActorPolicyEnv(violations, `ACTOR_POLICIES_JSON.${name}`, policy);
   }
-  return policyNames;
+  return { names: policyNames, tableAllowlists };
 }
 
-function validateOidcPolicyReferences(violations: string[], env: PostureEnv, policyNames: ReadonlySet<string>): void {
+function validateOidcPolicyReferences(violations: string[], env: PostureEnv, policyNames: ReadonlySet<string>): Set<string> {
   const defaultPolicy = env.OIDC_DEFAULT_POLICY_NAME?.trim() || "default";
   const referenced = new Set<string>([defaultPolicy]);
   const groupMap = parseJsonObject(violations, "OIDC_GROUP_POLICY_MAP", env.OIDC_GROUP_POLICY_MAP);
@@ -412,6 +374,20 @@ function validateOidcPolicyReferences(violations: string[], env: PostureEnv, pol
   for (const policyName of referenced) {
     if (!policyNames.has(policyName)) {
       violations.push(`OIDC_GROUP_POLICY_MAP references unknown ActorPolicy "${policyName}".`);
+    }
+  }
+  return referenced;
+}
+
+function validateReferencedActorPolicyAllowlists(
+  violations: string[],
+  referenced: ReadonlySet<string>,
+  actorPolicies: ActorPolicyValidation,
+): void {
+  for (const policyName of referenced) {
+    if (!actorPolicies.names.has(policyName)) continue;
+    if (!actorPolicies.tableAllowlists.get(policyName)) {
+      violations.push(`Referenced ActorPolicy "${policyName}" table allowlist must be set in production.`);
     }
   }
 }
@@ -456,7 +432,8 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     return [];
   }
 
-  const actorPolicyNames = validateActorPolicy(violations, env);
+  const actorPolicies = validateActorPolicy(violations, env);
+  let referencedActorPolicies = new Set<string>(["default"]);
 
   if (env.SERVICENOW_CREDENTIAL_MODE !== "per_user_oauth") {
     violations.push('SERVICENOW_CREDENTIAL_MODE must be "per_user_oauth" in production.');
@@ -467,6 +444,9 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   } catch {
     violations.push('AUTH_MODE must be "operator_secret" or "oidc".');
   }
+  if (authMode !== undefined && authMode !== "oidc") {
+    violations.push('AUTH_MODE must be "oidc" in production.');
+  }
   if (!hasText(env.SNOW_OAUTH_CLIENT_ID)) violations.push("SNOW_OAUTH_CLIENT_ID is required in production.");
   if (!hasText(env.SNOW_OAUTH_CLIENT_SECRET)) violations.push("SNOW_OAUTH_CLIENT_SECRET is required in production.");
   if (!hasText(env.WORKER_PUBLIC_ORIGIN)) {
@@ -474,8 +454,10 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   } else if (!isCanonicalHttpsOrigin(env.WORKER_PUBLIC_ORIGIN)) {
     violations.push("WORKER_PUBLIC_ORIGIN must be a canonical HTTPS origin in production.");
   }
-  if (authMode === "oidc") {
-    if (hasText(env.MCP_OPERATOR_SECRET)) violations.push("MCP_OPERATOR_SECRET must be unset when AUTH_MODE=oidc.");
+  if (hasText(env.MCP_OPERATOR_SECRET)) {
+    violations.push("MCP_OPERATOR_SECRET must be unset in production; use AUTH_MODE=oidc.");
+  }
+  if (authMode !== undefined) {
     if (!hasText(env.OIDC_ISSUER)) {
       violations.push("OIDC_ISSUER is required when AUTH_MODE=oidc.");
     } else if (!isHttpsUrl(env.OIDC_ISSUER)) {
@@ -484,32 +466,39 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     if (!hasText(env.OIDC_CLIENT_ID)) violations.push("OIDC_CLIENT_ID is required when AUTH_MODE=oidc.");
     if (!hasText(env.OIDC_CLIENT_SECRET)) violations.push("OIDC_CLIENT_SECRET is required when AUTH_MODE=oidc.");
     if (!hasText(env.OIDC_GROUP_POLICY_MAP)) violations.push("OIDC_GROUP_POLICY_MAP is required when AUTH_MODE=oidc.");
-    validateOidcPolicyReferences(violations, env, actorPolicyNames);
-  } else if (authMode === "operator_secret") {
-    if (!hasText(env.MCP_OPERATOR_USER_ID)) violations.push("MCP_OPERATOR_USER_ID is required while operator-secret consent is active.");
-    requireStrongSecret(violations, "MCP_OPERATOR_SECRET", env.MCP_OPERATOR_SECRET);
+    referencedActorPolicies = validateOidcPolicyReferences(violations, env, actorPolicies.names);
   }
+  validateReferencedActorPolicyAllowlists(violations, referencedActorPolicies, actorPolicies);
 
   const allowAdminScript = env.ALLOW_ADMIN_SCRIPT_CEILING === "true";
   if (allowAdminScript && env.SNOW_EXECUTOR_VERIFIER_ATTESTED !== "true") {
     violations.push('SNOW_EXECUTOR_VERIFIER_ATTESTED must be "true" before ALLOW_ADMIN_SCRIPT_CEILING=true in production.');
   }
+  if (allowAdminScript) {
+    if (csv(env.ADMIN_SCRIPT_ALLOWLIST).length === 0) {
+      violations.push("ADMIN_SCRIPT_ALLOWLIST must include at least one actor when ALLOW_ADMIN_SCRIPT_CEILING=true in production.");
+    }
+    if (csv(env.ADMIN_SCRIPT_APPROVAL_TOKENS).length === 0 && !hasText(env.ADMIN_SCRIPT_REQUIRED_GROUP)) {
+      violations.push("admin_script requires ADMIN_SCRIPT_APPROVAL_TOKENS or ADMIN_SCRIPT_REQUIRED_GROUP when ALLOW_ADMIN_SCRIPT_CEILING=true in production.");
+    }
+  }
   validateModeCeiling(violations, "TENANT_MAX_MODE", env.TENANT_MAX_MODE, allowAdminScript);
   validateModeCeiling(violations, "INSTANCE_MAX_MODE", env.INSTANCE_MAX_MODE, allowAdminScript);
 
-  requireStrongSecret(violations, "TOKEN_KEK_CURRENT/TOKEN_KEK", env.TOKEN_KEK_CURRENT ?? env.TOKEN_KEK);
+  requireStrongSecret(violations, "TOKEN_KEK_CURRENT", env.TOKEN_KEK_CURRENT);
   requireStrongSecret(violations, "OAUTH_PROVIDER_SECRET", env.OAUTH_PROVIDER_SECRET);
   try {
-    decodeFixedBase64Secret(env.X_MCP_EXECUTOR_HMAC_KEY, 32);
+    decodeFixedBase64Secret("X_MCP_EXECUTOR_HMAC_KEY", env.X_MCP_EXECUTOR_HMAC_KEY ?? "", 32);
   } catch {
     violations.push("X_MCP_EXECUTOR_HMAC_KEY must decode to exactly 32 bytes.");
   }
 
   if (env.ALLOW_LOCALHOST === "true") violations.push('ALLOW_LOCALHOST must not be "true" in production.');
-  if (csv(env.ALLOWED_ORIGINS).length === 0) {
+  const allowedOrigins = csv(env.ALLOWED_ORIGINS);
+  if (allowedOrigins.length === 0) {
     violations.push("ALLOWED_ORIGINS must include at least one origin in production.");
   }
-  for (const origin of csv(env.ALLOWED_ORIGINS)) {
+  for (const origin of allowedOrigins) {
     if (!isCanonicalHttpsOrigin(origin)) violations.push("ALLOWED_ORIGINS entries must be canonical public HTTPS origins in production.");
   }
   validateStrongTokenList(violations, "ADMIN_SCRIPT_APPROVAL_TOKENS", env.ADMIN_SCRIPT_APPROVAL_TOKENS);
@@ -517,16 +506,17 @@ export function collectPostureViolations(env: PostureEnv): string[] {
     if (!env[binding]) violations.push(`${binding} binding is required in production.`);
   }
 
-  if (csv(env.SNAPSHOT_ENABLED_TABLES).length > 0) {
+  const snapshotEnabledTables = csv(env.SNAPSHOT_ENABLED_TABLES);
+  if (snapshotEnabledTables.length > 0) {
     if (!env.SNAPSHOT_KV) violations.push("SNAPSHOT_KV binding is required when SNAPSHOT_ENABLED_TABLES is set.");
-    if (!strongSecret(env.SNAPSHOT_KEK_CURRENT ?? env.SNAPSHOT_KEK)) {
-      violations.push("SNAPSHOT_KEK_CURRENT/SNAPSHOT_KEK must be a strong CSPRNG secret when SNAPSHOT_ENABLED_TABLES is set.");
+    if (!strongSecret(env.SNAPSHOT_KEK_CURRENT)) {
+      violations.push("SNAPSHOT_KEK_CURRENT must be a strong CSPRNG secret when SNAPSHOT_ENABLED_TABLES is set.");
     }
   }
 
   validatePinnedInstance(violations, env);
-  if (hasText(env.SNOW_EXECUTOR_PATH) && !scopedExecutorPath.test(env.SNOW_EXECUTOR_PATH!.trim())) {
-    violations.push("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run when configured.");
+  if (!hasText(env.SNOW_EXECUTOR_PATH) || !scopedExecutorPath.test(env.SNOW_EXECUTOR_PATH!.trim())) {
+    violations.push("SNOW_EXECUTOR_PATH must be /api/(x|sn)_<scope>/x_mcp/executor/run in production.");
   }
   if (env.SNOW_DEV_ROPC === "1") violations.push("SNOW_DEV_ROPC must be disabled in production.");
 

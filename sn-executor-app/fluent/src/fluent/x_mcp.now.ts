@@ -198,29 +198,75 @@ RestApi({
 })
 
 // ─── Properties (plan §10, §P7 item 5) — scoped vendor-prefix namespace ───────
-// Aligned to x_1793136_mcp.executor.* (was x_mcp.executor.*) to match the app scope and the
-// executor scripts (kills the now-sdk TS11 prefix warnings; reconciles the naming split).
+// Aligned to x_1793136_mcp.executor.* to match the app scope and executor scripts.
 // Set hmac_secret to the Cloudflare X_MCP_EXECUTOR_HMAC_KEY; hmac_secret_prev holds the
 // previous key during a rotation window. Both are password2 — set on the instance, never in
 // source control (no `value` here so deploy does not overwrite an instance-set secret).
-// The break-glass executor toggles are disabled for fresh installs only; upgrades preserve any
-// operator-set value already present on the instance.
+// Break-glass executor toggles default OFF and RE-ARM OFF on every deploy (fresh install AND
+// upgrade). A break-glass kill-switch must not silently persist "on" across an upgrade, so these
+// ship as ordinary app properties with value:false — NOT installMethod:'first install', which maps
+// the record to the fresh-install-only `unload` folder and would SKIP the upgrade, leaving a prior
+// `true` in place. An operator who needs break-glass enables it deliberately AFTER the deploy; the
+// next deploy re-arms it off. NOTE: this cannot be exercised by the local gate (it does not build or
+// deploy the Fluent app) — verify on a live UPGRADE that `x_1793136_mcp.executor.enabled` reads `false`.
+const runtimePropertyRoles = { read: [executorRole, adminRole], write: [adminRole] }
+// gs.getProperty() is gated by property read roles; executor verification must read HMAC secrets.
+// Keep the values password2/private and write access admin-only.
+const secretPropertyRoles = { read: [executorRole, adminRole], write: [adminRole] }
+
 Property({
     $id: Now.ID['p_enabled'],
     name: 'x_1793136_mcp.executor.enabled',
     type: 'boolean',
-    $meta: { installMethod: 'first install' },
     value: false,
+    description: 'Enable the MCP executor REST endpoint after the target-family verifier gate passes.',
+    roles: runtimePropertyRoles,
 })
 Property({
     $id: Now.ID['p_egress'],
     name: 'x_1793136_mcp.executor.run_server_script_enabled',
     type: 'boolean',
-    $meta: { installMethod: 'first install' },
     value: false,
+    description: 'Permit break-glass runServerScript execution; keep disabled unless governance approval is active.',
+    roles: runtimePropertyRoles,
 })
-Property({ $id: Now.ID['p_maxb'], name: 'x_1793136_mcp.executor.max_bytes', type: 'integer', value: 32768 })
-Property({ $id: Now.ID['p_maxout'], name: 'x_1793136_mcp.executor.max_output_bytes', type: 'integer', value: 65536 })
-Property({ $id: Now.ID['p_timeout'], name: 'x_1793136_mcp.executor.timeout_ms', type: 'integer', value: 30000 })
-Property({ $id: Now.ID['p_hmac'], name: 'x_1793136_mcp.executor.hmac_secret', type: 'password2' })
-Property({ $id: Now.ID['p_hmac_prev'], name: 'x_1793136_mcp.executor.hmac_secret_prev', type: 'password2' })
+Property({
+    $id: Now.ID['p_maxb'],
+    name: 'x_1793136_mcp.executor.max_bytes',
+    type: 'integer',
+    value: 32768,
+    description: 'Maximum inbound script payload size accepted by the executor.',
+    roles: runtimePropertyRoles,
+})
+Property({
+    $id: Now.ID['p_maxout'],
+    name: 'x_1793136_mcp.executor.max_output_bytes',
+    type: 'integer',
+    value: 65536,
+    description: 'Maximum serialized executor response size returned to the Worker.',
+    roles: runtimePropertyRoles,
+})
+Property({
+    $id: Now.ID['p_timeout'],
+    name: 'x_1793136_mcp.executor.timeout_ms',
+    type: 'integer',
+    value: 30000,
+    description: 'Maximum executor runtime in milliseconds before the script is stopped.',
+    roles: runtimePropertyRoles,
+})
+Property({
+    $id: Now.ID['p_hmac'],
+    name: 'x_1793136_mcp.executor.hmac_secret',
+    type: 'password2',
+    description: 'Current HMAC key mirrored from the Worker X_MCP_EXECUTOR_HMAC_KEY secret.',
+    isPrivate: true,
+    roles: secretPropertyRoles,
+})
+Property({
+    $id: Now.ID['p_hmac_prev'],
+    name: 'x_1793136_mcp.executor.hmac_secret_prev',
+    type: 'password2',
+    description: 'Previous HMAC key accepted during a bounded Worker/executor key rotation window.',
+    isPrivate: true,
+    roles: secretPropertyRoles,
+})

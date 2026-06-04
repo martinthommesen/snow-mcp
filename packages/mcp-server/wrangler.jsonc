@@ -59,12 +59,11 @@
   ],
 
   "vars": {
-    // Local dev + vitest preserve the permissive single-operator posture explicitly.
-    // Production deploys must choose `pilot` or `production` in alchemy.run.ts / .dev.vars.
+    // Local dev + vitest use the explicit pilot profile. Alchemy deploys only production.
     "DEPLOYMENT_PROFILE": "pilot"
   }
 
-  // Secret bindings (§2.11: SNOW_*, OAUTH_PROVIDER_SECRET, TOKEN_KEK,
-  // X_MCP_EXECUTOR_HMAC_KEY, SNAPSHOT_KEK) are provided via .dev.vars / `wrangler
+  // Secret bindings (§2.11: SNOW_*, OAUTH_PROVIDER_SECRET, TOKEN_KEK_CURRENT,
+  // X_MCP_EXECUTOR_HMAC_KEY, SNAPSHOT_KEK_CURRENT) are provided via .dev.vars / `wrangler
   // secret put` and added to the typed Env as their flows are built.
 }
