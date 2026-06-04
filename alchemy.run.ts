@@ -29,16 +29,39 @@ function reqEnv(k: string): string {
   return v;
 }
 
-if (process.env.DEPLOYMENT_PROFILE?.trim() !== "production") {
-  throw new Error('Alchemy deploy requires DEPLOYMENT_PROFILE="production".');
+function envText(k: string): string | undefined {
+  return process.env[k]?.trim() || undefined;
+}
+
+const isDestroyMode = process.env.ALCHEMY_DESTROY === "1" || process.argv.includes("--destroy");
+
+function alchemyStatePassword(): string {
+  const explicit = envText("ALCHEMY_PASSWORD") ?? envText("ALCHEMY_STATE_PASSWORD");
+  if (explicit) return explicit;
+  if (isDestroyMode) {
+    const legacy = envText("OAUTH_PROVIDER_SECRET");
+    if (legacy) return legacy;
+    throw new Error("Missing Alchemy state password; set ALCHEMY_PASSWORD or the legacy OAUTH_PROVIDER_SECRET value before deploy:destroy.");
+  }
+  return reqEnv("OAUTH_PROVIDER_SECRET");
 }
 
 const app = await alchemy("servicenow-codemode-mcp", {
-  // Fail-closed (plan §P6a, finding 26): the Alchemy encrypted-state password MUST be the real
-  // OAUTH_PROVIDER_SECRET — never a hardcoded dev default. reqEnv throws when it is unset,
-  // matching the Worker-secret bindings below (which already fail closed via reqEnv).
-  password: reqEnv("OAUTH_PROVIDER_SECRET"),
+  // Fail-closed: the Alchemy encrypted-state password must be provided explicitly or, for
+  // existing deployments, be the same value previously supplied via OAUTH_PROVIDER_SECRET.
+  // Destroy mode accepts ALCHEMY_PASSWORD/ALCHEMY_STATE_PASSWORD so incident teardown does not
+  // depend on a valid production OIDC provider-secret configuration.
+  password: alchemyStatePassword(),
 });
+
+if (isDestroyMode) {
+  await app.finalize();
+  process.exit(0);
+}
+
+if (process.env.DEPLOYMENT_PROFILE?.trim() !== "production") {
+  throw new Error('Alchemy deploy requires DEPLOYMENT_PROFILE="production".');
+}
 
 // Adopt the KV namespaces already created in the account (by title).
 const SCHEMA_KV = await KVNamespace("SCHEMA_KV", { title: "servicenow-codemode-SCHEMA_KV", adopt: true });

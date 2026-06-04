@@ -42,3 +42,9 @@ re-evaluates OIDC claims when the MCP refresh token is exchanged, then writes ne
 strips IdP secrets from the next MCP access token. For high-risk `admin_script` use, keep MCP access
 tokens short-lived and prefer the required-group approval branch so the current access token's OIDC
 group set is checked again at the executor gate.
+
+Production cutover rejects existing non-OIDC MCP grants because production `/mcp` requires grant
+props with `authMode="oidc"` and a non-empty OIDC subject. Before switching a Worker to
+`DEPLOYMENT_PROFILE=production`, purge pilot/operator-secret MCP grants and have clients
+reauthorize through OIDC. A stale client token will fail closed with `invalid_auth_context`; it is
+not migrated in place.

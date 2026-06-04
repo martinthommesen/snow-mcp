@@ -52,6 +52,10 @@ mode instead of propagating the decrypt error: `integration_user` re-mints via R
 
 - Leveled idempotency (L1 replay / L2 indeterminate-blocks-retry / L3 documented limit) is
   **implemented + tested** (`do/mutation-ledger.ts`, S17).
+- Pre-wrapper completed mutation-ledger rows from pilot/dev builds are intentionally not replayed
+  after the replay-safe wrapper cutover. They fail closed as `internal_error` until retention expiry;
+  do not reuse old idempotency keys across the deploy. If an operator must preserve a specific
+  pilot retry, migrate that row into the replay-safe wrapper shape before cutting over.
 - Encrypted snapshots (`recovery/snapshots.ts`) reuse the AES-GCM envelope (`auth/crypto.ts`,
   unit-verified) with a dedicated `SNAPSHOT_KEK_CURRENT`. **Wired into the live `tableUpdate` path
   (P4):** for a `reversible_from_snapshot`-class update (a table in `SNAPSHOT_ENABLED_TABLES`)

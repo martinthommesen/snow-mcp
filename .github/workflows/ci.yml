@@ -7,7 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       run_live_gates:
-        description: "Run sub-prod live scoped-executor verifier; production OIDC deployed e2e is pending"
+        description: "Run sub-prod live scoped-executor verifier"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      run_production_oidc_e2e:
+        description: "Run production OIDC deployed MCP e2e"
         required: false
         default: "false"
         type: choice
@@ -121,3 +127,38 @@ jobs:
           SNOW_DEV_ROPC_PASSWORD: ${{ secrets.SNOW_DEV_ROPC_PASSWORD }}
           X_MCP_EXECUTOR_HMAC_KEY: ${{ secrets.X_MCP_EXECUTOR_HMAC_KEY }}
           SNOW_EXECUTOR_PATH: ${{ secrets.SNOW_EXECUTOR_PATH }}
+
+  production-oidc-deployed-e2e:
+    name: production OIDC deployed MCP e2e
+    runs-on: ubuntu-latest
+    needs: [local-gates]
+    if: github.event_name == 'workflow_dispatch' && inputs.run_production_oidc_e2e == 'true' && github.ref == 'refs/heads/main'
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium for deployed OIDC browser gate
+        run: npx playwright install --with-deps chromium
+
+      - name: Verify deployed production OIDC MCP flow
+        run: npm run production:oidc:e2e
+        env:
+          DEPLOYMENT_PROFILE: production
+          AUTH_MODE: oidc
+          WORKER_PUBLIC_ORIGIN: ${{ secrets.OIDC_E2E_WORKER_PUBLIC_ORIGIN }}
+          OIDC_E2E_USERNAME: ${{ secrets.OIDC_E2E_USERNAME }}
+          OIDC_E2E_PASSWORD: ${{ secrets.OIDC_E2E_PASSWORD }}
+          OIDC_E2E_SCOPES: ${{ vars.OIDC_E2E_SCOPES }}
+          OIDC_E2E_USERNAME_SELECTORS: ${{ vars.OIDC_E2E_USERNAME_SELECTORS }}
+          OIDC_E2E_PASSWORD_SELECTORS: ${{ vars.OIDC_E2E_PASSWORD_SELECTORS }}
+          OIDC_E2E_CONTINUE_SELECTORS: ${{ vars.OIDC_E2E_CONTINUE_SELECTORS }}
+          OIDC_E2E_EXPECT_REFRESH_WRITE_DENIED: ${{ vars.OIDC_E2E_EXPECT_REFRESH_WRITE_DENIED }}

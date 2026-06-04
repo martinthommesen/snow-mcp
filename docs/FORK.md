@@ -284,12 +284,17 @@ author's namespace GUIDs), so it deploys cleanly into *your* account.
 2. **Deploy:**
    ```bash
    npm run deploy            # = copy-wasm + alchemy deploy; reads .dev.vars; prints YOUR Worker URL
-   # teardown:  npm run deploy:destroy
+   ALCHEMY_PASSWORD="<state password>" npm run deploy:destroy
    ```
    `DEPLOYMENT_PROFILE` is intentionally breaking: unset/unknown fails closed, and Alchemy deploys
    only the production profile. Alchemy validates the assembled KV/DO
    bindings plus the raw secret/config values before uploading the Worker, so the terminal reports
    the misconfiguration list rather than relying on a later request path to discover it.
+   Teardown is deliberately split from deploy posture: `deploy:destroy` sets `ALCHEMY_DESTROY=1`
+   and skips Worker binding/posture assembly. If the Alchemy state was originally encrypted with
+   `OAUTH_PROVIDER_SECRET`, pass that same value as `ALCHEMY_PASSWORD` (or keep the legacy
+   `OAUTH_PROVIDER_SECRET` available) so Alchemy can read the state while the production config is
+   otherwise broken or rotated.
    The Worker URL is derived from **your** Cloudflare account subdomain
    (`servicenow-mcp.<your-subdomain>.workers.dev`) — it is not committed. If you set
    `WORKER_PUBLIC_ORIGIN` to a placeholder earlier, update it to the printed URL and redeploy.

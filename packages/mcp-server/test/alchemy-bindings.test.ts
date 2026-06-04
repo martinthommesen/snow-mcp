@@ -75,6 +75,14 @@ describe("Alchemy deploy bindings", () => {
     expect(alchemySource).toMatch(/SNOW_DEV_ROPC_USERNAME:\s*alchemy\.secret\(reqEnv\("SNOW_DEV_ROPC_USERNAME"\)\)/);
     expect(alchemySource).toMatch(/SNOW_DEV_ROPC_PASSWORD:\s*alchemy\.secret\(reqEnv\("SNOW_DEV_ROPC_PASSWORD"\)\)/);
   });
+
+  it("decouples destroy from production deploy posture and Worker secret assembly", () => {
+    expect(alchemySource).toContain('process.env.ALCHEMY_DESTROY === "1" || process.argv.includes("--destroy")');
+    expect(alchemySource).toContain("ALCHEMY_STATE_PASSWORD");
+    expect(alchemySource).toContain("if (isDestroyMode)");
+    expect(alchemySource).toContain("process.exit(0)");
+    expect(alchemySource).toContain('Alchemy deploy requires DEPLOYMENT_PROFILE="production".');
+  });
 });
 
 // P2b: the token-KEK binding requires the versioned current key. These exercise the EXTRACTED

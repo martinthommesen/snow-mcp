@@ -25,11 +25,22 @@ describe("ci workflow security posture", () => {
     expect(scripts).not.toHaveProperty("deploy:pilot");
     expect(scripts).not.toHaveProperty("deploy:e2e");
     expect(scripts.deploy).not.toContain("ALLOW_PILOT_DEPLOY=1");
-    expect(scripts["deploy:destroy"]).toContain("DEPLOYMENT_PROFILE=production");
+    expect(scripts["deploy:destroy"]).toContain("ALCHEMY_DESTROY=1");
+    expect(scripts["deploy:destroy"]).not.toContain("DEPLOYMENT_PROFILE=production");
   });
 
   it("does not run the operator-secret pilot e2e as a production live gate", () => {
     expect(ciText).not.toContain("npm run deploy:e2e");
     expect(ciText).not.toContain("MCP_OPERATOR_SECRET");
+  });
+
+  it("exposes a manual production OIDC deployed MCP e2e gate", () => {
+    const scripts = (JSON.parse(packageJsonText) as { scripts: Record<string, string> }).scripts;
+    expect(scripts["production:oidc:e2e"]).toBe("node scripts/deployed-oidc-e2e.mjs");
+    expect(ciText).toContain("run_production_oidc_e2e");
+    expect(ciText).toContain("production-oidc-deployed-e2e");
+    expect(ciText).toContain("npx playwright install --with-deps chromium");
+    expect(ciText).toContain("npm run production:oidc:e2e");
+    expect(ciText).toContain("github.ref == 'refs/heads/main'");
   });
 });
