@@ -1,6 +1,6 @@
+import { existsSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import ciText from "../../../.github/workflows/ci.yml?raw";
-import codeqlText from "../../../.github/workflows/codeql.yml?raw";
 import packageJsonText from "../../../package.json?raw";
 
 describe("ci workflow security posture", () => {
@@ -13,10 +13,10 @@ describe("ci workflow security posture", () => {
     expect(ciText).toContain("github.ref == 'refs/heads/main'");
   });
 
-  it("has a checked-in CodeQL JavaScript/TypeScript analysis workflow", () => {
-    expect(codeqlText).toContain("github/codeql-action/init");
-    expect(codeqlText).toContain("languages: javascript-typescript");
-    expect(codeqlText).toContain("security-events: write");
+  it("does not add an advanced CodeQL workflow while GitHub default setup is enabled", () => {
+    const advancedCodeqlWorkflow = new URL("../../../.github/workflows/codeql.yml", import.meta.url);
+    expect(existsSync(advancedCodeqlWorkflow)).toBe(false);
+    expect(ciText).not.toContain("github/codeql-action/analyze");
   });
 
   it("makes production the only deploy path", () => {

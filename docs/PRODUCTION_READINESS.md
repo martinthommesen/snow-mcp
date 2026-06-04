@@ -16,7 +16,7 @@ truth for production-readiness tracking.
 | Fluent build | `npm ci && npm run build` in `sn-executor-app/fluent` | Implemented in CI |
 | Dependency audit | Root and Fluent `npm audit --audit-level=high` | Implemented in CI; Fluent dev/build-toolchain residuals tracked under Current Exceptions below |
 | Secret scan | Gitleaks GitHub Action | Implemented in CI |
-| Static analysis | CodeQL JavaScript/TypeScript workflow | Implemented in CI |
+| Static analysis | GitHub CodeQL default setup | Enabled in repository settings; no checked-in advanced workflow while default setup is active |
 | SBOM | CycloneDX npm SBOM artifact | Implemented in CI |
 | Production posture | `DEPLOYMENT_PROFILE=production` preflight passes with OIDC identity, restrictive policy, strong secrets, pinned instance, scoped executor path, per-user OAuth, and admin-script verifier attestation when enabled | Implemented in source; requires real env |
 | OIDC identity | IdP authorization-code + PKCE, signed ID-token validation, nonce/state replay rejection, refresh-time group/policy re-evaluation | Mock-IdP tests implemented; live IdP tenant pending |
@@ -56,4 +56,4 @@ Append one entry per release candidate:
 
 | Date | Commit SHA | Environment | Evidence |
 |---|---|---|---|
-| 2026-06-04 | pending | local | Source changes require production OIDC, scoped executor path, CodeQL static analysis, hardened executor properties, and reconciled verifier comments; live sub-prod gates not run |
+| 2026-06-04 | pending | local | Source changes require production OIDC, scoped executor path, repository CodeQL default setup, hardened executor properties, and reconciled verifier comments; live sub-prod gates not run |
