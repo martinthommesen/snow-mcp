@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { canonicalize, hmacSha256Base64, sha256Base64 } from "../packages/mcp-server/dist/auth/actor.js";
 import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
+import { readDevVarFromText } from "./deployed-e2e-origin.mjs";
 
 // Transport-level path guard mirroring SnFetchClient (finding 3): a tampered SNOW_EXECUTOR_PATH
 // must not change host or traverse out of /api/. Rejects userinfo (@), scheme (://), and
@@ -17,11 +18,14 @@ function assertApiPath(p) {
 
 function dv(k) {
   if (process.env[k]) return process.env[k];
-  if (!existsSync(".dev.vars")) return undefined;
-  for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
-    const t = l.trim();
-    if (t.startsWith(`${k}=`)) { let v = t.slice(k.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
+  return readDevVarFromText(devVarsText(), k);
+}
+let cachedDevVarsText;
+function devVarsText() {
+  if (cachedDevVarsText === undefined) {
+    cachedDevVarsText = existsSync(".dev.vars") ? readFileSync(".dev.vars", "utf8") : "";
   }
+  return cachedDevVarsText;
 }
 // SSRF guard (finding 3): canonicalize the host against the ServiceNow allowlist before any
 // credentialed fetch, so a tampered SNOW_INSTANCE_HOST can't exfiltrate the Basic credential.

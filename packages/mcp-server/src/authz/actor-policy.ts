@@ -7,6 +7,7 @@
 
 import { McpToolError } from "../sn/errors.js";
 import { assertMandatoryRowFilterSafe, FIELD_NAME_RE, TABLE_NAME_RE } from "../sn/validate.js";
+import { bytesToHex } from "../auth/encoding.js";
 import { isValidMode, modeRisk, type Mode } from "@servicenow-codemode/shared";
 
 export type TableRule = string | RegExp;
@@ -511,5 +512,5 @@ export async function actorPolicyHash(policy: ActorPolicy): Promise<string> {
     "SHA-256",
     new TextEncoder().encode(JSON.stringify(canonicalPolicy(policy))),
   );
-  return [...new Uint8Array(bytes).subarray(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return bytesToHex(new Uint8Array(bytes).subarray(0, 8));
 }

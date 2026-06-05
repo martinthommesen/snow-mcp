@@ -22,14 +22,13 @@
 //   node scripts/executor-install.mjs   # installs the global verify() core + properties only
 import { readFileSync } from "node:fs";
 import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
+import { readDevVarFromText } from "./deployed-e2e-origin.mjs";
 
 const verifyScriptTemplate = readFileSync(new URL("../sn-executor-app/script-include/x_mcp_verify.js", import.meta.url), "utf8");
+const devVarsText = readFileSync(".dev.vars", "utf8");
 
 function dv(k) {
-  for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
-    const t = l.trim();
-    if (t.startsWith(`${k}=`)) { let v = t.slice(k.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
-  }
+  return readDevVarFromText(devVarsText, k);
 }
 // SSRF guard (S15 / finding 2): canonicalize the configured host against the ServiceNow
 // allowlist BEFORE any credentialed fetch, so a tampered SNOW_INSTANCE_HOST (userinfo,
