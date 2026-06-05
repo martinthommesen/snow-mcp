@@ -217,12 +217,21 @@ function admissionRenewalDelay(signal: AbortSignal): Promise<void> {
   });
 }
 
-async function renewMcpAdmissionUntilReleased(lease: AdmissionLease, signal: AbortSignal): Promise<void> {
+async function renewMcpAdmissionUntilReleased(
+  lease: AdmissionLease,
+  signal: AbortSignal,
+  onLeaseLost: () => void,
+): Promise<void> {
   while (!signal.aborted) {
     await admissionRenewalDelay(signal);
     if (signal.aborted) return;
     try {
-      await lease.stub.renew(lease.leaseId, Date.now());
+      const renewed = await lease.stub.renew(lease.leaseId, Date.now());
+      if (!renewed) {
+        console.error("mcp admission lease lost before response closed");
+        onLeaseLost();
+        return;
+      }
     } catch (e) {
       console.error("mcp admission renew failed:", redactString(e instanceof Error ? e.message : String(e)));
     }
@@ -235,18 +244,47 @@ export function responseWithAdmissionRelease(response: Response, lease: Admissio
     return response;
   }
   const renewalAbort = new AbortController();
-  const renewal = renewMcpAdmissionUntilReleased(lease, renewalAbort.signal);
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const pump = response.body
-    .pipeTo(writable)
-    .catch(() => {
-      // Client cancellation or stream errors should still release the lease.
-    })
-    .finally(async () => {
-      renewalAbort.abort();
-      await releaseMcpAdmission(lease);
-    });
-  ctx.waitUntil(Promise.allSettled([pump, renewal]).then(() => undefined));
+  const reader = response.body.getReader();
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let released = false;
+  const releaseOnce = async () => {
+    if (released) return;
+    released = true;
+    renewalAbort.abort();
+    await releaseMcpAdmission(lease);
+  };
+  const renewal = renewMcpAdmissionUntilReleased(lease, renewalAbort.signal, () => {
+    controller?.error(new Error("admission_lease_lost"));
+    void reader.cancel().catch(() => undefined);
+    void releaseOnce();
+  });
+  const readable = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+    async pull(c) {
+      try {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          c.close();
+          await releaseOnce();
+          return;
+        }
+        c.enqueue(chunk.value);
+      } catch (e) {
+        await releaseOnce();
+        throw e;
+      }
+    },
+    async cancel() {
+      try {
+        await reader.cancel();
+      } finally {
+        await releaseOnce();
+      }
+    },
+  });
+  ctx.waitUntil(renewal.catch(() => undefined));
   return new Response(readable, {
     status: response.status,
     statusText: response.statusText,

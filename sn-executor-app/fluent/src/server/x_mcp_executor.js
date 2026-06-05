@@ -176,8 +176,8 @@ function utf8Slice(s, maxBytes) {
     audit.reason = String(actor.reason || '')
 
     // EXECUTE the verified script (eval is global-only). Pass the wrapper-created audit sys_id as
-    // proof input: the global core re-checks that this audit row is still running, matches the
-    // signed request/code, and that the nonce has already been consumed before eval.
+    // proof input, not secret material: the global core re-checks that this audit row is still
+    // running, matches the signed request/code, and that the nonce has already been consumed before eval.
     // execute() catches internally and never throws, so the audit row always closes below — no
     // 'running'-stuck row on the execute path.
     var out

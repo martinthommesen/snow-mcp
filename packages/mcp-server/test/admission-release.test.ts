@@ -83,6 +83,25 @@ describe("authenticated /mcp admission lease lifetime", () => {
     }
   });
 
+  it("aborts and releases admitted streams when renewal reports a lost lease", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = testCtx();
+      const { lease, release, renew } = testLease();
+      renew.mockResolvedValueOnce(false);
+
+      responseWithAdmissionRelease(new Response(new ReadableStream<Uint8Array>()), lease, ctx);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await Promise.all(ctx.waits);
+
+      expect(renew).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledWith("lease-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("releases admitted leases through waitUntil when the response has no body", async () => {
     const ctx = testCtx();
     const { lease, release } = testLease();

@@ -134,11 +134,11 @@ function evaluatePolicy(reports, policy) {
     const reason = policyViolationReason(pkg, allowed, deniedRe);
     if (!reason) continue;
     const exception = exceptions.find((candidate) => exceptionMatches(candidate, pkg, report));
-    if (!exception) {
-      violations.push(violation(report, pkg, reason));
+    if (exception) {
+      exceptionsUsed.push(exceptionUsage(report, pkg, exception));
       continue;
     }
-    exceptionsUsed.push(exceptionUsage(report, pkg, exception));
+    violations.push(violation(report, pkg, reason));
   }
   return { violations, exceptionsUsed };
 }

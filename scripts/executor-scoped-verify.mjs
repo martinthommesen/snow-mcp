@@ -228,11 +228,14 @@ async function assertExecutorCannotReadHmacProperties(executorAuth) {
   );
   const rows = Array.isArray(res.json?.result) ? res.json.result : [];
   const responseBody = JSON.stringify(res.json ?? {});
-  const rawSecret = dv("X_MCP_EXECUTOR_HMAC_KEY") ?? "";
-  const noRawSecret = rawSecret.length > 0 && !responseBody.includes(rawSecret);
+  const rawSecrets = ["X_MCP_EXECUTOR_HMAC_KEY", "X_MCP_EXECUTOR_HMAC_KEY_PREV"]
+    .map((name) => dv(name))
+    .filter((value) => value);
+  const exposedSecret = rawSecrets.find((value) => responseBody.includes(value));
+  const noRawSecret = rawSecrets.length > 0 && !exposedSecret;
   const probeCompleted = res.status === 401 || res.status === 403 || (res.status >= 200 && res.status < 300);
   check(
-    "HMAC secret isolation — executor-only principal cannot read raw HMAC properties",
+    "HMAC secret isolation — executor-only principal cannot read raw current/previous HMAC properties",
     noRawSecret && probeCompleted,
     `(status ${res.status}, rows ${rows.length}, rawSecretExposed=${!noRawSecret})`,
   );

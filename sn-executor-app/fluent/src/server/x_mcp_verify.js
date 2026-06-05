@@ -24,9 +24,9 @@
 //                                                                claim + freshness. NO nonce
 //                                                                single-use, NO eval.
 //   execute(code, actor, sig, auditId) -> { serialized, error } — re-verifies the HMAC-bound actor
-//                                                                and the wrapper-created running
-//                                                                audit row + consumed nonce before
-//                                                                new Function eval + serialize.
+//                                                                audit row + consumed nonce, then
+//                                                                claims that audit/nonce pair once
+//                                                                before new Function eval + serialize.
 // SINGLE-USE NONCE consumption is now owned by the SCOPED Fluent wrapper (it INSERTs into the
 // scoped x_1793136_mcp_nonce table, which has a DB UNIQUE index — the live, deployable store).
 // The core does not consume nonces, but execute() checks that the scoped nonce row already exists
@@ -197,6 +197,25 @@ var x_mcp_verify = Class.create();
     return gr.next();
   },
 
+  _executionClaimKey: function (auditId, nonce) {
+    var digest = new GlideDigest().getSHA256Hex(String(nonce || ''));
+    return 'x:' + String(auditId || '') + ':' + String(digest || '').toLowerCase().substring(0, 32);
+  },
+
+  _claimExecutionOnce: function (auditId, nonce) {
+    var gr = new GlideRecord('x_1793136_mcp_nonce');
+    gr.initialize();
+    gr.value = this._executionClaimKey(auditId, nonce);
+    gr.created = new GlideDateTime();
+    var id;
+    try {
+      id = gr.insert();
+    } catch (e) {
+      id = null;
+    }
+    return !!id;
+  },
+
   _auditCapabilityValid: function (auditId, code, actor) {
     var id = String(auditId || '');
     if (!/^[0-9a-f]{32}$/.test(id)) return false;
@@ -211,7 +230,8 @@ var x_mcp_verify = Class.create();
   // PUBLIC: eval the verified script (plan §P7 item 2 / finding 6). The scoped wrapper calls this
   // ONLY AFTER its audit row exists and its single-use nonce INSERT succeeds. Direct callers still
   // need a fresh host-signed actor, a wrapper-created running audit row that matches the signed
-  // request/code, and proof that the nonce has already been consumed; otherwise execute() refuses eval.
+  // request/code, proof that the nonce has already been consumed, and a one-time execution claim
+  // for that audit/nonce pair; otherwise execute() refuses eval.
   execute: function (code, actor, sig, auditId) {
     var v;
     try {
@@ -222,7 +242,9 @@ var x_mcp_verify = Class.create();
     if (!v.verified) return { serialized: null, error: 'actor_signature_invalid' };
     var capabilityOk = false;
     try {
-      capabilityOk = this._auditCapabilityValid(auditId, code, actor || {}) && this._nonceConsumed((actor || {}).nonce);
+      capabilityOk = this._auditCapabilityValid(auditId, code, actor || {}) &&
+        this._nonceConsumed((actor || {}).nonce) &&
+        this._claimExecutionOnce(auditId, (actor || {}).nonce);
     } catch (ce) {
       capabilityOk = false;
     }

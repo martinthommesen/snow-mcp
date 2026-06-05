@@ -25,7 +25,7 @@ kill switch, byte cap, the role-gated endpoint — and calls the GLOBAL `x_mcp_v
 before consuming the scoped nonce, then `x_mcp_verify.execute()` after the nonce insert succeeds.
 The global core has installer-injected HMAC material, performs the HMAC verification
 (cross-engine-equal to the host signer, B1), checks the wrapper-created running audit row and
-consumed nonce, and runs the `new Function` execution.
+consumed nonce, inserts a one-time execution claim, and runs the `new Function` execution.
 
 ## Build / deploy
 

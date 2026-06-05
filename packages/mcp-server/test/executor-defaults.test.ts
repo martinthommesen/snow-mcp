@@ -48,6 +48,7 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(executorSource).toContain("out = core.execute(code, actor, sig, auditId + '')");
     expect(verifierCoreSource).toContain("_auditCapabilityValid");
     expect(verifierCoreSource).toContain("_nonceConsumed");
+    expect(verifierCoreSource).toContain("_claimExecutionOnce");
     expect(verifierCoreSource).not.toContain("gs.getProperty('x_1793136_mcp.executor.hmac_secret");
     expect(verifierCoreSource).toContain('var HMAC_SECRET_CURRENT = "__X_MCP_EXECUTOR_HMAC_KEY__"');
     expect(verifierCoreSource).not.toContain("HMAC_SECRET_CURRENT:");
@@ -56,12 +57,24 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(installerSource).toContain("JSON.stringify(keyB64)");
   });
 
+  it("the live helper installer updates only pre-created admin-only private HMAC properties", () => {
+    expect(installerSource).toContain("process.env[k]");
+    expect(installerSource).toContain('existsSync(".dev.vars")');
+    expect(installerSource).toContain("requiredScopedHmacProperty");
+    expect(installerSource).toContain("Refusing to update");
+    expect(installerSource).toContain("expected password2, private, admin-only read/write metadata");
+    expect(installerSource).toContain('updateRequiredHmacProperty("x_1793136_mcp.executor.hmac_secret"');
+    expect(installerSource).toContain('updateRequiredHmacProperty("x_1793136_mcp.executor.hmac_secret_prev"');
+    expect(installerSource).not.toContain('setProperty("x_1793136_mcp.executor.hmac_secret"');
+  });
+
   it("keeps raw eval private and fail-closes capability probe failures", () => {
     expect(verifierCoreSource).toContain("function executeCode(code)");
     expect(verifierCoreSource).toContain("return executeCode(code)");
     expect(verifierCoreSource).not.toContain("_executeCode:");
     expect(verifierCoreSource).toContain("capabilityOk = false");
     expect(verifierCoreSource).toContain("error: 'capability_required'");
+    expect(verifierCoreSource).toContain("'x:' + String(auditId || '')");
   });
 
   it("renders verifier HMAC placeholders without tripping on the fail-closed sentinel", () => {
@@ -107,6 +120,8 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(verifierSource).toContain("executorOnlyPrincipal");
     expect(verifierSource).toContain("assertExecutorCannotReadHmacProperties");
     expect(verifierSource).toContain("HMAC secret isolation");
+    expect(verifierSource).toContain('"X_MCP_EXECUTOR_HMAC_KEY_PREV"');
+    expect(verifierSource).toContain("rawSecrets.find");
     expect(verifierSource).toContain("endpointAuth = executorPrincipal.auth");
   });
 
