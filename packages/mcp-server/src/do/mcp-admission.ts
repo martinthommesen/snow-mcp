@@ -48,19 +48,19 @@ export class McpAdmissionDO extends DurableObject {
     if (window.count >= MAX_REQUESTS_PER_WINDOW) {
       return { ok: false, reason: "rate", retryAfterMs: Math.max(1, window.startAt + WINDOW_MS - now) };
     }
+    const countedWindow = { ...window, count: window.count + 1 };
 
     const leases = this.pruneLeases((stored.get(LEASES_KEY) as LeaseMap | undefined) ?? {}, now);
     const leaseExpiries = Object.values(leases);
     if (leaseExpiries.length >= MAX_IN_FLIGHT) {
       const earliestExpiry = Math.min(...leaseExpiries);
-      await this.ctx.storage.put({ [WINDOW_KEY]: window, [LEASES_KEY]: leases });
+      await this.ctx.storage.put({ [WINDOW_KEY]: countedWindow, [LEASES_KEY]: leases });
       return { ok: false, reason: "concurrency", retryAfterMs: Math.max(1, earliestExpiry - now) };
     }
 
     const leaseId = crypto.randomUUID();
     leases[leaseId] = leaseExpiresAt(now);
-    window = { ...window, count: window.count + 1 };
-    await this.ctx.storage.put({ [WINDOW_KEY]: window, [LEASES_KEY]: leases });
+    await this.ctx.storage.put({ [WINDOW_KEY]: countedWindow, [LEASES_KEY]: leases });
     return { ok: true, leaseId };
   }
 

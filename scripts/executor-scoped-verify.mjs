@@ -66,6 +66,13 @@ async function apiOk(method, path, body, authorization = adminBasic) {
   }
   return res;
 }
+async function deleteRecordIfPresent(path) {
+  const res = await api("DELETE", path);
+  if (res.status === 404) return;
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`DELETE ${path} failed with HTTP ${res.status}: ${JSON.stringify(res.json)}`);
+  }
+}
 async function getProperty(name) {
   const query = encodeURIComponent(`name=${name}`);
   const row = (await apiOk("GET", `/api/now/table/sys_properties?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,name,value`)).json?.result?.[0];
@@ -201,15 +208,15 @@ async function waitForExecutorRole(auth, timeoutMs = 15_000, stepMs = 1_000) {
 async function cleanupExecutorOnlyPrincipal(principal) {
   if (!principal?.managed) return;
   if (principal.roleGrantId) {
-    await api("DELETE", `/api/now/table/sys_user_has_role/${principal.roleGrantId}`);
+    await deleteRecordIfPresent(`/api/now/table/sys_user_has_role/${principal.roleGrantId}`);
   } else if (principal.userId && principal.roleId) {
     const query = encodeURIComponent(`user=${principal.userId}^role=${principal.roleId}`);
-    const grants = (await api("GET", `/api/now/table/sys_user_has_role?sysparm_query=${query}&sysparm_fields=sys_id`)).json?.result ?? [];
+    const grants = (await apiOk("GET", `/api/now/table/sys_user_has_role?sysparm_query=${query}&sysparm_fields=sys_id`)).json?.result ?? [];
     for (const grant of grants) {
-      if (grant?.sys_id) await api("DELETE", `/api/now/table/sys_user_has_role/${grant.sys_id}`);
+      if (grant?.sys_id) await deleteRecordIfPresent(`/api/now/table/sys_user_has_role/${grant.sys_id}`);
     }
   }
-  if (principal.userId) await api("DELETE", `/api/now/table/sys_user/${principal.userId}`);
+  if (principal.userId) await deleteRecordIfPresent(`/api/now/table/sys_user/${principal.userId}`);
 }
 async function assertExecutorCannotReadHmacProperties(executorAuth) {
   const query = encodeURIComponent(HMAC_PROPERTY_NAMES.map((name) => `name=${name}`).join("^OR"));

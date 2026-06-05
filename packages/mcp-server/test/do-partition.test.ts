@@ -366,6 +366,19 @@ describe("McpAdmissionDO bounds authenticated /mcp requests per user", () => {
     expect(await obj.admit(t0 + 75_001)).toMatchObject({ ok: false, reason: "concurrency" });
   });
 
+  it("counts concurrency-denied attempts toward the authenticated rate cap", async () => {
+    const obj = admission(`user-concurrency-rate-${crypto.randomUUID()}`);
+    const t0 = 1_750_000;
+    for (let i = 0; i < 4; i++) {
+      expect(await obj.admit(t0)).toMatchObject({ ok: true });
+    }
+    for (let i = 0; i < 56; i++) {
+      expect(await obj.admit(t0 + i)).toMatchObject({ ok: false, reason: "concurrency" });
+    }
+    expect(await obj.snapshot(t0 + 56)).toMatchObject({ windowCount: 60, inFlight: 4 });
+    expect(await obj.admit(t0 + 57)).toMatchObject({ ok: false, reason: "rate" });
+  });
+
   it("enforces the 60 request/minute authenticated rate cap per user object", async () => {
     const obj = admission(`user-rate-${crypto.randomUUID()}`);
     const t0 = 2_000_000;

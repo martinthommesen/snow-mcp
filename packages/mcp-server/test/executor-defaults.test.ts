@@ -110,6 +110,19 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(verifierSource).toContain("endpointAuth = executorPrincipal.auth");
   });
 
+  it("the live verifier fails closed when temporary executor cleanup deletes are rejected", () => {
+    expect(verifierSource).toContain("async function deleteRecordIfPresent(path)");
+    expect(verifierSource).toContain("throw new Error(`DELETE ${path} failed with HTTP ${res.status}");
+    const cleanupStart = verifierSource.indexOf("async function cleanupExecutorOnlyPrincipal");
+    const cleanupBlock = verifierSource.slice(
+      cleanupStart,
+      verifierSource.indexOf("async function assertExecutorCannotReadHmacProperties", cleanupStart),
+    );
+    expect(cleanupBlock).toContain("await deleteRecordIfPresent(");
+    expect(cleanupBlock).toContain('await apiOk("GET"');
+    expect(cleanupBlock).not.toContain('await api("DELETE"');
+  });
+
   it("defines table-level admin-only CRUD ACLs for the scoped audit log", () => {
     for (const [id, operation] of [
       ["acl_audit_table_create", "create"],
