@@ -69,6 +69,19 @@ export class McpAdmissionDO extends DurableObject {
     });
   }
 
+  renew(leaseId: string, now: number = Date.now()): Promise<boolean> {
+    return this.enqueue(async () => {
+      const leases = this.pruneLeases((await this.ctx.storage.get<LeaseMap>(LEASES_KEY)) ?? {}, now);
+      if (leases[leaseId] === undefined) {
+        await this.ctx.storage.put(LEASES_KEY, leases);
+        return false;
+      }
+      leases[leaseId] = now + STALE_LEASE_MS;
+      await this.ctx.storage.put(LEASES_KEY, leases);
+      return true;
+    });
+  }
+
   async snapshot(now: number = Date.now()): Promise<{ windowCount: number; inFlight: number }> {
     const stored = await this.ctx.storage.get<WindowState | LeaseMap>([WINDOW_KEY, LEASES_KEY]);
     const window = stored.get(WINDOW_KEY) as WindowState | undefined;

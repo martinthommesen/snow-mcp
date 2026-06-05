@@ -348,6 +348,24 @@ describe("McpAdmissionDO bounds authenticated /mcp requests per user", () => {
     expect(await obj.snapshot(t0 + 75_001)).toMatchObject({ inFlight: 0 });
   });
 
+  it("renews active leases so long-lived streams keep their in-flight slots", async () => {
+    const obj = admission(`user-renew-${crypto.randomUUID()}`);
+    const t0 = 1_500_000;
+    const leases = [];
+    for (let i = 0; i < 4; i++) {
+      const r = await obj.admit(t0);
+      expect(r.ok).toBe(true);
+      if (r.ok) leases.push(r.leaseId);
+    }
+
+    for (const lease of leases) {
+      expect(await obj.renew(lease, t0 + 74_000)).toBe(true);
+    }
+
+    expect(await obj.snapshot(t0 + 75_001)).toMatchObject({ inFlight: 4 });
+    expect(await obj.admit(t0 + 75_001)).toMatchObject({ ok: false, reason: "concurrency" });
+  });
+
   it("enforces the 60 request/minute authenticated rate cap per user object", async () => {
     const obj = admission(`user-rate-${crypto.randomUUID()}`);
     const t0 = 2_000_000;

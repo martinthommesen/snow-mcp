@@ -56,6 +56,14 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(installerSource).toContain("JSON.stringify(keyB64)");
   });
 
+  it("keeps raw eval private and fail-closes capability probe failures", () => {
+    expect(verifierCoreSource).toContain("function executeCode(code)");
+    expect(verifierCoreSource).toContain("return executeCode(code)");
+    expect(verifierCoreSource).not.toContain("_executeCode:");
+    expect(verifierCoreSource).toContain("capabilityOk = false");
+    expect(verifierCoreSource).toContain("error: 'capability_required'");
+  });
+
   it("renders verifier HMAC placeholders without tripping on the fail-closed sentinel", () => {
     const rendered = verifierCoreSource
       .replace("\"__X_MCP_EXECUTOR_HMAC_KEY__\"", JSON.stringify("current-key"))

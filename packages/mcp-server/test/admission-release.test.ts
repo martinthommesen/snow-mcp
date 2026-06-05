@@ -15,14 +15,16 @@ function testCtx(): ExecutionContext & { waits: Promise<unknown>[] } {
 
 function testLease() {
   const release = vi.fn(async () => {});
+  const renew = vi.fn(async () => true);
   const lease: AdmissionLease = {
     leaseId: "lease-1",
     stub: {
       admit: vi.fn(),
       release,
+      renew,
     },
   };
-  return { lease, release };
+  return { lease, release, renew };
 }
 
 describe("authenticated /mcp admission lease lifetime", () => {
@@ -55,6 +57,30 @@ describe("authenticated /mcp admission lease lifetime", () => {
 
     expect(release).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledWith("lease-1");
+  });
+
+  it("renews admitted leases while the response body remains open", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = testCtx();
+      const { lease, release, renew } = testLease();
+      const wrapped = responseWithAdmissionRelease(new Response(new ReadableStream<Uint8Array>()), lease, ctx);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(renew).toHaveBeenCalledTimes(1);
+      expect(renew).toHaveBeenCalledWith("lease-1", expect.any(Number));
+      expect(release).not.toHaveBeenCalled();
+
+      await wrapped.body?.cancel();
+      await Promise.all(ctx.waits);
+      const renewCountAfterCancel = renew.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(renew).toHaveBeenCalledTimes(renewCountAfterCancel);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("releases admitted leases through waitUntil when the response has no body", async () => {

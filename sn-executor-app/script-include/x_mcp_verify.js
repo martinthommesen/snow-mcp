@@ -53,7 +53,25 @@ var x_mcp_verify = Class.create();
     return secret(HMAC_SECRET_PREV);
   }
 
-x_mcp_verify.prototype = {
+  function executeCode(code) {
+    var result, err = null;
+    try {
+      var fn = new Function('gs', 'GlideRecord', 'GlideRecordSecure', 'GlideAggregate', '"use strict";\n' + code);
+      result = fn(gs, GlideRecord, GlideRecordSecure, GlideAggregate);
+    } catch (e) {
+      err = String(e);
+    }
+    var serialized = null;
+    try {
+      serialized = JSON.stringify(result === undefined ? null : result);
+    } catch (se) {
+      err = err || ('unserializable: ' + String(se));
+      serialized = null;
+    }
+    return { serialized: serialized, error: err };
+  }
+
+	x_mcp_verify.prototype = {
   FRESHNESS_MS: 120 * 1000,
 
   initialize: function () {},
@@ -201,28 +219,16 @@ x_mcp_verify.prototype = {
       v = { verified: false };
     }
     if (!v.verified) return { serialized: null, error: 'actor_signature_invalid' };
-    if (!this._auditCapabilityValid(auditId, code, actor || {}) || !this._nonceConsumed((actor || {}).nonce)) {
+    var capabilityOk = false;
+    try {
+      capabilityOk = this._auditCapabilityValid(auditId, code, actor || {}) && this._nonceConsumed((actor || {}).nonce);
+    } catch (ce) {
+      capabilityOk = false;
+    }
+    if (!capabilityOk) {
       return { serialized: null, error: 'capability_required' };
     }
-    return this._executeCode(code);
-  },
-
-  _executeCode: function (code) {
-    var result, err = null;
-    try {
-      var fn = new Function('gs', 'GlideRecord', 'GlideRecordSecure', 'GlideAggregate', '"use strict";\n' + code);
-      result = fn(gs, GlideRecord, GlideRecordSecure, GlideAggregate);
-    } catch (e) {
-      err = String(e);
-    }
-    var serialized = null;
-    try {
-      serialized = JSON.stringify(result === undefined ? null : result);
-    } catch (se) {
-      err = err || ('unserializable: ' + String(se));
-      serialized = null;
-    }
-    return { serialized: serialized, error: err };
+    return executeCode(code);
   },
 
   type: 'x_mcp_verify',

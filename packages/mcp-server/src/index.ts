@@ -135,6 +135,7 @@ function oauthAuthorizationServerMetadataRequest(request: Request): Request {
 const serviceName = "servicenow-codemode-mcp";
 const appVersion = "0.1.0";
 const workerCompatibilityDate = "2026-05-13";
+const ADMISSION_LEASE_RENEWAL_MS = 30_000;
 
 function healthLive(): Response {
   return Response.json({ ok: true, service: serviceName });
@@ -167,6 +168,7 @@ function productionPostureResponse(error: ProductionPostureError, includeViolati
 export interface AdmissionStub {
   admit(now?: number): Promise<{ ok: true; leaseId: string } | { ok: false; reason: "rate" | "concurrency"; retryAfterMs: number }>;
   release(leaseId: string): Promise<void>;
+  renew(leaseId: string, now?: number): Promise<boolean>;
 }
 
 export type AdmissionLease = { stub: AdmissionStub; leaseId: string };
@@ -204,19 +206,47 @@ async function releaseMcpAdmission(lease: AdmissionLease): Promise<void> {
   }
 }
 
+function admissionRenewalDelay(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ADMISSION_LEASE_RENEWAL_MS);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
+async function renewMcpAdmissionUntilReleased(lease: AdmissionLease, signal: AbortSignal): Promise<void> {
+  while (!signal.aborted) {
+    await admissionRenewalDelay(signal);
+    if (signal.aborted) return;
+    try {
+      await lease.stub.renew(lease.leaseId, Date.now());
+    } catch (e) {
+      console.error("mcp admission renew failed:", redactString(e instanceof Error ? e.message : String(e)));
+    }
+  }
+}
+
 export function responseWithAdmissionRelease(response: Response, lease: AdmissionLease, ctx: ExecutionContext): Response {
   if (!response.body) {
     ctx.waitUntil(releaseMcpAdmission(lease));
     return response;
   }
+  const renewalAbort = new AbortController();
+  const renewal = renewMcpAdmissionUntilReleased(lease, renewalAbort.signal);
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const pump = response.body
     .pipeTo(writable)
     .catch(() => {
       // Client cancellation or stream errors should still release the lease.
     })
-    .finally(() => releaseMcpAdmission(lease));
-  ctx.waitUntil(pump);
+    .finally(async () => {
+      renewalAbort.abort();
+      await releaseMcpAdmission(lease);
+    });
+  ctx.waitUntil(Promise.allSettled([pump, renewal]).then(() => undefined));
   return new Response(readable, {
     status: response.status,
     statusText: response.statusText,
