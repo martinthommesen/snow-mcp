@@ -75,7 +75,7 @@ jobs:
         run: node scripts/license-report.mjs --policy license-policy.json --enforce package-lock.json sn-executor-app/fluent/package-lock.json > license-report.json
 
       - name: Upload supply-chain artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supply-chain
           path: |
