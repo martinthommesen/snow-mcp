@@ -1,6 +1,7 @@
 // Executor resource (scoped app x_1793136_mcp). Scoped apps CANNOT use new Function or
 // GlideCertificateEncryption (global-only), so HMAC verification + script eval are DELEGATED to
-// the GLOBAL x_mcp_verify (plan §0.13a) via its verify()/execute() split. The scoped app owns the
+// the GLOBAL x_mcp_verify (plan §0.13a) via its verify()/execute() split. The global core carries
+// installer-injected HMAC material; the executor role only gates endpoint invocation. The scoped app owns the
 // role-gated REST endpoint (REST_Endpoint ACL = S8), the audit-first row (x_1793136_mcp_audit_log),
 // the kill switch, the byte cap, the safe truncation envelope, AND single-use nonce consumption —
 // the INSERT-as-arbiter into the scoped x_1793136_mcp_nonce table (the deployable unique-indexed
@@ -28,7 +29,10 @@ function utf8Slice(s, maxBytes) {
     var n = 0
     for (var i = 0; i < s.length; i++) {
         var c = s.charCodeAt(i)
-        var w = c < 0x80 ? 1 : c < 0x800 ? 2 : c >= 0xd800 && c <= 0xdbff ? 4 : 3
+        var w = 3
+        if (c < 0x80) w = 1
+        else if (c < 0x800) w = 2
+        else if (c >= 0xd800 && c <= 0xdbff) w = 4
         if (n + w > maxBytes) return s.slice(0, i)
         n += w
         if (w === 4) i++ // surrogate pair: skip the low surrogate too
@@ -100,11 +104,12 @@ function utf8Slice(s, maxBytes) {
     // timeout_ms as an in-script kill.
 
     // VERIFY -> CONSUME NONCE -> EXECUTE (plan §P7 nonce-store fix). The global core does HMAC +
-    // eval (new Function + GlideCertificateEncryption are global-only), but SINGLE-USE NONCE
+    // eval (new Function + GlideCertificateEncryption are global-only), but it uses installer-
+    // injected key material. The scoped wrapper never reads the HMAC properties. SINGLE-USE NONCE
     // consumption is owned HERE, in scope, against the scoped x_1793136_mcp_nonce table — the only
     // reliably-creatable unique-indexed nonce store (now-sdk deploys its table+UNIQUE index; the
     // global x_mcp_nonce table could not be created via the Table API). The interleave is:
-    //   verify() (no nonce, no eval) -> INSERT-as-arbiter nonce -> execute().
+    //   verify() (no nonce, no eval) -> INSERT-as-arbiter nonce -> execute() (re-verifies HMAC).
     // The try/catch around verify() is defense-in-depth (finding 31): if verify ever throws, close
     // the audit row to 'rejected' + 401 instead of leaving it stuck 'running' with a 500.
     var core
@@ -170,21 +175,21 @@ function utf8Slice(s, maxBytes) {
     // POST field. The host no longer sends a top-level body.reason.
     audit.reason = String(actor.reason || '')
 
-    // MINT the execute() capability (finding 6): execute() now REQUIRES a secret-derived cap so
-    // that instantiating global.x_mcp_verify and calling execute() directly cannot eval attacker
-    // code. We mint it HERE — AFTER the single-use nonce INSERT succeeded — binding it to this
-    // nonce + the exact code hash. Only a holder of the scoped secret can produce it; we read the
-    // secret from our own scope and hand it to the global _hmacBase64 (which takes the key as an
-    // argument, so it is not a minting oracle). A caller that skipped verify -> consume-nonce has
-    // no secret and cannot forge a matching cap.
-    var execSecret = gs.getProperty('x_1793136_mcp.executor.hmac_secret', '')
-    var execCodeHash = new GlideDigest().getSHA256Base64(code)
-    var execCap = core._hmacBase64(execSecret, 'x_mcp_exec_cap|' + nonceVal + '|' + execCodeHash)
-
-    // EXECUTE the verified script (eval is global-only). execute() catches internally and never
-    // throws, so the audit row always closes below — no 'running'-stuck row on the execute path.
+    // EXECUTE the verified script (eval is global-only). Pass the wrapper-created audit sys_id as
+    // an unreturned capability: the global core re-checks that this audit row is still running,
+    // matches the signed request/code, and that the nonce has already been consumed before eval.
+    // execute() catches internally and never throws, so the audit row always closes below — no
+    // 'running'-stuck row on the execute path.
     var out
-    out = core.execute(code, nonceVal, execCap)
+    out = core.execute(code, actor, sig, auditId + '')
+    if (out.error === 'actor_signature_invalid' || out.error === 'capability_required') {
+        audit.status = 'rejected'
+        audit.error_class = out.error
+        audit.update()
+        response.setStatus(401)
+        response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
+        return
+    }
     var err = out.error
     var status = err ? 'error' : 'ok'
     var serialized = out.serialized

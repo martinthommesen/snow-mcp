@@ -9,6 +9,8 @@
 // The audit table is likewise the scoped x_1793136_mcp_audit_log (written by the scoped wrapper);
 // no global code writes a global x_mcp_audit_log. The canonical request endpoint is the SCOPED
 // Fluent role-ACL-gated REST (x_1793136_mcp), which does verify -> consume-nonce -> execute.
+// HMAC key material is injected into the admin-installed global helper at install time so the
+// executor role never needs read access to x_1793136_mcp.executor.hmac_secret.
 //
 // M-4 (2026-05-31): the previously opt-in global-REST endpoint (HMAC-only, NO role ACL) + its live
 // self-test have been REMOVED from this installer. That surface reproduced the exact shape of the
@@ -21,7 +23,7 @@
 import { readFileSync } from "node:fs";
 import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
 
-const verifyScript = readFileSync(new URL("../sn-executor-app/script-include/x_mcp_verify.js", import.meta.url), "utf8");
+const verifyScriptTemplate = readFileSync(new URL("../sn-executor-app/script-include/x_mcp_verify.js", import.meta.url), "utf8");
 
 function dv(k) {
   for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
@@ -42,6 +44,24 @@ const installUser = process.env.SNOW_ADMIN_USER || dv("SNOW_DEV_ROPC_USERNAME");
 const installPass = process.env.SNOW_ADMIN_PASS || dv("SNOW_DEV_ROPC_PASSWORD");
 const basic = "Basic " + Buffer.from(`${installUser}:${installPass}`).toString("base64");
 const keyB64 = dv("X_MCP_EXECUTOR_HMAC_KEY");
+const keyPrevB64 = dv("X_MCP_EXECUTOR_HMAC_KEY_PREV") || "";
+
+if (!keyB64) {
+  throw new Error("X_MCP_EXECUTOR_HMAC_KEY is required so x_mcp_verify can be installed with isolated signing material.");
+}
+
+function renderVerifierScript() {
+  const rendered = verifyScriptTemplate
+    .replace("\"__X_MCP_EXECUTOR_HMAC_KEY__\"", JSON.stringify(keyB64))
+    .replace("\"__X_MCP_EXECUTOR_HMAC_KEY_PREV__\"", JSON.stringify(keyPrevB64));
+  if (
+    rendered.includes("\"__X_MCP_EXECUTOR_HMAC_KEY__\"") ||
+    rendered.includes("\"__X_MCP_EXECUTOR_HMAC_KEY_PREV__\"")
+  ) {
+    throw new Error("x_mcp_verify HMAC placeholders were not fully replaced.");
+  }
+  return rendered;
+}
 
 async function api(method, path, body) {
   const r = await fetch(`https://${host}${path}`, {
@@ -58,12 +78,6 @@ async function setProperty(name, value, type = "string") {
   if (ex) { await api("PATCH", `/api/now/table/sys_properties/${ex.sys_id}`, { value }); return "updated"; }
   await api("POST", "/api/now/table/sys_properties", { name, value, type }); return "created";
 }
-async function ensurePropertyDefault(name, value, type = "string") {
-  const ex = (await api("GET", `/api/now/table/sys_properties?sysparm_query=name=${name}&sysparm_limit=1&sysparm_fields=sys_id`)).result?.[0];
-  if (ex) return "kept";
-  await api("POST", "/api/now/table/sys_properties", { name, value, type });
-  return "created";
-}
 // NOTE: ensureTable/ensureColumn/ensureUniqueIndex are intentionally GONE — the SCOPED Fluent app
 // owns the nonce table + its UNIQUE index + the purge job (now-sdk deploys them; the Table API
 // 403s on DDL even for admin). This installer creates NO tables.
@@ -78,6 +92,7 @@ console.log(`Installing x_mcp executor on ${host}\n`);
 
 // 1) Properties (scoped-aligned namespace x_1793136_mcp.executor.*, plan §P7 item 5)
 log("hmac_secret:", await setProperty("x_1793136_mcp.executor.hmac_secret", keyB64, "password2"));
+log("hmac_secret_prev:", await setProperty("x_1793136_mcp.executor.hmac_secret_prev", keyPrevB64, "password2"));
 // Break-glass toggles RE-ARM OFF on every (re)install/upgrade run (force-set, not keep-if-exists):
 // a kill-switch must not persist "on" across a deploy. An operator re-enables it deliberately after
 // install; executor-scoped-verify.mjs enables + restores only within its own verify window.
@@ -90,10 +105,12 @@ log("max_output_bytes:", await setProperty("x_1793136_mcp.executor.max_output_by
 // admin, so we create NO tables here. The nonce store (x_1793136_mcp_nonce) + its UNIQUE index +
 // the purge job, and the audit log (x_1793136_mcp_audit_log), are OWNED BY THE SCOPED FLUENT APP
 // (now-sdk install deploys them — see sn-executor-app/fluent/src/fluent/x_mcp.now.ts). The scoped
-// wrapper consumes the nonce in-scope; this global core no longer touches any nonce table.
+// wrapper consumes the nonce in-scope; this global core only reads scoped audit/nonce rows to prove
+// the wrapper path ran before eval.
 
-// 3) Script Include (the global verify()/execute() core for scoped delegation).
-log("x_mcp_verify script include:", await ensureScriptInclude("x_mcp_verify", verifyScript));
+// 3) Script Include (the global verify()/execute() core for scoped delegation). The installed
+// script contains the current/previous HMAC key literals; rotate by rerunning this installer.
+log("x_mcp_verify script include:", await ensureScriptInclude("x_mcp_verify", renderVerifierScript()));
 
 console.log(
   "\nHelper install complete (x_mcp_verify core + properties; NO tables, NO global REST endpoint — " +

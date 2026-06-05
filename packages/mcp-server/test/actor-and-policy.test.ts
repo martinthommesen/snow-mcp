@@ -140,6 +140,13 @@ describe("§2.12 ActorPolicy (B5)", () => {
     expect(() => assertQueryFieldsAllowed(policy, "incident", "u_ssnfoo123")).toThrow(McpToolError);
   });
 
+  it("M-6 — catches leading-whitespace and case-folded masked query fields", () => {
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "   u_ssnLIKE123")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "CALLER_ID=abc")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "active=true^   ORU_SSNSTARTSWITH9")).toThrow(McpToolError);
+    expect(() => assertQueryFieldsAllowed(policy, "incident", "   ORDERBYCALLER_ID.name")).toThrow(McpToolError);
+  });
+
   it("L-3 — does NOT over-reject legit unmasked fields with operator-looking names", () => {
     // short_description is not masked; an operator-looking suffix must still pass.
     expect(() => assertQueryFieldsAllowed(policy, "incident", "short_descriptionlike5")).not.toThrow();

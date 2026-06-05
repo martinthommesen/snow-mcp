@@ -84,12 +84,15 @@ const bindings = {
   // production deploy path; without this the binding is unbound and the GET /authorize admission
   // cap silently no-ops in production (the handler guards on `if (env.CONSENT_RATE_DO)`).
   CONSENT_RATE_DO: DurableObjectNamespace("CONSENT_RATE_DO", { className: "ConsentRateDO", sqlite: true }),
+  MCP_ADMISSION_DO: DurableObjectNamespace("MCP_ADMISSION_DO", { className: "McpAdmissionDO", sqlite: true }),
 
   // Non-sensitive config (plain bindings)
   SNOW_INSTANCE_HOST: reqEnv("SNOW_INSTANCE_HOST"),
   ...(process.env.DEPLOYMENT_PROFILE ? { DEPLOYMENT_PROFILE: process.env.DEPLOYMENT_PROFILE } : {}),
   ...(process.env.ALLOW_ADMIN_SCRIPT_CEILING ? { ALLOW_ADMIN_SCRIPT_CEILING: process.env.ALLOW_ADMIN_SCRIPT_CEILING } : {}),
   ...(process.env.SNOW_EXECUTOR_VERIFIER_ATTESTED ? { SNOW_EXECUTOR_VERIFIER_ATTESTED: process.env.SNOW_EXECUTOR_VERIFIER_ATTESTED } : {}),
+  ...(process.env.AUDIT_SIEM_ATTESTED ? { AUDIT_SIEM_ATTESTED: process.env.AUDIT_SIEM_ATTESTED } : {}),
+  ...(process.env.MUTATION_FREEZE ? { MUTATION_FREEZE: process.env.MUTATION_FREEZE } : {}),
   ...(process.env.ALLOWED_ORIGINS ? { ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS } : {}),
   ...(process.env.WORKER_PUBLIC_ORIGIN ? { WORKER_PUBLIC_ORIGIN: process.env.WORKER_PUBLIC_ORIGIN } : {}),
   ...(process.env.SNOW_OAUTH_CLIENT_ID ? { SNOW_OAUTH_CLIENT_ID: process.env.SNOW_OAUTH_CLIENT_ID } : {}),

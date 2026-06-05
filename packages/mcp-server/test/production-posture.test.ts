@@ -34,6 +34,7 @@ function productionEnv(overrides: Partial<PostureEnv> = {}): PostureEnv {
     TENANT_MAX_MODE: "write" as Mode,
     INSTANCE_MAX_MODE: "write" as Mode,
     ALLOWED_ORIGINS: "https://app.example.com",
+    AUDIT_SIEM_ATTESTED: "true",
     SNOW_INSTANCE_HOST: "prod123.service-now.com",
     SNOW_EXECUTOR_PATH: "/api/x_acme_mcp/x_mcp/executor/run",
     ACTOR_POLICY_TABLE_ALLOWLIST: "incident",
@@ -46,6 +47,7 @@ function productionEnv(overrides: Partial<PostureEnv> = {}): PostureEnv {
     BUDGET_DO: binding(),
     LEDGER_DO: binding(),
     CONSENT_RATE_DO: binding(),
+    MCP_ADMISSION_DO: binding(),
     ...overrides,
   };
 }
@@ -169,8 +171,15 @@ describe("Phase 1B production posture", () => {
       'Referenced ActorPolicy "default" table allowlist must be set in production.',
       "ALLOWED_ORIGINS must include at least one origin in production.",
       "BUDGET_DO binding is required in production.",
+      "MCP_ADMISSION_DO binding is required in production.",
       "SNOW_INSTANCE_HOST must be pinned in production.",
     ]));
+  });
+
+  it("requires structured-audit SIEM attestation in production", () => {
+    expect(collectPostureViolations(productionEnv({
+      AUDIT_SIEM_ATTESTED: undefined,
+    }))).toContain('AUDIT_SIEM_ATTESTED must be "true" in production after proving structured audit log receipt.');
   });
 
   it("rejects weak secrets and malformed executor HMAC keys", () => {

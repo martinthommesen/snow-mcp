@@ -39,7 +39,8 @@
       { "name": "TOKEN_DO", "class_name": "TokenStoreDO" },
       { "name": "BUDGET_DO", "class_name": "BudgetDO" },
       { "name": "LEDGER_DO", "class_name": "MutationLedgerDO" },
-      { "name": "CONSENT_RATE_DO", "class_name": "ConsentRateDO" }
+      { "name": "CONSENT_RATE_DO", "class_name": "ConsentRateDO" },
+      { "name": "MCP_ADMISSION_DO", "class_name": "McpAdmissionDO" }
     ]
   },
   "migrations": [
@@ -55,6 +56,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["ConsentRateDO"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["McpAdmissionDO"]
     }
   ],
 

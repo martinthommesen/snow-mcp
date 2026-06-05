@@ -7,11 +7,11 @@ const fluentPath = resolve(root, "sn-executor-app/fluent/src/server/x_mcp_verify
 
 function verifierBody(path) {
   const source = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
-  const marker = "x_mcp_verify.prototype = {";
+  const marker = "(function () {";
   const start = source.indexOf(marker);
-  const end = source.lastIndexOf("\n};");
+  const end = source.lastIndexOf("\n})();");
   if (start < 0 || end < 0 || end <= start) {
-    throw new Error(`Could not locate x_mcp_verify prototype body in ${relative(root, path)}`);
+    throw new Error(`Could not locate x_mcp_verify closure body in ${relative(root, path)}`);
   }
   return source.slice(start + marker.length, end).trim();
 }

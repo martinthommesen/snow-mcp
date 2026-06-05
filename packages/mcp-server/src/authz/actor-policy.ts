@@ -427,13 +427,11 @@ export function assertRequestedFieldsAllowed(policy: ActorPolicy, table: string,
 // like `^ORsalary>5` / `^ORDERBYsalary` / `^GROUPBYdept`.
 const QUERY_OP_PREFIX = /^(ORDERBYDESC|ORDERBY|GROUPBY|NQ|OR|EQ)/i;
 
-/** The leading ServiceNow field token of a clause: the initial run of lowercase field chars.
- *  SN field names are lowercase `[a-z0-9_.]` (see validate.ts FIELD_NAME_RE), so an UPPERCASE
- *  operator (LIKE/IN/STARTSWITH/ISEMPTY/BETWEEN/…) or a symbol (`=`,`>`,`<`) terminates the run
- *  cleanly — `salaryLIKE5` and `salary>5` both yield `salary`. */
+/** The leading ServiceNow field token of a clause: trim leading whitespace, then take the initial
+ *  run of field chars and case-fold it for comparison with canonical lowercase field masks. */
 function leadingFieldToken(clause: string): string {
-  const m = clause.match(/^[a-z0-9_.]+/);
-  return m ? m[0] : "";
+  const m = clause.trimStart().match(/^[a-z0-9_.]+/i);
+  return m ? m[0].toLowerCase() : "";
 }
 
 /** If `token` is a masked field immediately followed by an alphabetic suffix, treat it as an
@@ -468,7 +466,8 @@ export function assertQueryFieldsAllowed(policy: ActorPolicy, table: string, use
   const masked = maskIndex(policy, table);
   if (!masked || masked.fields.size === 0 || !userQuery) return;
   for (const clause of userQuery.split("^")) {
-    const candidates = [leadingFieldToken(clause), leadingFieldToken(clause.replace(QUERY_OP_PREFIX, ""))];
+    const normalizedClause = clause.trimStart();
+    const candidates = [leadingFieldToken(normalizedClause), leadingFieldToken(normalizedClause.replace(QUERY_OP_PREFIX, ""))];
     for (const f of candidates) {
       if (!f) continue;
       if (isFieldMaskedByIndex(masked, f)) {

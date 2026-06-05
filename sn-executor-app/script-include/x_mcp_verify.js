@@ -13,30 +13,50 @@
 //   canonical = the ASCII-only encoder below, keys in THIS fixed order:
 //     mcp_actor_user_id, mcp_actor_email, snow_effective_user_sys_id,
 //     instance, request_id, script_sha256, issued_at, nonce, reason
-//   actor_sig = base64( HMAC-SHA256( key = x_1793136_mcp.executor.hmac_secret, canonical ) )
+//   actor_sig = base64( HMAC-SHA256( key = installer-injected HMAC secret, canonical ) )
 //   Verification is FAIL-CLOSED on: bad/missing sig; script_sha256 != SHA-256(script);
 //   actor.instance != this instance (cross-instance replay); issued_at outside ±freshness;
-//   replayed nonce (seen in the nonce table within the window).
+//   missing nonce. Replay is rejected by the scoped wrapper's DB-unique nonce INSERT.
 //
 // PUBLIC API (plan §P7 nonce-store fix):
 //   verify(code, actor, sig) -> { verified:boolean, error? }   — HMAC + script-bind + instance-
 //                                                                claim + freshness. NO nonce
 //                                                                single-use, NO eval.
-//   execute(code, nonce, cap) -> { serialized, error }        — cap-gated new Function eval +
-//                                                                serialize (finding 6). cap is
-//                                                                minted by the scoped wrapper
-//                                                                after the nonce INSERT.
+//   execute(code, actor, sig, auditId) -> { serialized, error } — re-verifies the HMAC-bound actor
+//                                                                and the wrapper-created running
+//                                                                audit row + consumed nonce before
+//                                                                new Function eval + serialize.
 // SINGLE-USE NONCE consumption is now owned by the SCOPED Fluent wrapper (it INSERTs into the
 // scoped x_1793136_mcp_nonce table, which has a DB UNIQUE index — the live, deployable store).
-// The core no longer touches any nonce table (the global x_mcp_nonce table could not be created
-// via the Table API). The nonce STAYS in the signed canonical — the HMAC still covers it.
+// The core does not consume nonces, but execute() checks that the scoped nonce row already exists
+// before eval. The nonce STAYS in the signed canonical — the HMAC still covers it.
 
 var x_mcp_verify = Class.create();
+(function () {
+  var HMAC_SECRET_CURRENT = "__X_MCP_EXECUTOR_HMAC_KEY__";
+  var HMAC_SECRET_PREV = "__X_MCP_EXECUTOR_HMAC_KEY_PREV__";
+
+  // The installer replaces the placeholders above with JSON string literals. Untemplated source
+  // fails closed, so the scoped executor role never needs read access to the HMAC properties.
+  function secret(value) {
+    var s = String(value || '');
+    if (!s) return '';
+    if (s.indexOf('__X_MCP_EXECUTOR_HMAC_KEY') === 0) return '';
+    return s;
+  }
+
+  function currentSecret() {
+    return secret(HMAC_SECRET_CURRENT);
+  }
+
+  function previousSecret() {
+    return secret(HMAC_SECRET_PREV);
+  }
+
 x_mcp_verify.prototype = {
   FRESHNESS_MS: 120 * 1000,
 
   initialize: function () {},
-
   // Engine-independent, ASCII-ONLY escaper. MUST match the host signer byte-for-byte
   // (packages/mcp-server/src/auth/actor.ts asciiJsonString). We do NOT use JSON.stringify
   // here, because V8 and ServiceNow's engine can escape non-ASCII differently — which
@@ -106,12 +126,14 @@ x_mcp_verify.prototype = {
     return c === name || c.indexOf(name + '.') === 0;
   },
 
-  // PUBLIC: verify the signed actor (HMAC + script-bind + instance-claim + freshness). NO nonce
-  // single-use and NO eval — the scoped wrapper interleaves verify -> consume-nonce -> execute so
-  // the single-use INSERT lands on the deployable scoped x_1793136_mcp_nonce table (plan §P7).
+  // PUBLIC: verify the signed actor (HMAC + script-bind + instance-claim + freshness + nonce
+  // presence). NO nonce single-use and NO eval — the scoped wrapper interleaves verify ->
+  // consume-nonce -> execute so the single-use INSERT lands on the deployable scoped
+  // x_1793136_mcp_nonce table (plan §P7).
   // Returns { verified:true } or { verified:false }.
   verify: function (script, actor, sig) {
     if (!sig) return { verified: false };
+    actor = actor || {};
 
     // (a) script binding.
     // GlideDigest.getSHA256Base64(String) must hash the UTF-8 bytes of the
@@ -128,10 +150,15 @@ x_mcp_verify.prototype = {
     var issued = parseInt(actor.issued_at, 10);
     if (isNaN(issued) || Math.abs(now - issued) > this.FRESHNESS_MS) return { verified: false };
 
-    // (d) signature (current key, then previous key during rotation)
+    // (d) signed nonce presence. The scoped wrapper consumes it after verify() succeeds.
+    if (!String(actor.nonce || '')) return { verified: false };
+
+    // (e) signature (current key, then previous key during rotation). The key material is injected
+    // into this admin-installed global Script Include; it is NOT read from executor-role-visible
+    // scoped properties at request time.
     var canonical = this._canonical(actor);
-    var keyCur = gs.getProperty('x_1793136_mcp.executor.hmac_secret', '');
-    var keyPrev = gs.getProperty('x_1793136_mcp.executor.hmac_secret_prev', '');
+    var keyCur = currentSecret();
+    var keyPrev = previousSecret();
     var ok = keyCur && this._constantTimeEquals(this._hmacBase64(keyCur, canonical), sig);
     if (!ok && keyPrev) ok = this._constantTimeEquals(this._hmacBase64(keyPrev, canonical), sig);
     if (!ok) return { verified: false };
@@ -141,22 +168,46 @@ x_mcp_verify.prototype = {
     return { verified: true };
   },
 
-  // PUBLIC: eval the verified script (plan §P7 item 2 / finding 6). REQUIRES a capability that
-  // only a holder of the executor HMAC secret can mint:
-  //   cap = base64(HMAC(hmac_secret, 'x_mcp_exec_cap|' + nonce + '|' + SHA256(code)))
-  // The SCOPED wrapper mints it (it reads the scoped secret) ONLY AFTER the single-use nonce
-  // INSERT succeeds, then passes (code, nonce, cap) here. A caller that instantiates this global
-  // core and calls execute() DIRECTLY — bypassing verify -> consume-nonce — cannot produce a
-  // valid cap (no secret), and re-running verify() alone does NOT mint one. _hmacBase64 takes the
-  // key as a parameter, so it is not a minting oracle. FAIL-CLOSED: a missing secret or any cap
-  // mismatch refuses eval. Closes the public-execute() HMAC/nonce-replay bypass.
-  execute: function (code, nonce, cap) {
-    var secret = gs.getProperty('x_1793136_mcp.executor.hmac_secret', '');
+  _nonceConsumed: function (nonce) {
+    var n = String(nonce || '');
+    if (!n) return false;
+    var gr = new GlideRecord('x_1793136_mcp_nonce');
+    gr.addQuery('value', n);
+    gr.setLimit(1);
+    gr.query();
+    return gr.next();
+  },
+
+  _auditCapabilityValid: function (auditId, code, actor) {
+    var id = String(auditId || '');
+    if (!/^[0-9a-f]{32}$/.test(id)) return false;
+    var audit = new GlideRecord('x_1793136_mcp_audit_log');
+    if (!audit.get(id)) return false;
     var codeHash = new GlideDigest().getSHA256Base64(String(code || ''));
-    var expected = this._hmacBase64(secret, 'x_mcp_exec_cap|' + String(nonce || '') + '|' + codeHash);
-    if (!secret || !this._constantTimeEquals(cap, expected)) {
+    return String(audit.status || '') === 'running' &&
+      String(audit.request_id || '') === String(actor.request_id || '') &&
+      String(audit.code_hash || '') === codeHash;
+  },
+
+  // PUBLIC: eval the verified script (plan §P7 item 2 / finding 6). The scoped wrapper calls this
+  // ONLY AFTER its audit row exists and its single-use nonce INSERT succeeds. Direct callers still
+  // need a fresh host-signed actor, the unreturned running audit sys_id, and proof that the nonce
+  // has already been consumed; otherwise execute() refuses eval.
+  execute: function (code, actor, sig, auditId) {
+    var v;
+    try {
+      v = this.verify(code, actor || {}, sig);
+    } catch (ve) {
+      v = { verified: false };
+    }
+    if (!v.verified) return { serialized: null, error: 'actor_signature_invalid' };
+    if (!this._auditCapabilityValid(auditId, code, actor || {}) || !this._nonceConsumed((actor || {}).nonce)) {
       return { serialized: null, error: 'capability_required' };
     }
+    return this._executeCode(code);
+  },
+
+  _executeCode: function (code) {
     var result, err = null;
     try {
       var fn = new Function('gs', 'GlideRecord', 'GlideRecordSecure', 'GlideAggregate', '"use strict";\n' + code);
@@ -176,3 +227,4 @@ x_mcp_verify.prototype = {
 
   type: 'x_mcp_verify',
 };
+})();

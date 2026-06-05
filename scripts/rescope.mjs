@@ -52,7 +52,7 @@ if (newScope.length < 4 || newScope.length > 18) {
 // substring of a preserved GLOBAL identifier: it becomes the next search token, so a later re-scope
 // would over-match and corrupt the global helper (e.g. "x_mcp" inside "x_mcp_verify") — and the
 // verifier-sync self-check would NOT catch it (both copies get the same wrong edit).
-const PRESERVED_GLOBALS = ["x_mcp", "x_mcp_verify", "x_mcp_executor", "x_mcp_exec_cap"];
+const PRESERVED_GLOBALS = ["x_mcp", "x_mcp_verify", "x_mcp_executor"];
 const clash = PRESERVED_GLOBALS.find((g) => g.includes(newScope));
 if (clash) {
   fail(`unsafe scope "${newScope}": it is a substring of the preserved global "${clash}" — a later ` +
@@ -145,13 +145,13 @@ if (!check) {
   if (JSON.stringify(config).split(newScope).join(SENTINEL).includes(oldScope)) stragglers.push("now.config.json");
   if (stragglers.length) fail(`old scope "${oldScope}" still present in: ${stragglers.join(", ")}`);
 
-  // Mirror scripts/check-verifier-sync.mjs: compare ONLY the prototype body of both copies.
+  // Mirror scripts/check-verifier-sync.mjs: compare the closure-backed verifier core.
   const verifierBody = (rel) => {
     const src = readFileSync(resolve(root, rel), "utf8").replace(/\r\n/g, "\n");
-    const marker = "x_mcp_verify.prototype = {";
+    const marker = "(function () {";
     const start = src.indexOf(marker);
-    const end = src.lastIndexOf("\n};");
-    if (start < 0 || end < 0 || end <= start) fail(`could not locate x_mcp_verify prototype body in ${rel}`);
+    const end = src.lastIndexOf("\n})();");
+    if (start < 0 || end < 0 || end <= start) fail(`could not locate x_mcp_verify closure body in ${rel}`);
     return src.slice(start + marker.length, end).trim();
   };
   if (verifierBody("sn-executor-app/fluent/src/server/x_mcp_verify.js") !==

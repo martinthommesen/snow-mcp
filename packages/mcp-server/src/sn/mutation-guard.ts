@@ -165,6 +165,8 @@ export interface MutationGuard {
   now: () => number;
   /** Live mutating/executor paths require both ledger and durable audit. */
   durabilityRequired?: boolean;
+  /** Incident control: deny new mutations before ledger/effect side effects. */
+  mutationFreeze?: boolean;
   /** Build the ledger handle for this run+ordinal. Absent => no durable ledger (tests). */
   ledger?: (ordinal: number) => LedgerHandle;
   /** Durable audit sink (AUDIT_KV-backed). Absent => no durable audit (tests). */
@@ -248,6 +250,11 @@ export async function guardMutation<T>(guard: MutationGuard, eff: GuardedEffect<
       "mutation durability is not fully configured — refusing to mutate (fail closed).",
       { ledger: Boolean(guard.ledger), audit: Boolean(guard.audit) },
     );
+  }
+  if (guard.mutationFreeze) {
+    const err = new McpToolError("capability_denied", "mutations are temporarily frozen.");
+    await emitDenial(guard, eff, err);
+    throw err;
   }
   // The tool-level idempotencyKey is mandatory for any mutation. A missing key is itself
   // a DENIAL and is audited as such.

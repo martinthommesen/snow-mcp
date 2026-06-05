@@ -26,6 +26,7 @@ export { TokenStoreDO } from "./do/token-store.js";
 export { BudgetDO } from "./do/budget.js";
 export { MutationLedgerDO } from "./do/mutation-ledger.js";
 export { ConsentRateDO } from "./do/consent-rate.js";
+export { McpAdmissionDO } from "./do/mcp-admission.js";
 
 export interface Env {
   LOADER: WorkerLoader;
@@ -41,6 +42,8 @@ export interface Env {
   LEDGER_DO: DurableObjectNamespace;
   // Consent-write rate limiter (finding 4). Missing binding fails closed on consent/registration.
   CONSENT_RATE_DO?: ConsentRateNamespace;
+  // Authenticated /mcp admission limiter. Missing/unreachable binding fails closed.
+  MCP_ADMISSION_DO?: DurableObjectNamespace;
   ALLOWED_ORIGINS?: string;
   // I-1: pin the worker's public origin for OAuth redirect_uri / reauth URLs instead of deriving
   // it from the request Host. Required when SERVICENOW_CREDENTIAL_MODE=per_user_oauth.
@@ -69,6 +72,8 @@ export interface Env {
   DEPLOYMENT_PROFILE?: string;
   ALLOW_ADMIN_SCRIPT_CEILING?: string;
   SNOW_EXECUTOR_VERIFIER_ATTESTED?: string;
+  AUDIT_SIEM_ATTESTED?: string;
+  MUTATION_FREEZE?: string;
   ALLOW_LOCALHOST?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
@@ -159,6 +164,66 @@ function productionPostureResponse(error: ProductionPostureError, includeViolati
   );
 }
 
+interface AdmissionStub {
+  admit(now?: number): Promise<{ ok: true; leaseId: string } | { ok: false; reason: "rate" | "concurrency"; retryAfterMs: number }>;
+  release(leaseId: string): Promise<void>;
+}
+
+type AdmissionLease = { stub: AdmissionStub; leaseId: string };
+
+function retryAfterSeconds(ms: number): string {
+  return String(Math.max(1, Math.ceil(ms / 1000)));
+}
+
+async function admitMcpRequest(env: Env, userId: string): Promise<AdmissionLease | Response> {
+  if (!env.MCP_ADMISSION_DO) {
+    return Response.json({ error: "admission_unavailable" }, { status: 503 });
+  }
+  try {
+    const ns = env.MCP_ADMISSION_DO;
+    const stub = ns.get(ns.idFromName(userId)) as unknown as AdmissionStub;
+    const admitted = await stub.admit(Date.now());
+    if (!admitted.ok) {
+      return Response.json(
+        { error: admitted.reason === "rate" ? "rate_limited" : "too_many_in_flight" },
+        { status: 429, headers: { "Retry-After": retryAfterSeconds(admitted.retryAfterMs) } },
+      );
+    }
+    return { stub, leaseId: admitted.leaseId };
+  } catch (e) {
+    console.error("mcp admission failed:", redactString(e instanceof Error ? e.message : String(e)));
+    return Response.json({ error: "admission_unavailable" }, { status: 503 });
+  }
+}
+
+async function releaseMcpAdmission(lease: AdmissionLease): Promise<void> {
+  try {
+    await lease.stub.release(lease.leaseId);
+  } catch (e) {
+    console.error("mcp admission release failed:", redactString(e instanceof Error ? e.message : String(e)));
+  }
+}
+
+function responseWithAdmissionRelease(response: Response, lease: AdmissionLease, ctx: ExecutionContext): Response {
+  if (!response.body) {
+    ctx.waitUntil(releaseMcpAdmission(lease));
+    return response;
+  }
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const pump = response.body
+    .pipeTo(writable)
+    .catch(() => {
+      // Client cancellation or stream errors should still release the lease.
+    })
+    .finally(() => releaseMcpAdmission(lease));
+  ctx.waitUntil(pump);
+  return new Response(readable, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 function healthVersion(env: Env): Response {
   return Response.json({
     ok: true,
@@ -206,17 +271,25 @@ const apiHandler = {
       if (env.SERVICENOW_CREDENTIAL_MODE === "per_user_oauth" && !workerOrigin) {
         return Response.json({ error: "public_origin_required" }, { status: 500 });
       }
-      // Per-request server (§2.3); auth props flow to tools via getMcpAuthContext().
-      return await createMcpHandler(createServer(buildHandlers(env, {
-        userId,
-        scopeMaxMode,
-        props,
-        ...(workerOrigin ? { workerOrigin } : {}),
-        schemaIdentityResolver: (budget) => resolveSchemaIdentity(env, userId, { budget }),
-        schemaIdentityFreshResolver: () => resolveSchemaIdentity(env, userId, { freshOnly: true }),
-      })), {
-        authContext: { props },
-      })(request, env, ctx);
+      const admission = await admitMcpRequest(env, userId);
+      if (admission instanceof Response) return admission;
+      try {
+        // Per-request server (§2.3); auth props flow to tools via getMcpAuthContext().
+        const response = await createMcpHandler(createServer(buildHandlers(env, {
+          userId,
+          scopeMaxMode,
+          props,
+          ...(workerOrigin ? { workerOrigin } : {}),
+          schemaIdentityResolver: (budget) => resolveSchemaIdentity(env, userId, { budget }),
+          schemaIdentityFreshResolver: () => resolveSchemaIdentity(env, userId, { freshOnly: true }),
+        })), {
+          authContext: { props },
+        })(request, env, ctx);
+        return responseWithAdmissionRelease(response, admission, ctx);
+      } catch (e) {
+        await releaseMcpAdmission(admission);
+        throw e;
+      }
     } catch (e) {
       if (e instanceof ProductionPostureError) {
         return productionPostureResponse(e, true);

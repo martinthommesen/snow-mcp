@@ -90,6 +90,8 @@ export interface MutationDeps {
   now: () => number;
   /** Live handler wiring requires ledger + audit before any mutation/executor effect. */
   durabilityRequired?: boolean;
+  /** Incident switch: deny new mutations before ledger/effect side effects. */
+  mutationFreeze?: boolean;
   /** Per run+ordinal idempotency-ledger handle (LEDGER_DO-backed in production). */
   ledger?: (ordinal: number) => LedgerHandle;
   /** Durable host audit sink (AUDIT_KV-backed in production). */
@@ -450,6 +452,7 @@ export class ServiceNowRPC {
         identity: mutation.identity,
         now: mutation.now,
         ...(mutation.durabilityRequired ? { durabilityRequired: true } : {}),
+        ...(mutation.mutationFreeze ? { mutationFreeze: true } : {}),
         ...(mutation.ledger ? { ledger: mutation.ledger } : {}),
         ...(mutation.audit ? { audit: mutation.audit } : {}),
       },
@@ -637,6 +640,7 @@ export class ServiceNowRPC {
         identity: mutation.identity,
         now: mutation.now,
         ...(mutation.durabilityRequired ? { durabilityRequired: true } : {}),
+        ...(mutation.mutationFreeze ? { mutationFreeze: true } : {}),
         ...(mutation.ledger ? { ledger: mutation.ledger } : {}),
         ...(mutation.audit ? { audit: mutation.audit } : {}),
       },
