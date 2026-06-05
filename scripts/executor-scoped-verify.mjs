@@ -85,19 +85,23 @@ async function restoreExecutorToggles(props) {
 function randomPassword() {
   return `McpVerify-${crypto.randomUUID()}-${crypto.randomUUID()}`;
 }
-async function createExecutorOnlyPrincipal(roleId) {
-  const configuredUser = dv("SNOW_EXECUTOR_TEST_USERNAME");
-  const configuredPassword = dv("SNOW_EXECUTOR_TEST_PASSWORD");
-  if (configuredUser || configuredPassword) {
-    return configuredExecutorPrincipal(configuredUser, configuredPassword, roleId);
+async function executorOnlyPrincipal(roleId) {
+  const configured = configuredExecutorCredentials();
+  if (configured) return configuredExecutorPrincipal(configured.username, configured.password, roleId);
+  return managedExecutorPrincipal(roleId);
+}
+
+function configuredExecutorCredentials() {
+  const username = dv("SNOW_EXECUTOR_TEST_USERNAME");
+  const password = dv("SNOW_EXECUTOR_TEST_PASSWORD");
+  if (!username && !password) return undefined;
+  if (!username || !password) {
+    throw new Error("Set both SNOW_EXECUTOR_TEST_USERNAME and SNOW_EXECUTOR_TEST_PASSWORD, or set neither to create a temporary executor-only user.");
   }
-  return createManagedExecutorOnlyPrincipal(roleId);
+  return { username, password };
 }
 
 async function configuredExecutorPrincipal(configuredUser, configuredPassword, roleId) {
-  if (!configuredUser || !configuredPassword) {
-    throw new Error("Set both SNOW_EXECUTOR_TEST_USERNAME and SNOW_EXECUTOR_TEST_PASSWORD, or set neither to create a temporary executor-only user.");
-  }
   const query = encodeURIComponent(`user_name=${configuredUser}`);
   const user = (await apiOk("GET", `/api/now/table/sys_user?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,user_name`)).json?.result?.[0];
   if (!user?.sys_id) throw new Error("SNOW_EXECUTOR_TEST_USERNAME was not found in sys_user.");
@@ -146,23 +150,32 @@ async function grantExecutorRole(userId, roleId) {
   return sysIdFrom(grant, "Temporary executor-only role grant did not return sys_id.");
 }
 
-async function createManagedExecutorOnlyPrincipal(roleId) {
-  const randomSuffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
-  const username = `x_mcp_exec_verify_${Date.now()}_${randomSuffix}`;
-  const password = randomPassword();
+async function cleanupManagedPrincipalOnFailure(task) {
   let principal;
   try {
-    const userId = await createTemporaryExecutorUser(username, password);
-    const auth = basicAuth(username, password);
-    principal = { auth, managed: true, userId, roleId, roleGrantId: undefined, label: username };
-    await assertExecutorEndpointRequiresRole(auth);
-    principal.roleGrantId = await grantExecutorRole(userId, roleId);
-    await waitForExecutorRole(auth);
-    return principal;
+    return await task((candidate) => {
+      principal = candidate;
+      return candidate;
+    });
   } catch (e) {
     await cleanupExecutorOnlyPrincipal(principal);
     throw e;
   }
+}
+
+async function managedExecutorPrincipal(roleId) {
+  const randomSuffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
+  const username = `x_mcp_exec_verify_${Date.now()}_${randomSuffix}`;
+  const password = randomPassword();
+  return cleanupManagedPrincipalOnFailure(async (track) => {
+    const userId = await createTemporaryExecutorUser(username, password);
+    const auth = basicAuth(username, password);
+    const principal = track({ auth, managed: true, userId, roleId, roleGrantId: undefined, label: username });
+    await assertExecutorEndpointRequiresRole(auth);
+    principal.roleGrantId = await grantExecutorRole(userId, roleId);
+    await waitForExecutorRole(auth);
+    return principal;
+  });
 }
 
 async function waitForExecutorRole(auth, timeoutMs = 15_000, stepMs = 1_000) {
@@ -312,7 +325,7 @@ executorToggleSnapshot = await enableExecutorTogglesForVerify();
 
 // Use a non-admin principal with only x_1793136_mcp.executor for the executor endpoint. The admin
 // credential above remains setup/cleanup only and never proves endpoint-role or secret isolation.
-executorPrincipal = await createExecutorOnlyPrincipal(roleId);
+executorPrincipal = await executorOnlyPrincipal(roleId);
 endpointAuth = executorPrincipal.auth;
 await assertExecutorCannotReadHmacProperties(executorPrincipal.auth);
 

@@ -119,6 +119,10 @@ function violation(report, pkg, reason) {
   };
 }
 
+function reportPackages(reports) {
+  return reports.flatMap((report) => report.packages.map((pkg) => ({ report, pkg })));
+}
+
 function evaluatePolicy(reports, policy) {
   if (!policy) return { violations: [], exceptionsUsed: [] };
   const allowed = new Set(policy.allowedLicenses ?? []);
@@ -126,17 +130,15 @@ function evaluatePolicy(reports, policy) {
   const exceptions = (policy.exceptions ?? []).map(compileException);
   const violations = [];
   const exceptionsUsed = [];
-  for (const report of reports) {
-    for (const pkg of report.packages) {
-      const reason = policyViolationReason(pkg, allowed, deniedRe);
-      if (!reason) continue;
-      const exception = exceptions.find((candidate) => exceptionMatches(candidate, pkg, report));
-      if (!exception) {
-        violations.push(violation(report, pkg, reason));
-        continue;
-      }
-      exceptionsUsed.push(exceptionUsage(report, pkg, exception));
+  for (const { report, pkg } of reportPackages(reports)) {
+    const reason = policyViolationReason(pkg, allowed, deniedRe);
+    if (!reason) continue;
+    const exception = exceptions.find((candidate) => exceptionMatches(candidate, pkg, report));
+    if (!exception) {
+      violations.push(violation(report, pkg, reason));
+      continue;
     }
+    exceptionsUsed.push(exceptionUsage(report, pkg, exception));
   }
   return { violations, exceptionsUsed };
 }

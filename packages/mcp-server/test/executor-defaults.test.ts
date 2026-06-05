@@ -104,7 +104,7 @@ describe("Phase 2 — admin_script executor defaults", () => {
 
   it("the live verifier uses an executor-only principal and proves raw HMAC property denial", () => {
     expect(verifierSource).toContain("SNOW_EXECUTOR_TEST_USERNAME");
-    expect(verifierSource).toContain("createExecutorOnlyPrincipal");
+    expect(verifierSource).toContain("executorOnlyPrincipal");
     expect(verifierSource).toContain("assertExecutorCannotReadHmacProperties");
     expect(verifierSource).toContain("HMAC secret isolation");
     expect(verifierSource).toContain("endpointAuth = executorPrincipal.auth");
