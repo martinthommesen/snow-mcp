@@ -116,33 +116,47 @@ async function configuredExecutorPrincipal(configuredUser, configuredPassword, r
   };
 }
 
+function sysIdFrom(response, message) {
+  const sysId = response.json?.result?.sys_id;
+  if (!sysId) throw new Error(message);
+  return sysId;
+}
+
+async function createTemporaryExecutorUser(username, password) {
+  const created = await apiOk("POST", "/api/now/table/sys_user", {
+    user_name: username,
+    first_name: "MCP",
+    last_name: "Executor Verify",
+    active: "true",
+    locked_out: "false",
+    password_needs_reset: "false",
+    user_password: password,
+  });
+  return sysIdFrom(created, "Temporary executor-only user creation did not return sys_id.");
+}
+
+async function assertExecutorEndpointRequiresRole(auth) {
+  const noRole = await call(await signed("return 1;"), auth);
+  check("S8 live — executor-only test principal without role cannot invoke endpoint",
+    noRole.status === 403 || noRole.status === 401, `(status ${noRole.status})`);
+}
+
+async function grantExecutorRole(userId, roleId) {
+  const grant = await apiOk("POST", "/api/now/table/sys_user_has_role", { user: userId, role: roleId });
+  return sysIdFrom(grant, "Temporary executor-only role grant did not return sys_id.");
+}
+
 async function createManagedExecutorOnlyPrincipal(roleId) {
   const randomSuffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
   const username = `x_mcp_exec_verify_${Date.now()}_${randomSuffix}`;
   const password = randomPassword();
   let principal;
   try {
-    const created = await apiOk("POST", "/api/now/table/sys_user", {
-      user_name: username,
-      first_name: "MCP",
-      last_name: "Executor Verify",
-      active: "true",
-      locked_out: "false",
-      password_needs_reset: "false",
-      user_password: password,
-    });
-    const userId = created.json?.result?.sys_id;
-    if (!userId) throw new Error("Temporary executor-only user creation did not return sys_id.");
-
+    const userId = await createTemporaryExecutorUser(username, password);
     const auth = basicAuth(username, password);
     principal = { auth, managed: true, userId, roleId, roleGrantId: undefined, label: username };
-    const noRole = await call(await signed("return 1;"), auth);
-    check("S8 live — executor-only test principal without role cannot invoke endpoint",
-      noRole.status === 403 || noRole.status === 401, `(status ${noRole.status})`);
-
-    const grant = await apiOk("POST", "/api/now/table/sys_user_has_role", { user: userId, role: roleId });
-    principal.roleGrantId = grant.json?.result?.sys_id;
-    if (!principal.roleGrantId) throw new Error("Temporary executor-only role grant did not return sys_id.");
+    await assertExecutorEndpointRequiresRole(auth);
+    principal.roleGrantId = await grantExecutorRole(userId, roleId);
     await waitForExecutorRole(auth);
     return principal;
   } catch (e) {

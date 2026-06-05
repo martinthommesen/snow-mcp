@@ -92,6 +92,33 @@ function exceptionMatches(exception, pkg, report) {
   return true;
 }
 
+function policyViolationReason(pkg, allowed, deniedRe) {
+  const deniedLicense = deniedRe.test(pkg.license);
+  if (allowed.has(pkg.license) && !deniedLicense) return undefined;
+  return deniedLicense ? "denied_license" : "license_not_in_allowlist";
+}
+
+function exceptionUsage(report, pkg, exception) {
+  return {
+    lockfile: report.lockfile,
+    name: pkg.name,
+    version: pkg.version,
+    license: pkg.license,
+    reason: exception.reason,
+  };
+}
+
+function violation(report, pkg, reason) {
+  return {
+    lockfile: report.lockfile,
+    name: pkg.name,
+    version: pkg.version,
+    license: pkg.license,
+    path: pkg.path,
+    reason,
+  };
+}
+
 function evaluatePolicy(reports, policy) {
   if (!policy) return { violations: [], exceptionsUsed: [] };
   const allowed = new Set(policy.allowedLicenses ?? []);
@@ -101,28 +128,14 @@ function evaluatePolicy(reports, policy) {
   const exceptionsUsed = [];
   for (const report of reports) {
     for (const pkg of report.packages) {
-      const allowedLicense = allowed.has(pkg.license);
-      const deniedLicense = deniedRe.test(pkg.license);
-      if (allowedLicense && !deniedLicense) continue;
+      const reason = policyViolationReason(pkg, allowed, deniedRe);
+      if (!reason) continue;
       const exception = exceptions.find((candidate) => exceptionMatches(candidate, pkg, report));
-      if (exception) {
-        exceptionsUsed.push({
-          lockfile: report.lockfile,
-          name: pkg.name,
-          version: pkg.version,
-          license: pkg.license,
-          reason: exception.reason,
-        });
+      if (!exception) {
+        violations.push(violation(report, pkg, reason));
         continue;
       }
-      violations.push({
-        lockfile: report.lockfile,
-        name: pkg.name,
-        version: pkg.version,
-        license: pkg.license,
-        path: pkg.path,
-        reason: deniedLicense ? "denied_license" : "license_not_in_allowlist",
-      });
+      exceptionsUsed.push(exceptionUsage(report, pkg, exception));
     }
   }
   return { violations, exceptionsUsed };

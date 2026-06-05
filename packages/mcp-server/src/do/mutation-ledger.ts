@@ -88,11 +88,11 @@ export function normalizeLedgerRecordForStorage(
 }
 
 export class MutationLedgerDO extends DurableObject {
-  private chain: Promise<unknown> = Promise.resolve();
+  private mutationChain: Promise<unknown> = Promise.resolve();
 
-  private enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(task);
-    this.chain = run.then(
+  private serializeMutation<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.mutationChain.then(task);
+    this.mutationChain = run.then(
       () => undefined,
       () => undefined,
     );
@@ -103,7 +103,7 @@ export class MutationLedgerDO extends DurableObject {
     task: (...args: Args) => Promise<T>,
     ...args: Args
   ): Promise<T> {
-    return this.enqueue(() => task.apply(this, args));
+    return this.serializeMutation(() => task.apply(this, args));
   }
 
   private async getActiveRecord(): Promise<LedgerRecord | undefined> {

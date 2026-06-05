@@ -210,8 +210,8 @@ var x_mcp_verify = Class.create();
 
   // PUBLIC: eval the verified script (plan §P7 item 2 / finding 6). The scoped wrapper calls this
   // ONLY AFTER its audit row exists and its single-use nonce INSERT succeeds. Direct callers still
-  // need a fresh host-signed actor, the unreturned running audit sys_id, and proof that the nonce
-  // has already been consumed; otherwise execute() refuses eval.
+  // need a fresh host-signed actor, a wrapper-created running audit row that matches the signed
+  // request/code, and proof that the nonce has already been consumed; otherwise execute() refuses eval.
   execute: function (code, actor, sig, auditId) {
     var v;
     try {

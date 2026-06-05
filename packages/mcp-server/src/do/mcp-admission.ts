@@ -19,6 +19,10 @@ export type McpAdmissionResult =
   | { ok: true; leaseId: string }
   | { ok: false; reason: "rate" | "concurrency"; retryAfterMs: number };
 
+function leaseExpiresAt(now: number): number {
+  return now + STALE_LEASE_MS;
+}
+
 export class McpAdmissionDO extends DurableObject {
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -54,7 +58,7 @@ export class McpAdmissionDO extends DurableObject {
     }
 
     const leaseId = crypto.randomUUID();
-    leases[leaseId] = now + STALE_LEASE_MS;
+    leases[leaseId] = leaseExpiresAt(now);
     window = { ...window, count: window.count + 1 };
     await this.ctx.storage.put({ [WINDOW_KEY]: window, [LEASES_KEY]: leases });
     return { ok: true, leaseId };
@@ -76,7 +80,7 @@ export class McpAdmissionDO extends DurableObject {
         await this.ctx.storage.put(LEASES_KEY, leases);
         return false;
       }
-      leases[leaseId] = now + STALE_LEASE_MS;
+      leases[leaseId] = leaseExpiresAt(now);
       await this.ctx.storage.put(LEASES_KEY, leases);
       return true;
     });
