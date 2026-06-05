@@ -7,7 +7,7 @@
   "main": "src/index.ts",
   "dependencies": {
     "@cloudflare/codemode": "0.3.8",
-    "@cloudflare/workers-oauth-provider": "0.7.0",
+    "@cloudflare/workers-oauth-provider": "0.7.2",
     "@modelcontextprotocol/sdk": "1.29.0",
     "@servicenow-codemode/shared": "*",
     "agents": "0.14.1",
