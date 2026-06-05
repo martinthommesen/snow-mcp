@@ -28,7 +28,7 @@ const verifyScriptTemplate = readFileSync(new URL("../sn-executor-app/script-inc
 let cachedDevVarsText;
 
 function dv(k) {
-  if (process.env[k]) return process.env[k];
+  if (Object.prototype.hasOwnProperty.call(process.env, k)) return process.env[k] ?? "";
   if (cachedDevVarsText === undefined) {
     cachedDevVarsText = existsSync(".dev.vars") ? readFileSync(".dev.vars", "utf8") : "";
   }

@@ -42,6 +42,23 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(secretRoles).not.toContain("executorRole");
   });
 
+  it("grants the Global verifier read-only cross-scope access to scoped proof tables", () => {
+    for (const name of [
+      "x_1793136_mcp_audit_log",
+      "x_1793136_mcp_nonce",
+    ]) {
+      const start = fluentSource.indexOf(`name: '${name}'`);
+      expect(start).toBeGreaterThan(-1);
+      const block = fluentSource.slice(start, fluentSource.indexOf("schema:", start));
+      expect(block).toContain("accessibleFrom: 'public'");
+      expect(block).toContain("callerAccess: 'none'");
+      expect(block).toContain("actions: ['read']");
+      expect(block).not.toContain("'create'");
+      expect(block).not.toContain("'update'");
+      expect(block).not.toContain("'delete'");
+    }
+  });
+
   it("does not let the scoped executor runtime read or mint from raw HMAC properties", () => {
     expect(executorSource).not.toContain("x_1793136_mcp.executor.hmac_secret");
     expect(executorSource).not.toContain("x_mcp_exec_cap");
@@ -58,7 +75,8 @@ describe("Phase 2 — admin_script executor defaults", () => {
   });
 
   it("the live helper installer updates only pre-created admin-only private HMAC properties", () => {
-    expect(installerSource).toContain("process.env[k]");
+    expect(installerSource).toContain("Object.prototype.hasOwnProperty.call(process.env, k)");
+    expect(installerSource).toContain('return process.env[k] ?? ""');
     expect(installerSource).toContain('existsSync(".dev.vars")');
     expect(installerSource).toContain("requiredScopedHmacProperty");
     expect(installerSource).toContain("Refusing to update");

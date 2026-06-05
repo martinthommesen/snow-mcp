@@ -25,10 +25,15 @@ const adminRole = Role({
 })
 
 // ─── Tables (plan §10): audit log + nonce ─────────────────────────────────────
+// Application access grants the installed Global verifier helper read-only proof-row visibility.
+// Human/API row access remains locked down separately by explicit admin-only record ACLs below.
 export const x_1793136_mcp_audit_log = Table({
     $id: Now.ID['t_audit'],
     name: 'x_1793136_mcp_audit_log',
     label: 'MCP Audit Log',
+    accessibleFrom: 'public',
+    callerAccess: 'none',
+    actions: ['read'],
     schema: {
         snow_user: StringColumn({ label: 'SN User', maxLength: 64 }),
         snow_user_name: StringColumn({ label: 'SN User Name', maxLength: 128 }),
@@ -59,6 +64,9 @@ export const x_1793136_mcp_nonce = Table({
     $id: Now.ID['t_nonce'],
     name: 'x_1793136_mcp_nonce',
     label: 'MCP Nonce',
+    accessibleFrom: 'public',
+    callerAccess: 'none',
+    actions: ['read'],
     schema: {
         value: StringColumn({ label: 'Value', maxLength: 128 }),
         created: DateTimeColumn({ label: 'Created' }),
