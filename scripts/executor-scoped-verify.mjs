@@ -110,7 +110,8 @@ async function createExecutorOnlyPrincipal(roleId) {
     };
   }
 
-  const username = `x_mcp_exec_verify_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const randomSuffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
+  const username = `x_mcp_exec_verify_${Date.now()}_${randomSuffix}`;
   const password = randomPassword();
   let principal;
   try {
