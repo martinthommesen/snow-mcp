@@ -99,6 +99,13 @@ export class MutationLedgerDO extends DurableObject {
     return run;
   }
 
+  private runCritical<Args extends unknown[], T>(
+    task: (...args: Args) => Promise<T>,
+    ...args: Args
+  ): Promise<T> {
+    return this.enqueue(() => task.apply(this, args));
+  }
+
   private async getActiveRecord(): Promise<LedgerRecord | undefined> {
     const rec = await this.ctx.storage.get<Partial<LedgerRecord>>(RECORD_KEY);
     const normalized = normalizeLedgerRecordForStorage(rec);
@@ -129,7 +136,7 @@ export class MutationLedgerDO extends DurableObject {
    * A request-hash mismatch on an existing key is treated as a conflict ("blocked").
    */
   async begin(requestHash: string): Promise<BeginResult> {
-    return this.enqueue(() => this.beginCritical(requestHash));
+    return this.runCritical(this.beginCritical, requestHash);
   }
 
   private async beginCritical(requestHash: string): Promise<BeginResult> {
@@ -153,7 +160,7 @@ export class MutationLedgerDO extends DurableObject {
   }
 
   async complete(result: unknown): Promise<void> {
-    return this.enqueue(() => this.completeCritical(result));
+    return this.runCritical(this.completeCritical, result);
   }
 
   private async completeCritical(result: unknown): Promise<void> {
@@ -167,7 +174,7 @@ export class MutationLedgerDO extends DurableObject {
   }
 
   async fail(): Promise<void> {
-    return this.enqueue(() => this.failCritical());
+    return this.runCritical(this.failCritical);
   }
 
   private async failCritical(): Promise<void> {
@@ -177,7 +184,7 @@ export class MutationLedgerDO extends DurableObject {
 
   /** Mark an outcome unknown (e.g. runServerScript timed out). Blocks future retries (S17). */
   async markIndeterminate(): Promise<void> {
-    return this.enqueue(() => this.markIndeterminateCritical());
+    return this.runCritical(this.markIndeterminateCritical);
   }
 
   private async markIndeterminateCritical(): Promise<void> {

@@ -89,27 +89,34 @@ async function createExecutorOnlyPrincipal(roleId) {
   const configuredUser = dv("SNOW_EXECUTOR_TEST_USERNAME");
   const configuredPassword = dv("SNOW_EXECUTOR_TEST_PASSWORD");
   if (configuredUser || configuredPassword) {
-    if (!configuredUser || !configuredPassword) {
-      throw new Error("Set both SNOW_EXECUTOR_TEST_USERNAME and SNOW_EXECUTOR_TEST_PASSWORD, or set neither to create a temporary executor-only user.");
-    }
-    const query = encodeURIComponent(`user_name=${configuredUser}`);
-    const user = (await apiOk("GET", `/api/now/table/sys_user?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,user_name`)).json?.result?.[0];
-    if (!user?.sys_id) throw new Error("SNOW_EXECUTOR_TEST_USERNAME was not found in sys_user.");
-    const roles = (await apiOk("GET", `/api/now/table/sys_user_has_role?sysparm_query=user=${user.sys_id}&sysparm_fields=role.name`)).json?.result ?? [];
-    const roleNames = new Set(roles.map((r) => String(r["role.name"] ?? "")));
-    check("executor test principal has executor role and is not admin",
-      roleNames.has("x_1793136_mcp.executor") && !roleNames.has("admin"),
-      `(executor=${roleNames.has("x_1793136_mcp.executor")}, admin=${roleNames.has("admin")})`);
-    return {
-      auth: basicAuth(configuredUser, configuredPassword),
-      managed: false,
-      userId: user.sys_id,
-      roleId,
-      roleGrantId: undefined,
-      label: configuredUser,
-    };
+    return configuredExecutorPrincipal(configuredUser, configuredPassword, roleId);
   }
+  return createManagedExecutorOnlyPrincipal(roleId);
+}
 
+async function configuredExecutorPrincipal(configuredUser, configuredPassword, roleId) {
+  if (!configuredUser || !configuredPassword) {
+    throw new Error("Set both SNOW_EXECUTOR_TEST_USERNAME and SNOW_EXECUTOR_TEST_PASSWORD, or set neither to create a temporary executor-only user.");
+  }
+  const query = encodeURIComponent(`user_name=${configuredUser}`);
+  const user = (await apiOk("GET", `/api/now/table/sys_user?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,user_name`)).json?.result?.[0];
+  if (!user?.sys_id) throw new Error("SNOW_EXECUTOR_TEST_USERNAME was not found in sys_user.");
+  const roles = (await apiOk("GET", `/api/now/table/sys_user_has_role?sysparm_query=user=${user.sys_id}&sysparm_fields=role.name`)).json?.result ?? [];
+  const roleNames = new Set(roles.map((r) => String(r["role.name"] ?? "")));
+  check("executor test principal has executor role and is not admin",
+    roleNames.has("x_1793136_mcp.executor") && !roleNames.has("admin"),
+    `(executor=${roleNames.has("x_1793136_mcp.executor")}, admin=${roleNames.has("admin")})`);
+  return {
+    auth: basicAuth(configuredUser, configuredPassword),
+    managed: false,
+    userId: user.sys_id,
+    roleId,
+    roleGrantId: undefined,
+    label: configuredUser,
+  };
+}
+
+async function createManagedExecutorOnlyPrincipal(roleId) {
   const randomSuffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
   const username = `x_mcp_exec_verify_${Date.now()}_${randomSuffix}`;
   const password = randomPassword();
@@ -143,6 +150,7 @@ async function createExecutorOnlyPrincipal(roleId) {
     throw e;
   }
 }
+
 async function waitForExecutorRole(auth, timeoutMs = 15_000, stepMs = 1_000) {
   const deadline = Date.now() + timeoutMs;
   let lastStatus = "none";

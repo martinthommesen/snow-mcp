@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, relative, resolve } from "node:path";
 
 const DEFAULT_DENIED_LICENSE_RE = /\b(?:AGPL|GPL|LGPL)\b|UNKNOWN|UNLICENSED/i;
+const repoRoot = process.cwd();
+const lockfileBasenames = new Set(["package-lock.json"]);
+const policyBasenames = new Set(["license-policy.json"]);
 
 function packageName(pathKey, pkg) {
   if (pkg.name) return pkg.name;
@@ -10,8 +13,24 @@ function packageName(pathKey, pkg) {
   return parts[parts.length - 1] || basename(dirname(pathKey)) || "(root)";
 }
 
+function repoFilePath(input, allowedBasenames) {
+  const absolute = resolve(repoRoot, input);
+  const rel = relative(repoRoot, absolute);
+  if (rel.startsWith("..") || rel === "" || rel.includes("..")) {
+    throw new Error(`Refusing to read non-repository file: ${input}`);
+  }
+  if (!allowedBasenames.has(basename(absolute))) {
+    throw new Error(`Refusing to read unexpected file type: ${input}`);
+  }
+  return absolute;
+}
+
+function readJsonFile(input, allowedBasenames) {
+  return JSON.parse(readFileSync(repoFilePath(input, allowedBasenames), "utf8"));
+}
+
 function reportFor(lockfile) {
-  const lock = JSON.parse(readFileSync(lockfile, "utf8"));
+  const lock = readJsonFile(lockfile, lockfileBasenames);
   const lockPackages = lock.packages ?? {};
   const packages = Object.entries(lockPackages).map(([pathKey, pkg]) => {
     const target = pkg.link && pkg.resolved ? lockPackages[pkg.resolved] : undefined;
@@ -52,7 +71,7 @@ function globRegex(pattern) {
 
 function loadPolicy(path) {
   if (!path) return undefined;
-  return JSON.parse(readFileSync(path, "utf8"));
+  return readJsonFile(path, policyBasenames);
 }
 
 function compileException(exception) {
@@ -96,16 +115,14 @@ function evaluatePolicy(reports, policy) {
         });
         continue;
       }
-      if (deniedLicense || !allowedLicense) {
-        violations.push({
-          lockfile: report.lockfile,
-          name: pkg.name,
-          version: pkg.version,
-          license: pkg.license,
-          path: pkg.path,
-          reason: deniedLicense ? "denied_license" : "license_not_in_allowlist",
-        });
-      }
+      violations.push({
+        lockfile: report.lockfile,
+        name: pkg.name,
+        version: pkg.version,
+        license: pkg.license,
+        path: pkg.path,
+        reason: deniedLicense ? "denied_license" : "license_not_in_allowlist",
+      });
     }
   }
   return { violations, exceptionsUsed };
