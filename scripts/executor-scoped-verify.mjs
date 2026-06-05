@@ -163,19 +163,21 @@ async function cleanupManagedPrincipalOnFailure(task) {
   }
 }
 
+async function createAndConfigureManagedPrincipal(track, username, password, roleId) {
+  const userId = await createTemporaryExecutorUser(username, password);
+  const auth = basicAuth(username, password);
+  const principal = track({ auth, managed: true, userId, roleId, roleGrantId: undefined, label: username });
+  await assertExecutorEndpointRequiresRole(auth);
+  principal.roleGrantId = await grantExecutorRole(userId, roleId);
+  await waitForExecutorRole(auth);
+  return principal;
+}
+
 async function managedExecutorPrincipal(roleId) {
   const randomSuffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
   const username = `x_mcp_exec_verify_${Date.now()}_${randomSuffix}`;
   const password = randomPassword();
-  return cleanupManagedPrincipalOnFailure(async (track) => {
-    const userId = await createTemporaryExecutorUser(username, password);
-    const auth = basicAuth(username, password);
-    const principal = track({ auth, managed: true, userId, roleId, roleGrantId: undefined, label: username });
-    await assertExecutorEndpointRequiresRole(auth);
-    principal.roleGrantId = await grantExecutorRole(userId, roleId);
-    await waitForExecutorRole(auth);
-    return principal;
-  });
+  return cleanupManagedPrincipalOnFailure((track) => createAndConfigureManagedPrincipal(track, username, password, roleId));
 }
 
 async function waitForExecutorRole(auth, timeoutMs = 15_000, stepMs = 1_000) {
