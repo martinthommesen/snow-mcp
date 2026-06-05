@@ -78,7 +78,7 @@ async function api(method, path, body) {
 async function apiOk(method, path, body) {
   const res = await api(method, path, body);
   if (res.status < 200 || res.status >= 300) {
-    throw new Error(`${method} ${path} failed with HTTP ${res.status}: ${JSON.stringify(res.json)}`);
+    throw new Error(`${method} ${path} failed with HTTP ${res.status}`);
   }
   return res;
 }

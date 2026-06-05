@@ -72,6 +72,25 @@ var x_mcp_verify = Class.create();
     return { serialized: serialized, error: err };
   }
 
+  function executionClaimKey(auditId, nonce) {
+    var digest = new GlideDigest().getSHA256Hex(String(nonce || ''));
+    return 'x:' + String(auditId || '') + ':' + String(digest || '').toLowerCase().substring(0, 32);
+  }
+
+  function claimExecutionOnce(auditId, nonce) {
+    var gr = new GlideRecord('x_1793136_mcp_nonce');
+    gr.initialize();
+    gr.value = executionClaimKey(auditId, nonce);
+    gr.created = new GlideDateTime();
+    var id;
+    try {
+      id = gr.insert();
+    } catch (e) {
+      id = null;
+    }
+    return !!id;
+  }
+
 	x_mcp_verify.prototype = {
   FRESHNESS_MS: 120 * 1000,
 
@@ -197,25 +216,6 @@ var x_mcp_verify = Class.create();
     return gr.next();
   },
 
-  _executionClaimKey: function (auditId, nonce) {
-    var digest = new GlideDigest().getSHA256Hex(String(nonce || ''));
-    return 'x:' + String(auditId || '') + ':' + String(digest || '').toLowerCase().substring(0, 32);
-  },
-
-  _claimExecutionOnce: function (auditId, nonce) {
-    var gr = new GlideRecord('x_1793136_mcp_nonce');
-    gr.initialize();
-    gr.value = this._executionClaimKey(auditId, nonce);
-    gr.created = new GlideDateTime();
-    var id;
-    try {
-      id = gr.insert();
-    } catch (e) {
-      id = null;
-    }
-    return !!id;
-  },
-
   _auditCapabilityValid: function (auditId, code, actor) {
     var id = String(auditId || '');
     if (!/^[0-9a-f]{32}$/.test(id)) return false;
@@ -244,7 +244,7 @@ var x_mcp_verify = Class.create();
     try {
       capabilityOk = this._auditCapabilityValid(auditId, code, actor || {}) &&
         this._nonceConsumed((actor || {}).nonce) &&
-        this._claimExecutionOnce(auditId, (actor || {}).nonce);
+        claimExecutionOnce(auditId, (actor || {}).nonce);
     } catch (ce) {
       capabilityOk = false;
     }

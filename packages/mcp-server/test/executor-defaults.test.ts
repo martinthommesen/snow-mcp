@@ -48,7 +48,6 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(executorSource).toContain("out = core.execute(code, actor, sig, auditId + '')");
     expect(verifierCoreSource).toContain("_auditCapabilityValid");
     expect(verifierCoreSource).toContain("_nonceConsumed");
-    expect(verifierCoreSource).toContain("_claimExecutionOnce");
     expect(verifierCoreSource).not.toContain("gs.getProperty('x_1793136_mcp.executor.hmac_secret");
     expect(verifierCoreSource).toContain('var HMAC_SECRET_CURRENT = "__X_MCP_EXECUTOR_HMAC_KEY__"');
     expect(verifierCoreSource).not.toContain("HMAC_SECRET_CURRENT:");
@@ -72,6 +71,9 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(verifierCoreSource).toContain("function executeCode(code)");
     expect(verifierCoreSource).toContain("return executeCode(code)");
     expect(verifierCoreSource).not.toContain("_executeCode:");
+    expect(verifierCoreSource).toContain("function claimExecutionOnce");
+    expect(verifierCoreSource).not.toContain("_claimExecutionOnce:");
+    expect(verifierCoreSource).not.toContain("_executionClaimKey:");
     expect(verifierCoreSource).toContain("capabilityOk = false");
     expect(verifierCoreSource).toContain("error: 'capability_required'");
     expect(verifierCoreSource).toContain("'x:' + String(auditId || '')");

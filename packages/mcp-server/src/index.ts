@@ -238,6 +238,16 @@ async function renewMcpAdmissionUntilReleased(
   }
 }
 
+function abortAdmissionStreamAfterLeaseLoss(
+  controller: ReadableStreamDefaultController<Uint8Array> | undefined,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  releaseOnce: () => Promise<void>,
+): void {
+  controller?.error("admission_lease_lost");
+  void reader.cancel().catch(() => undefined);
+  void releaseOnce();
+}
+
 export function responseWithAdmissionRelease(response: Response, lease: AdmissionLease, ctx: ExecutionContext): Response {
   if (!response.body) {
     ctx.waitUntil(releaseMcpAdmission(lease));
@@ -253,11 +263,10 @@ export function responseWithAdmissionRelease(response: Response, lease: Admissio
     renewalAbort.abort();
     await releaseMcpAdmission(lease);
   };
-  const renewal = renewMcpAdmissionUntilReleased(lease, renewalAbort.signal, () => {
-    controller?.error(new Error("admission_lease_lost"));
-    void reader.cancel().catch(() => undefined);
-    void releaseOnce();
-  });
+  function onLeaseLost(): void {
+    abortAdmissionStreamAfterLeaseLoss(controller, reader, releaseOnce);
+  }
+  const renewal = renewMcpAdmissionUntilReleased(lease, renewalAbort.signal, onLeaseLost);
   const readable = new ReadableStream<Uint8Array>({
     start(c) {
       controller = c;
