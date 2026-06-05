@@ -141,14 +141,18 @@ The P0–P7 security-hardening branch landed the following deltas vs the pre-har
   `_consumeNonce` in the global core against a global `x_mcp_nonce` table; that never shipped, HEAD
   `8c6e1fd` moved consumption to the scoped wrapper, confirmed live.) The scoped wrapper
   (`x_mcp_executor.js`) delegates HMAC verify + `new Function` eval to the GLOBAL `x_mcp_verify`
-  core (global-only primitives, D11) — that core does **verify()/execute()/run() only, no nonce,
-  no DB write**. The wrapper itself does a bare INSERT into the **scoped `x_1793136_mcp_nonce`**
-  between verify() and execute(); a duplicate (falsy insert OR unique-constraint violation) is a
-  replay → 401. Arbiter = the scoped table's **DB unique index** on `value` (✅ live-verified via
-  the CONCURRENT one-200/one-401 case). now-sdk 4.7.1 creates the physical index but omits the
-  `sys_index` catalog row — index enforces while `sys_index` reads empty; verify functionally.
-- **`executor-install.mjs` = global verify()/execute()/run() CORE + properties ONLY (no tables,
-  no REST endpoint).** The opt-in global-REST install path
+  core (global-only primitives, D11) — that core does **verify()/execute() only**, uses
+  installer-injected HMAC material instead of executor-role property reads, and refuses eval unless
+  the wrapper-created audit row is still `running` and the nonce row already exists. The wrapper
+  itself does a bare INSERT into the **scoped `x_1793136_mcp_nonce`** between verify() and execute();
+  a duplicate (falsy insert OR unique-constraint violation) is a replay → 401. Arbiter = the scoped
+  table's **DB unique index** on `value` (✅ live-verified via the CONCURRENT one-200/one-401 case).
+  now-sdk 4.7.1 creates the physical index but omits the `sys_index` catalog row — index enforces
+  while `sys_index` reads empty; verify functionally.
+- **`executor-install.mjs` = global verify()/execute() CORE + properties ONLY (no tables, no REST
+  endpoint).** The installer renders the core with `X_MCP_EXECUTOR_HMAC_KEY` and optional
+  `X_MCP_EXECUTOR_HMAC_KEY_PREV`; the admin-only ServiceNow HMAC properties are operational
+  inventory, not the runtime read path. The opt-in global-REST install path
   was **REMOVED** in the M-4 remediation (2026-05-31) — it reproduced the incident's un-ACL'd
   global-executor shape. The canonical surface is the scoped, role-ACL-gated Fluent REST at the
   two-segment path **`/api/x_1793136_mcp/x_mcp/executor/run`**.

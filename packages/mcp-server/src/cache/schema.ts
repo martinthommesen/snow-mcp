@@ -4,6 +4,7 @@
 // could leak a field that user A can see but user B (same role, failing a field/scripted ACL)
 // cannot. ~24h TTL.
 
+import { bytesToHex } from "../auth/encoding.js";
 import type { FieldInfo, ListTablesResult } from "../sn/discovery.js";
 
 export const SCHEMA_VERSION = "v2";
@@ -81,6 +82,5 @@ export class SchemaCache {
 export async function roleHash(roles: string[]): Promise<string> {
   const canonical = [...roles].sort().join(",");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
-  const bytes = new Uint8Array(digest).subarray(0, 8);
-  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return bytesToHex(new Uint8Array(digest).subarray(0, 8));
 }

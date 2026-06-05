@@ -136,6 +136,47 @@ describe("P4 — idempotency ledger wired into tableUpdate", () => {
     expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
   });
 
+  it("MUTATION_FREEZE denies tableUpdate before ledger or PATCH side effects", async () => {
+    const runKey = `freeze-table-${crypto.randomUUID()}`;
+    const rows: AuditRecord[] = [];
+    const http = new MockHttp();
+    const r = rpc({
+      http,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-freeze-table", runKey },
+        mutationFreeze: true,
+        ledger: realLedger(runKey),
+        audit: async (rec) => { rows.push(rec); },
+      }),
+    });
+    await expect(
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
+    ).rejects.toMatchObject({ code: "capability_denied" });
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+    expect(await ledgerStatus(runKey)).toBe("none");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "denied", errorClass: "capability_denied" });
+  });
+
+  it("MUTATION_FREEZE does not mask a missing production audit sink", async () => {
+    const runKey = `freeze-no-audit-${crypto.randomUUID()}`;
+    const http = new MockHttp();
+    const r = rpc({
+      http,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-freeze-no-audit", runKey },
+        durabilityRequired: true,
+        mutationFreeze: true,
+        ledger: realLedger(runKey),
+      }),
+    });
+    await expect(
+      r.tableUpdate({ table: "incident", sys_id: SYS_ID, fields: { state: "2" } }),
+    ).rejects.toMatchObject({ code: "internal_error" });
+    expect(http.calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+    expect(await ledgerStatus(runKey)).toBe("none");
+  });
+
   it("P2a: a durability-required mutation with NO runKey is denied AND audited (not internal_error)", async () => {
     // With audit present, a missing idempotencyKey must surface as capability_denied with a
     // denial audit row — the audit-require check must NOT pre-empt the denial.
@@ -702,6 +743,27 @@ describe("Phase 1C — outbound request bodies are pre-serialized and metered", 
 describe("P4 — second-approval gate wired into runServerScript", () => {
   const SCRIPT = "return gs.getUserName();";
   const APPROVED = { adminScriptAllowlist: ["userA"], requiredAccessGroup: "mcp-admins", actorAccessGroups: ["mcp-admins"] };
+
+  it("MUTATION_FREEZE denies runServerScript before ledger or POST side effects", async () => {
+    const runKey = `freeze-script-${crypto.randomUUID()}`;
+    const rows: AuditRecord[] = [];
+    const http = new MockHttp();
+    const r = rpc({
+      http, mode: "admin_script", signing: true,
+      mutation: mutationDeps({
+        runContext: { requestId: "r-freeze-script", runKey, reason: "rotate" },
+        mutationFreeze: true,
+        ledger: realLedger(runKey),
+        audit: async (rec) => { rows.push(rec); },
+        approval: APPROVED,
+      }),
+    });
+    await expect(r.runServerScript({ script: SCRIPT })).rejects.toMatchObject({ code: "capability_denied" });
+    expect(http.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+    expect(await ledgerStatus(runKey)).toBe("none");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "denied", errorClass: "capability_denied" });
+  });
 
   it("FAILS CLOSED when the live executor path requires durability but the ledger is missing", async () => {
     const http = new MockHttp();

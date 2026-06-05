@@ -27,7 +27,7 @@ executor controls are exercised live by `scripts/executor-scoped-verify.mjs` aga
 | T16 | **Mode escalation** via the `mode` tool input | Unauthorized writes / arbitrary script | `effectiveMode = min(requested, scope, tenant, instance)`; an **unknown mode → maximum risk (fail-closed)**; `admin_script` needs allowlist + approval |
 | T17 | **`integration_user` over-reads** for a given user | Confidential data disclosure (audit ≠ access control) | `ActorPolicy` (instances/tables/fields/rows) before every RPC; OIDC groups may select named ActorPolicies; mandatory row filter AND-ed into reads **including `tableGet`** and write preflight; field masks checked on query **predicates**, not just fields/rows; or `per_user_oauth` |
 | T18 | **`scriptedRest` bypasses `runServerScript()`** | Ungated/unaudited executor reach | No generic scripted-REST RPC exists; the executor is reachable only via `runServerScript()`; any future generic adapter must deny executor/config/audit/OAuth paths |
-| T19 | **ServiceNow-side egress** via `runServerScript` | Server-side script calls SN outbound / email / events / records | Scoped tenant `run_server_script_enabled` toggle + `reason` + approval for `admin_script` + non-recoverable label + host audit/ledger/snapshot wrap; the executor `execute()` is cap-gated to the consumed nonce |
+| T19 | **ServiceNow-side egress** via `runServerScript` | Server-side script calls SN outbound / email / events / records | Scoped tenant `run_server_script_enabled` toggle + `reason` + approval for `admin_script` + non-recoverable label + host audit/ledger/snapshot wrap; the executor consumes a DB-unique nonce before `execute()`, and `execute()` re-verifies the fresh HMAC-bound actor plus wrapper audit/nonce proof |
 | T20 | **Recovery snapshot store** becomes a second sensitive DB | New PII exposure / over-retention | Retention window + dedicated `SNAPSHOT_KEK_CURRENT` (AES-256-GCM) + admin-only decrypt + KV auto-expiry + PII classification + explicit table enablement (`RETENTION.md`) |
 
 **ServiceNow-side egress (T19) deserves its own emphasis.** `globalOutbound: null` is a
@@ -39,6 +39,6 @@ non-recoverable labeling), documented in [`SNOW_EGRESS.md`](SNOW_EGRESS.md) — 
 
 **Forged actor metadata (T15) and integration_user over-reads (T17)** are why
 [`DESIGN.md`](DESIGN.md) insists on host **sign-AND-verify** (a claimed `body.actor` is forgeable by
-anyone holding the executor role) and on `ActorPolicy` gating every read (audit records disclosure;
-it does not prevent it). Per-actor `maxMode` is re-checked at the `runServerScript` sink, not
-inherited.
+anyone holding the executor role) and on `ActorPolicy` gating every read. The executor role must not
+read the HMAC signing properties; otherwise the HMAC stops being an independent factor. Per-actor
+`maxMode` is re-checked at the `runServerScript` sink, not inherited.

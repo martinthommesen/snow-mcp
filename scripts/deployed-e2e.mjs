@@ -194,7 +194,7 @@ await mcp.close();
     const at = new StreamableHTTPClientTransport(new URL(`${BASE}/mcp`), { requestInit: { headers: { authorization: `Bearer ${adminToken}` } } });
     const admin = new Client({ name: "e2e-idem", version: "0.1.0" });
     await admin.connect(at);
-    const idem = "idem-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    const idem = `idem-${Date.now()}-${crypto.randomUUID()}`;
     const args = {
       // Side-effect-free: gs.generateGUID() is fresh per real execution. The inner idempotencyKey
       // is required by the executor RPC but is NOT the ledger key (the tool-level one is).

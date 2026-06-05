@@ -16,6 +16,7 @@ interface TestEnv {
   BUDGET_DO: DurableObjectNamespace<import("../src/do/budget.js").BudgetDO>;
   LEDGER_DO: DurableObjectNamespace<import("../src/do/mutation-ledger.js").MutationLedgerDO>;
   CONSENT_RATE_DO: DurableObjectNamespace<import("../src/do/consent-rate.js").ConsentRateDO>;
+  MCP_ADMISSION_DO: DurableObjectNamespace<import("../src/do/mcp-admission.js").McpAdmissionDO>;
 }
 const E = env as unknown as TestEnv;
 
@@ -137,6 +138,29 @@ describe("MutationLedgerDO replay storage", () => {
     expect((replay as { result: { serializedResult: string } }).result.serializedResult).toHaveLength(
       MUTATION_LEDGER_MAX_REPLAY_BYTES,
     );
+  });
+
+  it("serializes parallel begin/complete calls through one promise chain", async () => {
+    const ns = E.LEDGER_DO;
+    const obj = ns.get(ns.idFromName(`ledger-parallel-${crypto.randomUUID()}`));
+    const requestHash = "hash-parallel";
+
+    expect(await obj.begin(requestHash)).toEqual({ state: "new" });
+    const results = await Promise.all([
+      obj.complete({ ok: true }),
+      obj.begin(requestHash),
+      obj.begin("different-hash"),
+      obj.complete({ ignored: true }),
+    ]);
+    expect(results.slice(1)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: expect.stringMatching(/blocked|replay/) }),
+    ]));
+    const finalReplay = await obj.begin(requestHash);
+    expect(finalReplay).toMatchObject({
+      state: "replay",
+      result: { replaySafe: true, truncated: false, serializedResult: expect.any(String) },
+    });
+    expect(visibleReplayResult((finalReplay as { result: ReplaySafeWrapper }).result)).toEqual({ ok: true });
   });
 
   it("does not trust caller-shaped replay wrappers that exceed the cap", () => {
@@ -299,6 +323,72 @@ describe("Finding 4 — ConsentRateDO bounds consent writes per key per window",
     expect(await obj.count()).toBe(MAX_KEYS); // NEVER exceeds the bound (was unbounded before)
     // ip-0 (oldest-inserted) was evicted, so it now gets a FRESH window (true), not the stale cap.
     expect(await obj.allow("ip-0", t0)).toBe(true);
+  });
+});
+
+describe("McpAdmissionDO bounds authenticated /mcp requests per user", () => {
+  function admission(key: string) {
+    const ns = E.MCP_ADMISSION_DO;
+    return ns.get(ns.idFromName(key));
+  }
+
+  it("enforces four in-flight leases, releases in-flight slots, and prunes stale leases", async () => {
+    const obj = admission(`user-admit-${crypto.randomUUID()}`);
+    const t0 = 1_000_000;
+    const leases = [];
+    for (let i = 0; i < 4; i++) {
+      const r = await obj.admit(t0);
+      expect(r.ok).toBe(true);
+      if (r.ok) leases.push(r.leaseId);
+    }
+    const denied = await obj.admit(t0);
+    expect(denied).toMatchObject({ ok: false, reason: "concurrency" });
+    await obj.release(leases[0]!);
+    expect(await obj.admit(t0 + 1)).toMatchObject({ ok: true });
+    expect(await obj.snapshot(t0 + 75_001)).toMatchObject({ inFlight: 0 });
+  });
+
+  it("renews active leases so long-lived streams keep their in-flight slots", async () => {
+    const obj = admission(`user-renew-${crypto.randomUUID()}`);
+    const t0 = 1_500_000;
+    const leases = [];
+    for (let i = 0; i < 4; i++) {
+      const r = await obj.admit(t0);
+      expect(r.ok).toBe(true);
+      if (r.ok) leases.push(r.leaseId);
+    }
+
+    for (const lease of leases) {
+      expect(await obj.renew(lease, t0 + 74_000)).toBe(true);
+    }
+
+    expect(await obj.snapshot(t0 + 75_001)).toMatchObject({ inFlight: 4 });
+    expect(await obj.admit(t0 + 75_001)).toMatchObject({ ok: false, reason: "concurrency" });
+  });
+
+  it("counts concurrency-denied attempts toward the authenticated rate cap", async () => {
+    const obj = admission(`user-concurrency-rate-${crypto.randomUUID()}`);
+    const t0 = 1_750_000;
+    for (let i = 0; i < 4; i++) {
+      expect(await obj.admit(t0)).toMatchObject({ ok: true });
+    }
+    for (let i = 0; i < 56; i++) {
+      expect(await obj.admit(t0 + i)).toMatchObject({ ok: false, reason: "concurrency" });
+    }
+    expect(await obj.snapshot(t0 + 56)).toMatchObject({ windowCount: 60, inFlight: 4 });
+    expect(await obj.admit(t0 + 57)).toMatchObject({ ok: false, reason: "rate" });
+  });
+
+  it("enforces the 60 request/minute authenticated rate cap per user object", async () => {
+    const obj = admission(`user-rate-${crypto.randomUUID()}`);
+    const t0 = 2_000_000;
+    for (let i = 0; i < 60; i++) {
+      const r = await obj.admit(t0 + i);
+      expect(r.ok).toBe(true);
+      if (r.ok) await obj.release(r.leaseId);
+    }
+    expect(await obj.admit(t0 + 59_999)).toMatchObject({ ok: false, reason: "rate" });
+    expect(await obj.admit(t0 + 60_001)).toMatchObject({ ok: true });
   });
 });
 

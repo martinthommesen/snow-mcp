@@ -124,15 +124,20 @@ the script's internal GlideRecord operations).
 `new Function` (eval) and `GlideCertificateEncryption` (HMAC) are **global-scope only** — not
 permitted inside a scoped app. So the executor is a **scoped, role-ACL-gated REST wrapper** that
 delegates the eval/HMAC primitives to a **global `x_mcp_verify` core** via a `verify()` / `execute()`
-split. Single-use **nonce** consumption stays in the scoped wrapper: it `INSERT`s into a scoped
-nonce table **between** `verify()` and `execute()`, and that table's **DB UNIQUE INDEX** on the
-nonce value is the concurrency arbiter — a duplicate INSERT is a replay and is rejected. `execute()`
-additionally requires a capability HMAC bound to the consumed nonce, so a direct cross-scope caller
-cannot bypass verification.
+split. The global core is rendered by `scripts/executor-install.mjs` with the Worker HMAC key
+material; it does not read executor-role-visible scoped properties at request time. Single-use
+**nonce** consumption stays in the scoped wrapper: it `INSERT`s into a scoped nonce table
+**between** `verify()` and `execute()`, and that table's **DB UNIQUE INDEX** on the nonce value is
+the concurrency arbiter — a duplicate INSERT is a replay and is rejected. `execute()` re-verifies
+the fresh HMAC-bound actor and refuses eval unless the wrapper-created audit row is still `running`
+and the nonce row already exists, so a direct cross-scope caller cannot replay a fresh signed tuple
+outside the audit/nonce wrapper.
 
 The host **HMAC-signs a canonical actor payload** and the executor **verifies** it (freshness +
 single-use nonce + instance claim, fail-closed). A claimed `body.actor` is forgeable by anyone
 holding the executor role, so **sign-AND-verify** is what makes integration-mode attribution real.
+The HMAC signing properties are scoped-app admin-only inventory; `x_1793136_mcp.executor`
+authorizes REST endpoint invocation, not access to the Worker signing secret or `_prev` rotation key.
 `reason` is the **last** canonical key, so the audited justification can't be forged independently of
 the HMAC.
 

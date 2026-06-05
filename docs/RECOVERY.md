@@ -65,3 +65,39 @@ mode instead of propagating the decrypt error: `integration_user` re-mints via R
   recovery row => no mutate). The mutating path is also wrapped by the idempotency ledger,
   host audit (audit-before-effect, fail-closed), and the second-approval gate
   (`sn/mutation-guard.ts`).
+
+## Incident controls
+
+| Control | Procedure |
+|---|---|
+| `MUTATION_FREEZE=true` | Set the Worker binding and redeploy to deny new `tableUpdate` and `runServerScript` calls before ledger claims or ServiceNow effects. Read-only tools remain available. Clear only after audit, ledger, and ServiceNow state are reconciled. |
+| Executor kill switch | Set `x_1793136_mcp.executor.enabled=false` and/or `x_1793136_mcp.executor.run_server_script_enabled=false` in ServiceNow. The Fluent app also re-arms both disabled on every deploy. |
+| Account loss | Revoke the affected IdP user/session, delete that user's ServiceNow token envelope from `TokenStoreDO`, and rotate ServiceNow/OIDC credentials if token misuse is suspected. Production posture rejects shared `MCP_OPERATOR_SECRET`. |
+| HMAC secret exposure | Rotate `X_MCP_EXECUTOR_HMAC_KEY`, set optional `X_MCP_EXECUTOR_HMAC_KEY_PREV` for the bounded overlap window, and rerun `scripts/executor-install.mjs` so the global verifier helper and admin-only HMAC properties move together. Clear `_prev` by removing it from `.dev.vars` or by rerunning with `X_MCP_EXECUTOR_HMAC_KEY_PREV=` in the environment. Executor-role principals must never read either property. |
+| DO blast radius | `TokenStoreDO` is partitioned by `userId|instanceHost`; `MutationLedgerDO` by `userId|instanceHost|runKey:ordinal`; `BudgetDO` is one daily tenant-wide cap with per-user visibility counters; `McpAdmissionDO` is one object per authenticated user. |
+
+## Ledger-safe recovery
+
+1. Freeze mutations with `MUTATION_FREEZE=true` before manual repair if any side effect may be
+   duplicated or partially applied.
+2. Inspect `AUDIT_KV` / SIEM for the requestId, ordinal, op, status, and `errorClass`.
+3. Treat `status="intent"` or `errorClass` ending in `:indeterminate` as unknown outcome. Do not
+   replay the same logical effect until ServiceNow state has been inspected and either manually
+   reconciled or explicitly abandoned.
+4. If a table update has a snapshot, decrypt with the snapshot KEK ring and apply the previous
+   reversible fields through a new, justified mutation with a new idempotency key.
+5. Leave old ledger rows in place until retention expiry unless an operator has source-backed proof
+   that deleting a row cannot double-apply an effect.
+
+## Drills before GA
+
+- Rollback: deploy the previous known-good Worker and confirm `/health/ready` posture plus read-only
+  MCP calls.
+- Key rotation: rotate `TOKEN_KEK_CURRENT`, `SNAPSHOT_KEK_CURRENT`, and executor HMAC with previous
+  keys configured only during the overlap window.
+- Kill switch: disable executor toggles, prove signed execution fails, restore, and prove execution
+  succeeds.
+- SIEM receipt: run one denied and one successful mutation and record the Logpush/SIEM event ids for
+  `event="mcp_audit_record"`.
+- Secret escrow: verify current recovery holders can retrieve Cloudflare, IdP, ServiceNow OAuth,
+  KEK, and executor HMAC secrets without exposing them in logs or tickets.

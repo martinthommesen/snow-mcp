@@ -25,10 +25,15 @@ const adminRole = Role({
 })
 
 // ─── Tables (plan §10): audit log + nonce ─────────────────────────────────────
+// Application access grants the installed Global verifier helper read-only proof-row visibility.
+// Human/API row access remains locked down separately by explicit admin-only record ACLs below.
 export const x_1793136_mcp_audit_log = Table({
     $id: Now.ID['t_audit'],
     name: 'x_1793136_mcp_audit_log',
     label: 'MCP Audit Log',
+    accessibleFrom: 'public',
+    callerAccess: 'none',
+    actions: ['read'],
     schema: {
         snow_user: StringColumn({ label: 'SN User', maxLength: 64 }),
         snow_user_name: StringColumn({ label: 'SN User Name', maxLength: 128 }),
@@ -59,6 +64,9 @@ export const x_1793136_mcp_nonce = Table({
     $id: Now.ID['t_nonce'],
     name: 'x_1793136_mcp_nonce',
     label: 'MCP Nonce',
+    accessibleFrom: 'public',
+    callerAccess: 'none',
+    actions: ['read'],
     schema: {
         value: StringColumn({ label: 'Value', maxLength: 128 }),
         created: DateTimeColumn({ label: 'Created' }),
@@ -70,8 +78,9 @@ export const x_1793136_mcp_nonce = Table({
 
 // HMAC verification + script eval are delegated to the GLOBAL x_mcp_verify Script Include
 // (GlideCertificateEncryption + new Function are global-only; plan §0.13a) via its verify()/
-// execute() split — installed by scripts/executor-install.mjs. SINGLE-USE NONCE consumption stays
-// in scope: the wrapper INSERTs into x_1793136_mcp_nonce (above) between verify() and execute().
+// execute() split — installed by scripts/executor-install.mjs with HMAC material injected into the
+// global helper. SINGLE-USE NONCE consumption stays in scope: the wrapper INSERTs into
+// x_1793136_mcp_nonce (above) between verify() and execute().
 
 // ─── Audit-table hardening (plan §P7 item 5; finding 25) ──────────────────────
 // Restrict reading + writing the audit log to x_1793136_mcp.admin ONLY (separation of duty:
@@ -144,10 +153,10 @@ Acl({
 
 // ─── Scheduled nonce-purge (TTL) job (plan §P7 item 5; finding 24) ────────────
 // THE LIVE nonce purge: bounds the scoped x_1793136_mcp_nonce table the wrapper writes.
-// The nonce table grows one row per executor call and is never read after the freshness
-// window (120s). Purge rows older than 1 hour every 15 minutes so the table stays bounded
-// (the 1-hour cutoff is far longer than the freshness window, so a still-relevant nonce is
-// never deleted).
+// The nonce table stores bounded proof rows: wrapper nonce consumption plus the wrapper's one-time
+// execution claim. These rows are never read after the freshness window (120s). Purge rows
+// older than 1 hour every 15 minutes so the table stays bounded (the 1-hour cutoff is far longer
+// than the freshness window, so a still-relevant proof row is never deleted).
 ScheduledScript({
     $id: Now.ID['job_nonce_purge'],
     name: 'MCP Nonce Purge',
@@ -199,8 +208,10 @@ RestApi({
 
 // ─── Properties (plan §10, §P7 item 5) — scoped vendor-prefix namespace ───────
 // Aligned to x_1793136_mcp.executor.* to match the app scope and executor scripts.
-// Set hmac_secret to the Cloudflare X_MCP_EXECUTOR_HMAC_KEY; hmac_secret_prev holds the
-// previous key during a rotation window. Both are password2 — set on the instance, never in
+// hmac_secret mirrors the Cloudflare X_MCP_EXECUTOR_HMAC_KEY for admin inventory only;
+// hmac_secret_prev mirrors the previous key during a rotation window. Runtime verification uses
+// the admin-installed global x_mcp_verify helper rendered by scripts/executor-install.mjs, never
+// executor-role property reads. Both properties are password2 — set by the installer, never in
 // source control (no `value` here so deploy does not overwrite an instance-set secret).
 // Break-glass executor toggles default OFF and RE-ARM OFF on every deploy (fresh install AND
 // upgrade). A break-glass kill-switch must not silently persist "on" across an upgrade, so these
@@ -210,9 +221,9 @@ RestApi({
 // next deploy re-arms it off. NOTE: this cannot be exercised by the local gate (it does not build or
 // deploy the Fluent app) — verify on a live UPGRADE that `x_1793136_mcp.executor.enabled` reads `false`.
 const runtimePropertyRoles = { read: [executorRole, adminRole], write: [adminRole] }
-// gs.getProperty() is gated by property read roles; executor verification must read HMAC secrets.
-// Keep the values password2/private and write access admin-only.
-const secretPropertyRoles = { read: [executorRole, adminRole], write: [adminRole] }
+// The executor role gates REST endpoint invocation only. It must never grant read access to the
+// Worker HMAC signing secret or its rotation predecessor.
+const secretPropertyRoles = { read: [adminRole], write: [adminRole] }
 
 Property({
     $id: Now.ID['p_enabled'],
@@ -251,7 +262,7 @@ Property({
     name: 'x_1793136_mcp.executor.timeout_ms',
     type: 'integer',
     value: 30000,
-    description: 'Maximum executor runtime in milliseconds before the script is stopped.',
+    description: 'Cooperative executor timeout budget in milliseconds; platform quotas still bound synchronous CPU.',
     roles: runtimePropertyRoles,
 })
 Property({

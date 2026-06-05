@@ -19,6 +19,8 @@ export interface PostureEnv {
   OAUTH_PROVIDER_SECRET?: string;
   X_MCP_EXECUTOR_HMAC_KEY?: string;
   SNOW_EXECUTOR_VERIFIER_ATTESTED?: string;
+  AUDIT_SIEM_ATTESTED?: string;
+  MUTATION_FREEZE?: string;
   SNAPSHOT_ENABLED_TABLES?: string;
   SNAPSHOT_KV?: unknown;
   SNAPSHOT_KEK_CURRENT?: string;
@@ -40,6 +42,7 @@ export interface PostureEnv {
   BUDGET_DO?: unknown;
   LEDGER_DO?: unknown;
   CONSENT_RATE_DO?: unknown;
+  MCP_ADMISSION_DO?: unknown;
   ACTOR_POLICY_TABLE_ALLOWLIST?: string;
   ACTOR_POLICY_FIELD_MASKS?: string;
   ACTOR_POLICY_ROW_FILTERS?: string;
@@ -73,6 +76,7 @@ const coreBindings = [
   "TOKEN_DO",
   "LOADER",
   "CONSENT_RATE_DO",
+  "MCP_ADMISSION_DO",
 ] as const satisfies readonly (keyof PostureEnv)[];
 
 const scopedExecutorPath = /^\/api\/(x|sn)_[a-z0-9_]+\/x_mcp\/executor\/run$/;
@@ -473,6 +477,9 @@ export function collectPostureViolations(env: PostureEnv): string[] {
   const allowAdminScript = env.ALLOW_ADMIN_SCRIPT_CEILING === "true";
   if (allowAdminScript && env.SNOW_EXECUTOR_VERIFIER_ATTESTED !== "true") {
     violations.push('SNOW_EXECUTOR_VERIFIER_ATTESTED must be "true" before ALLOW_ADMIN_SCRIPT_CEILING=true in production.');
+  }
+  if (env.AUDIT_SIEM_ATTESTED !== "true") {
+    violations.push('AUDIT_SIEM_ATTESTED must be "true" in production after proving structured audit log receipt.');
   }
   if (allowAdminScript) {
     if (csv(env.ADMIN_SCRIPT_ALLOWLIST).length === 0) {

@@ -9,6 +9,8 @@
 // The audit table is likewise the scoped x_1793136_mcp_audit_log (written by the scoped wrapper);
 // no global code writes a global x_mcp_audit_log. The canonical request endpoint is the SCOPED
 // Fluent role-ACL-gated REST (x_1793136_mcp), which does verify -> consume-nonce -> execute.
+// HMAC key material is injected into the admin-installed global helper at install time so the
+// executor role never needs read access to x_1793136_mcp.executor.hmac_secret.
 //
 // M-4 (2026-05-31): the previously opt-in global-REST endpoint (HMAC-only, NO role ACL) + its live
 // self-test have been REMOVED from this installer. That surface reproduced the exact shape of the
@@ -18,16 +20,19 @@
 // tables. Verify the live executor with scripts/executor-scoped-verify.mjs.
 //
 //   node scripts/executor-install.mjs   # installs the global verify() core + properties only
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
+import { readDevVarFromText } from "./deployed-e2e-origin.mjs";
 
-const verifyScript = readFileSync(new URL("../sn-executor-app/script-include/x_mcp_verify.js", import.meta.url), "utf8");
+const verifyScriptTemplate = readFileSync(new URL("../sn-executor-app/script-include/x_mcp_verify.js", import.meta.url), "utf8");
+let cachedDevVarsText;
 
 function dv(k) {
-  for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
-    const t = l.trim();
-    if (t.startsWith(`${k}=`)) { let v = t.slice(k.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
+  if (Object.prototype.hasOwnProperty.call(process.env, k)) return process.env[k] ?? "";
+  if (cachedDevVarsText === undefined) {
+    cachedDevVarsText = existsSync(".dev.vars") ? readFileSync(".dev.vars", "utf8") : "";
   }
+  return readDevVarFromText(cachedDevVarsText, k);
 }
 // SSRF guard (S15 / finding 2): canonicalize the configured host against the ServiceNow
 // allowlist BEFORE any credentialed fetch, so a tampered SNOW_INSTANCE_HOST (userinfo,
@@ -42,6 +47,25 @@ const installUser = process.env.SNOW_ADMIN_USER || dv("SNOW_DEV_ROPC_USERNAME");
 const installPass = process.env.SNOW_ADMIN_PASS || dv("SNOW_DEV_ROPC_PASSWORD");
 const basic = "Basic " + Buffer.from(`${installUser}:${installPass}`).toString("base64");
 const keyB64 = dv("X_MCP_EXECUTOR_HMAC_KEY");
+const keyPrevB64 = dv("X_MCP_EXECUTOR_HMAC_KEY_PREV") || "";
+const ADMIN_ROLE_NAME = "x_1793136_mcp.admin";
+
+if (!keyB64) {
+  throw new Error("X_MCP_EXECUTOR_HMAC_KEY is required so x_mcp_verify can be installed with isolated signing material.");
+}
+
+function renderVerifierScript() {
+  const rendered = verifyScriptTemplate
+    .replace("\"__X_MCP_EXECUTOR_HMAC_KEY__\"", JSON.stringify(keyB64))
+    .replace("\"__X_MCP_EXECUTOR_HMAC_KEY_PREV__\"", JSON.stringify(keyPrevB64));
+  if (
+    rendered.includes("\"__X_MCP_EXECUTOR_HMAC_KEY__\"") ||
+    rendered.includes("\"__X_MCP_EXECUTOR_HMAC_KEY_PREV__\"")
+  ) {
+    throw new Error("x_mcp_verify HMAC placeholders were not fully replaced.");
+  }
+  return rendered;
+}
 
 async function api(method, path, body) {
   const r = await fetch(`https://${host}${path}`, {
@@ -51,6 +75,13 @@ async function api(method, path, body) {
   const j = await r.json().catch(() => null);
   return { status: r.status, json: j, result: j?.result };
 }
+async function apiOk(method, path, body) {
+  const res = await api(method, path, body);
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`${method} ${path} failed with HTTP ${res.status}`);
+  }
+  return res;
+}
 const log = (...a) => console.log(" ", ...a);
 
 async function setProperty(name, value, type = "string") {
@@ -58,11 +89,47 @@ async function setProperty(name, value, type = "string") {
   if (ex) { await api("PATCH", `/api/now/table/sys_properties/${ex.sys_id}`, { value }); return "updated"; }
   await api("POST", "/api/now/table/sys_properties", { name, value, type }); return "created";
 }
-async function ensurePropertyDefault(name, value, type = "string") {
-  const ex = (await api("GET", `/api/now/table/sys_properties?sysparm_query=name=${name}&sysparm_limit=1&sysparm_fields=sys_id`)).result?.[0];
-  if (ex) return "kept";
-  await api("POST", "/api/now/table/sys_properties", { name, value, type });
-  return "created";
+function fieldText(row, name) {
+  const value = row?.[name];
+  if (value && typeof value === "object") return String(value.value ?? value.display_value ?? "");
+  return String(value ?? "");
+}
+function hasTruthyField(row, names) {
+  return names.some((name) => ["true", "1", "yes"].includes(fieldText(row, name).toLowerCase()));
+}
+function roleFieldIsAdminOnly(row, field, adminRoleId) {
+  const roles = fieldText(row, field).split(/[,\s]+/).map((token) => token.trim()).filter(Boolean);
+  if (roles.length === 0) return false;
+  return roles.every((role) => role === adminRoleId || role === ADMIN_ROLE_NAME);
+}
+async function adminRoleId() {
+  const query = encodeURIComponent(`name=${ADMIN_ROLE_NAME}`);
+  const role = (await apiOk("GET", `/api/now/table/sys_user_role?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,name`)).result?.[0];
+  if (!role?.sys_id) throw new Error(`Required role ${ADMIN_ROLE_NAME} is missing; install the scoped Fluent app before running executor-install.mjs.`);
+  return String(role.sys_id);
+}
+async function requiredScopedHmacProperty(name, adminRoleSysId) {
+  const query = encodeURIComponent(`name=${name}`);
+  const row = (await apiOk(
+    "GET",
+    `/api/now/table/sys_properties?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,name,type,is_private,private,read_roles,write_roles`,
+  )).result?.[0];
+  if (!row?.sys_id) {
+    throw new Error(`Required scoped HMAC property ${name} is missing; install the scoped Fluent app before running executor-install.mjs.`);
+  }
+  const typeOk = fieldText(row, "type") === "password2";
+  const privateOk = hasTruthyField(row, ["is_private", "private"]);
+  const readOk = roleFieldIsAdminOnly(row, "read_roles", adminRoleSysId);
+  const writeOk = roleFieldIsAdminOnly(row, "write_roles", adminRoleSysId);
+  if (!typeOk || !privateOk || !readOk || !writeOk) {
+    throw new Error(`Refusing to update ${name}: expected password2, private, admin-only read/write metadata.`);
+  }
+  return row.sys_id;
+}
+async function updateRequiredHmacProperty(name, value, adminRoleSysId) {
+  const sysId = await requiredScopedHmacProperty(name, adminRoleSysId);
+  await apiOk("PATCH", `/api/now/table/sys_properties/${sysId}`, { value });
+  return "updated";
 }
 // NOTE: ensureTable/ensureColumn/ensureUniqueIndex are intentionally GONE — the SCOPED Fluent app
 // owns the nonce table + its UNIQUE index + the purge job (now-sdk deploys them; the Table API
@@ -75,9 +142,11 @@ async function ensureScriptInclude(name, script) {
 }
 
 console.log(`Installing x_mcp executor on ${host}\n`);
+const hmacAdminRoleId = await adminRoleId();
 
 // 1) Properties (scoped-aligned namespace x_1793136_mcp.executor.*, plan §P7 item 5)
-log("hmac_secret:", await setProperty("x_1793136_mcp.executor.hmac_secret", keyB64, "password2"));
+log("hmac_secret:", await updateRequiredHmacProperty("x_1793136_mcp.executor.hmac_secret", keyB64, hmacAdminRoleId));
+log("hmac_secret_prev:", await updateRequiredHmacProperty("x_1793136_mcp.executor.hmac_secret_prev", keyPrevB64, hmacAdminRoleId));
 // Break-glass toggles RE-ARM OFF on every (re)install/upgrade run (force-set, not keep-if-exists):
 // a kill-switch must not persist "on" across a deploy. An operator re-enables it deliberately after
 // install; executor-scoped-verify.mjs enables + restores only within its own verify window.
@@ -90,10 +159,12 @@ log("max_output_bytes:", await setProperty("x_1793136_mcp.executor.max_output_by
 // admin, so we create NO tables here. The nonce store (x_1793136_mcp_nonce) + its UNIQUE index +
 // the purge job, and the audit log (x_1793136_mcp_audit_log), are OWNED BY THE SCOPED FLUENT APP
 // (now-sdk install deploys them — see sn-executor-app/fluent/src/fluent/x_mcp.now.ts). The scoped
-// wrapper consumes the nonce in-scope; this global core no longer touches any nonce table.
+// wrapper consumes the nonce in-scope; this global core only reads scoped audit/nonce rows to prove
+// the wrapper path ran before eval.
 
-// 3) Script Include (the global verify()/execute() core for scoped delegation).
-log("x_mcp_verify script include:", await ensureScriptInclude("x_mcp_verify", verifyScript));
+// 3) Script Include (the global verify()/execute() core for scoped delegation). The installed
+// script contains the current/previous HMAC key literals; rotate by rerunning this installer.
+log("x_mcp_verify script include:", await ensureScriptInclude("x_mcp_verify", renderVerifierScript()));
 
 console.log(
   "\nHelper install complete (x_mcp_verify core + properties; NO tables, NO global REST endpoint — " +

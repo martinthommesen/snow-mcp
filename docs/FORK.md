@@ -65,9 +65,11 @@ Then edit `.dev.vars`. The load-bearing variables:
 Generate every one of these with `openssl rand -base64 32`:
 
 - `OAUTH_PROVIDER_SECRET` — signing/encryption secret for the MCP-client OAuth provider.
-- `X_MCP_EXECUTOR_HMAC_KEY` — the executor actor-signing HMAC key. **You will mirror this exact
-  value to the ServiceNow property `<scope>.executor.hmac_secret` in step 3.** Host and instance
-  must hold the same secret or every executor signature fails 401.
+- `X_MCP_EXECUTOR_HMAC_KEY` — the executor actor-signing HMAC key. `scripts/executor-install.mjs`
+  injects this exact value into the global verifier helper and mirrors it to the admin-only
+  ServiceNow property `<scope>.executor.hmac_secret` for inventory. Host and instance must hold the
+  same secret or every executor signature fails 401. The `<scope>.executor` role must not be able
+  to read this property or `_prev`.
 - The **KEK ring**:
   - `TOKEN_KEK_CURRENT` — AES-256-GCM KEK for token envelopes (TokenStoreDO).
   - `SNAPSHOT_KEK_CURRENT` — AES-256-GCM KEK for recovery snapshots.
@@ -180,8 +182,8 @@ node scripts/rescope.mjs x_<vendor>_mcp <scopeId>
    - `sn-executor-app/fluent/src/server/x_mcp_verify.js` **and**
      `sn-executor-app/script-include/x_mcp_verify.js` — **both copies, with the identical
      replacement string** (this is what keeps `check:verifier-sync` green),
-   - `scripts/executor-install.mjs` (it WRITES the live `<scope>.executor.*` properties the global
-     verifier reads — must be re-scoped together with the app or signatures fail 401),
+   - `scripts/executor-install.mjs` (it writes the live `<scope>.executor.*` properties and renders
+     the global verifier — must be re-scoped together with the app or signatures fail 401),
    - `scripts/executor-scoped-verify.mjs` (the post-install live smoke test).
 5. **Deletes** the generated key file `sn-executor-app/fluent/src/fluent/generated/keys.ts` so the
    next `now-sdk build` regenerates it cleanly. **Do not hand-edit `keys.ts`** — it is build-managed
@@ -191,8 +193,8 @@ node scripts/rescope.mjs x_<vendor>_mcp <scopeId>
 
 The full-token (`x_1793136_mcp`) substitution leaves these literals alone, and they must stay:
 
-- The REST **service id `x_mcp`**, the script-include **class `x_mcp_verify`**, the
-  **`x_mcp_executor`** name, and the capability label **`x_mcp_exec_cap`**.
+- The REST **service id `x_mcp`**, the script-include **class `x_mcp_verify`**, and the
+  **`x_mcp_executor`** name.
 - **Host source, host tests, docs, and `.dev.vars.example`** — host test fixtures are pinned to the
   default prefix by design and are self-consistent. The substitution must not be broadened to them.
 
@@ -225,11 +227,13 @@ node scripts/executor-scoped-verify.mjs  # live smoke test (role/ACL gate, audit
 
 After installing, in ServiceNow:
 
-- **Set the property `<scope>.executor.hmac_secret`** = the exact `X_MCP_EXECUTOR_HMAC_KEY` value
-  from your `.dev.vars`. (`executor-install.mjs`, now re-scoped, writes the `<scope>.executor.*`
-  namespace and keeps the break-glass toggles disabled by default; confirm `hmac_secret` matches
-  the host secret.)
-- **Assign the `<scope>.executor` role** to your integration user (e.g. `mcp_integration_user`).
+- **Run `scripts/executor-install.mjs` with the exact `X_MCP_EXECUTOR_HMAC_KEY` value from your
+  `.dev.vars`** (and optional `X_MCP_EXECUTOR_HMAC_KEY_PREV` during rotation). The installer writes
+  the `<scope>.executor.*` namespace, keeps the break-glass toggles disabled by default, and renders
+  the global verifier helper with the same HMAC material. Do not grant the executor role property
+  read access to make verification work.
+- **Assign the `<scope>.executor` role** only to the non-admin principal that invokes the executor
+  REST endpoint.
 - **Enable the break-glass executor deliberately** only after the role and HMAC are correct:
   set `<scope>.executor.enabled=true` and `<scope>.executor.run_server_script_enabled=true`.
   Fresh installs and upgrades default both to `false`; re-enable only after the verifier and
@@ -239,8 +243,13 @@ After installing, in ServiceNow:
 > `GlideCertificateEncryption` (HMAC) are global-only — not permitted in scoped apps. So the scoped
 > `executor/run` does what scope allows (audit-first, kill switch, byte cap, role-gated endpoint)
 > and calls the GLOBAL `x_mcp_verify.verify()` before consuming the scoped nonce, then
-> `x_mcp_verify.execute()` after the nonce insert succeeds. That is why there are two copies of
-> `x_mcp_verify.js` and why `check:verifier-sync` enforces their bodies stay byte-identical.
+> `x_mcp_verify.execute()` with the wrapper-created audit sys_id after the nonce insert succeeds.
+> The global core is rendered by `executor-install.mjs` with the Worker HMAC key material, so the
+> scoped executor never reads raw HMAC properties; `execute()` also checks that the audit row is
+> still running, the nonce row exists, and the scoped wrapper-created execution claim exists before eval.
+> That is why there are two copies of
+> `x_mcp_verify.js` and why
+> `check:verifier-sync` enforces their bodies stay byte-identical.
 
 > **`SNOW_EXECUTOR_PATH` — get the path form exactly right (silent-404 trap).** Set the Worker
 > binding to the literal **two-segment** scoped path:
@@ -366,8 +375,8 @@ npx now-sdk auth --add https://<instance> --type basic --alias dev
 npx now-sdk build && npx now-sdk install -a dev && cd ../..
 node scripts/executor-install.mjs
 node scripts/executor-scoped-verify.mjs
-#   then in ServiceNow: set <scope>.executor.hmac_secret = X_MCP_EXECUTOR_HMAC_KEY,
-#   assign the <scope>.executor role, set SNOW_EXECUTOR_PATH=/api/<scope>/x_mcp/executor/run
+#   then in ServiceNow: assign the <scope>.executor role to a non-admin endpoint principal,
+#   set SNOW_EXECUTOR_PATH=/api/<scope>/x_mcp/executor/run
 
 # 4. Verify the gate, then deploy the host
 npm run typecheck && npm test && npm run check:verifier-sync

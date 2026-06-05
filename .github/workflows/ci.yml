@@ -34,6 +34,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            sn-executor-app/fluent/package-lock.json
 
       - name: Install root dependencies
         run: npm ci
@@ -68,8 +71,8 @@ jobs:
       - name: Generate SBOM
         run: npm exec --no -- cyclonedx-npm --output-file sbom.json
 
-      - name: Generate license report
-        run: node scripts/license-report.mjs package-lock.json sn-executor-app/fluent/package-lock.json > license-report.json
+      - name: Enforce license policy
+        run: node scripts/license-report.mjs --policy license-policy.json --enforce package-lock.json sn-executor-app/fluent/package-lock.json > license-report.json
 
       - name: Upload supply-chain artifacts
         uses: actions/upload-artifact@v4
@@ -107,6 +110,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            sn-executor-app/fluent/package-lock.json
 
       - name: Install dependencies
         run: |
@@ -127,6 +133,8 @@ jobs:
           SNOW_DEV_ROPC_PASSWORD: ${{ secrets.SNOW_DEV_ROPC_PASSWORD }}
           X_MCP_EXECUTOR_HMAC_KEY: ${{ secrets.X_MCP_EXECUTOR_HMAC_KEY }}
           SNOW_EXECUTOR_PATH: ${{ secrets.SNOW_EXECUTOR_PATH }}
+          SNOW_EXECUTOR_TEST_USERNAME: ${{ secrets.SNOW_EXECUTOR_TEST_USERNAME }}
+          SNOW_EXECUTOR_TEST_PASSWORD: ${{ secrets.SNOW_EXECUTOR_TEST_PASSWORD }}
 
   production-oidc-deployed-e2e:
     name: production OIDC deployed MCP e2e
@@ -142,6 +150,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            sn-executor-app/fluent/package-lock.json
 
       - name: Install dependencies
         run: npm ci

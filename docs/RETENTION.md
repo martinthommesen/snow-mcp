@@ -12,17 +12,21 @@ become "we built a second unmanaged sensitive database."
 | **PII classification** | Snapshots may contain PII — classified accordingly; access audited. |
 | **Table enablement** | `SNAPSHOT_ENABLED_TABLES` selects snapshot-backed tables. Empty means no snapshots, and the recovery claim is **narrowed** for that tenant (RECOVERY.md). |
 
-Audit retention (`x_1793136_mcp_audit_log`) follows the same purge cadence; audit rows store
+Host audit retention in `AUDIT_KV` follows the same 30-day cache cadence and audit rows store
 **hashes + attribution only** (no script body, no raw output, §10) so they are far less
-sensitive than snapshots.
+sensitive than snapshots. `AUDIT_KV` is not the long-term audit sink: each host audit row is also
+emitted as a redacted structured log event (`event="mcp_audit_record"`) for Cloudflare Logpush/SIEM.
+Production posture requires `AUDIT_SIEM_ATTESTED=true` only after that external receipt has been
+proven.
 
 ## Status
 
 Policy defined and the host stores are now wired (P4): the recovery snapshot store is
-`SNAPSHOT_KV` and the host audit trail is `AUDIT_KV`, both written with a **30-day Cloudflare
+`SNAPSHOT_KV` and the host audit cache is `AUDIT_KV`, both written with a **30-day Cloudflare
 KV `expirationTtl`** (`tools/handlers.ts`). KV auto-expires each key at its TTL, so **no
 separate scheduled purge job is needed on the host side** for either store (the executor
-nonce-table purge is a separate, executor-side P7 concern). Snapshots are AES-256-GCM
+nonce-table purge is a separate, executor-side P7 concern). Structured audit log delivery is the
+append-only retention path outside this repository. Snapshots are AES-256-GCM
 sealed (`recovery/snapshots.ts`) under the versioned `SNAPSHOT_KEK_CURRENT` ring (`buildKekRing`,
 P3); the integration user never holds the ring. `SNAPSHOT_ENABLED_TABLES` selects which
 tables get snapshots; empty means none and narrows the recovery claim.

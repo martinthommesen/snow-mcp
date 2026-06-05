@@ -25,6 +25,14 @@ describe("Alchemy deploy bindings", () => {
     );
   });
 
+  it("declares authenticated MCP admission and incident/audit posture bindings", () => {
+    expect(alchemySource).toContain('MCP_ADMISSION_DO: DurableObjectNamespace("MCP_ADMISSION_DO"');
+    for (const name of ["AUDIT_SIEM_ATTESTED", "MUTATION_FREEZE"]) {
+      expect(alchemySource).toContain(`process.env.${name}`);
+      expect(alchemySource).toContain(`${name}: process.env.${name}`);
+    }
+  });
+
   it("forwards snapshot and restrictive ActorPolicy config as plain bindings", () => {
     for (const name of [
       "SNAPSHOT_ENABLED_TABLES",

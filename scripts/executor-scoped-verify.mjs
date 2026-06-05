@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { canonicalize, hmacSha256Base64, sha256Base64 } from "../packages/mcp-server/dist/auth/actor.js";
 import { canonicalizeInstanceHost } from "../packages/mcp-server/dist/sn/url-allowlist.js";
+import { readDevVarFromText } from "./deployed-e2e-origin.mjs";
 
 // Transport-level path guard mirroring SnFetchClient (finding 3): a tampered SNOW_EXECUTOR_PATH
 // must not change host or traverse out of /api/. Rejects userinfo (@), scheme (://), and
@@ -17,39 +18,60 @@ function assertApiPath(p) {
 
 function dv(k) {
   if (process.env[k]) return process.env[k];
-  if (!existsSync(".dev.vars")) return undefined;
-  for (const l of readFileSync(".dev.vars", "utf8").split("\n")) {
-    const t = l.trim();
-    if (t.startsWith(`${k}=`)) { let v = t.slice(k.length + 1).trim(); return v.startsWith('"') ? v.slice(1, -1) : v; }
+  return readDevVarFromText(devVarsText(), k);
+}
+let cachedDevVarsText;
+function devVarsText() {
+  if (cachedDevVarsText === undefined) {
+    cachedDevVarsText = existsSync(".dev.vars") ? readFileSync(".dev.vars", "utf8") : "";
   }
+  return cachedDevVarsText;
 }
 // SSRF guard (finding 3): canonicalize the host against the ServiceNow allowlist before any
 // credentialed fetch, so a tampered SNOW_INSTANCE_HOST can't exfiltrate the Basic credential.
 const host = canonicalizeInstanceHost(dv("SNOW_INSTANCE_HOST"), { allowedHostSuffixes: ["service-now.com"] });
-const basic = "Basic " + Buffer.from(`${dv("SNOW_DEV_ROPC_USERNAME")}:${dv("SNOW_DEV_ROPC_PASSWORD")}`).toString("base64");
+function basicAuth(username, password) {
+  return "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
+}
+const adminBasic = basicAuth(dv("SNOW_DEV_ROPC_USERNAME"), dv("SNOW_DEV_ROPC_PASSWORD"));
 const keyBytes = Uint8Array.from(atob(dv("X_MCP_EXECUTOR_HMAC_KEY")), (c) => c.charCodeAt(0));
 // Hit the EXACT endpoint the live Worker calls (SNOW_EXECUTOR_PATH in .dev.vars, e.g. the
 // numeric scoped form /api/1793136/x_mcp/executor/run) so a scope-name-vs-numeric path-form
 // mismatch can't 404. Falls back to the scope-name form if SNOW_EXECUTOR_PATH is unset.
 const ENDPOINT = `https://${host}${assertApiPath(dv("SNOW_EXECUTOR_PATH") || "/api/x_1793136_mcp/x_mcp/executor/run")}`;
-const h = { authorization: basic, accept: "application/json" };
+let endpointAuth = adminBasic;
 const NONCE_PURGE_JOB_NAME = "MCP Nonce Purge";
 const NONCE_PURGE_RUN_PERIOD = "1970-01-01 00:15:00";
 const EXECUTOR_TOGGLE_NAMES = [
   "x_1793136_mcp.executor.enabled",
   "x_1793136_mcp.executor.run_server_script_enabled",
 ];
+const HMAC_PROPERTY_NAMES = [
+  "x_1793136_mcp.executor.hmac_secret",
+  "x_1793136_mcp.executor.hmac_secret_prev",
+];
 
-async function api(method, path, body) {
-  const r = await fetch(`https://${host}${path}`, { method, headers: { ...h, ...(body ? { "content-type": "application/json" } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
+async function api(method, path, body, authorization = adminBasic) {
+  const r = await fetch(`https://${host}${path}`, {
+    method,
+    headers: { authorization, accept: "application/json", ...(body ? { "content-type": "application/json" } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
   return { status: r.status, json: await r.json().catch(() => null) };
 }
-async function apiOk(method, path, body) {
-  const res = await api(method, path, body);
+async function apiOk(method, path, body, authorization = adminBasic) {
+  const res = await api(method, path, body, authorization);
   if (res.status < 200 || res.status >= 300) {
     throw new Error(`${method} ${path} failed with HTTP ${res.status}: ${JSON.stringify(res.json)}`);
   }
   return res;
+}
+async function deleteRecordIfPresent(path) {
+  const res = await api("DELETE", path);
+  if (res.status === 404) return;
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`DELETE ${path} failed with HTTP ${res.status}: ${JSON.stringify(res.json)}`);
+  }
 }
 async function getProperty(name) {
   const query = encodeURIComponent(`name=${name}`);
@@ -71,15 +93,162 @@ async function enableExecutorTogglesForVerify() {
 async function restoreExecutorToggles(props) {
   for (const prop of props) await setPropertyValue(prop, prop.value);
 }
+function randomPassword() {
+  return `McpVerify-${crypto.randomUUID()}-${crypto.randomUUID()}`;
+}
+async function executorOnlyPrincipal(roleId) {
+  const configured = configuredExecutorCredentials();
+  if (configured) return configuredExecutorPrincipal(configured.username, configured.password, roleId);
+  return managedExecutorPrincipal(roleId);
+}
+
+function configuredExecutorCredentials() {
+  const username = dv("SNOW_EXECUTOR_TEST_USERNAME");
+  const password = dv("SNOW_EXECUTOR_TEST_PASSWORD");
+  if (!username && !password) return undefined;
+  if (!username || !password) {
+    throw new Error("Set both SNOW_EXECUTOR_TEST_USERNAME and SNOW_EXECUTOR_TEST_PASSWORD, or set neither to create a temporary executor-only user.");
+  }
+  return { username, password };
+}
+
+async function configuredExecutorPrincipal(configuredUser, configuredPassword, roleId) {
+  const query = encodeURIComponent(`user_name=${configuredUser}`);
+  const user = (await apiOk("GET", `/api/now/table/sys_user?sysparm_query=${query}&sysparm_limit=1&sysparm_fields=sys_id,user_name`)).json?.result?.[0];
+  if (!user?.sys_id) throw new Error("SNOW_EXECUTOR_TEST_USERNAME was not found in sys_user.");
+  const roles = (await apiOk("GET", `/api/now/table/sys_user_has_role?sysparm_query=user=${user.sys_id}&sysparm_fields=role.name`)).json?.result ?? [];
+  const roleNames = new Set(roles.map((r) => String(r["role.name"] ?? "")));
+  check("executor test principal has executor role and is not admin",
+    roleNames.has("x_1793136_mcp.executor") && !roleNames.has("admin"),
+    `(executor=${roleNames.has("x_1793136_mcp.executor")}, admin=${roleNames.has("admin")})`);
+  return {
+    auth: basicAuth(configuredUser, configuredPassword),
+    managed: false,
+    userId: user.sys_id,
+    roleId,
+    roleGrantId: undefined,
+    label: configuredUser,
+  };
+}
+
+function sysIdFrom(response, message) {
+  const sysId = response.json?.result?.sys_id;
+  if (!sysId) throw new Error(message);
+  return sysId;
+}
+
+async function createTemporaryExecutorUser(username, password) {
+  const created = await apiOk("POST", "/api/now/table/sys_user", {
+    user_name: username,
+    first_name: "MCP",
+    last_name: "Executor Verify",
+    active: "true",
+    locked_out: "false",
+    password_needs_reset: "false",
+    user_password: password,
+  });
+  return sysIdFrom(created, "Temporary executor-only user creation did not return sys_id.");
+}
+
+async function assertExecutorEndpointRequiresRole(auth) {
+  const noRole = await call(await signed("return 1;"), auth);
+  check("S8 live — executor-only test principal without role cannot invoke endpoint",
+    noRole.status === 403 || noRole.status === 401, `(status ${noRole.status})`);
+}
+
+async function grantExecutorRole(userId, roleId) {
+  const grant = await apiOk("POST", "/api/now/table/sys_user_has_role", { user: userId, role: roleId });
+  return sysIdFrom(grant, "Temporary executor-only role grant did not return sys_id.");
+}
+
+async function cleanupManagedPrincipalOnFailure(task) {
+  let principal;
+  try {
+    return await task((candidate) => {
+      principal = candidate;
+      return candidate;
+    });
+  } catch (e) {
+    await cleanupExecutorOnlyPrincipal(principal);
+    throw e;
+  }
+}
+
+async function createAndConfigureManagedPrincipal(track, username, password, roleId) {
+  const userId = await createTemporaryExecutorUser(username, password);
+  const auth = basicAuth(username, password);
+  const principal = track({ auth, managed: true, userId, roleId, roleGrantId: undefined, label: username });
+  await assertExecutorEndpointRequiresRole(auth);
+  principal.roleGrantId = await grantExecutorRole(userId, roleId);
+  await waitForExecutorRole(auth);
+  return principal;
+}
+
+async function managedExecutorPrincipal(roleId) {
+  const randomSuffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
+  const username = `x_mcp_exec_verify_${Date.now()}_${randomSuffix}`;
+  const password = randomPassword();
+  return cleanupManagedPrincipalOnFailure((track) => createAndConfigureManagedPrincipal(track, username, password, roleId));
+}
+
+async function waitForExecutorRole(auth, timeoutMs = 15_000, stepMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = "none";
+  while (Date.now() < deadline) {
+    const r = await call(await signed("return 1;"), auth);
+    lastStatus = String(r.status);
+    if (r.status >= 200 && r.status < 300) return;
+    if (r.status !== 401 && r.status !== 403) {
+      throw new Error(`Executor role readiness probe failed with HTTP ${r.status}: ${JSON.stringify(r.body)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+  throw new Error(`Executor role grant did not become effective before timeout; last status ${lastStatus}.`);
+}
+async function cleanupExecutorOnlyPrincipal(principal) {
+  if (!principal?.managed) return;
+  if (principal.roleGrantId) {
+    await deleteRecordIfPresent(`/api/now/table/sys_user_has_role/${principal.roleGrantId}`);
+  } else if (principal.userId && principal.roleId) {
+    const query = encodeURIComponent(`user=${principal.userId}^role=${principal.roleId}`);
+    const grants = (await apiOk("GET", `/api/now/table/sys_user_has_role?sysparm_query=${query}&sysparm_fields=sys_id`)).json?.result ?? [];
+    for (const grant of grants) {
+      if (grant?.sys_id) await deleteRecordIfPresent(`/api/now/table/sys_user_has_role/${grant.sys_id}`);
+    }
+  }
+  if (principal.userId) await deleteRecordIfPresent(`/api/now/table/sys_user/${principal.userId}`);
+}
+async function assertExecutorCannotReadHmacProperties(executorAuth) {
+  const query = encodeURIComponent(HMAC_PROPERTY_NAMES.map((name) => `name=${name}`).join("^OR"));
+  const res = await api(
+    "GET",
+    `/api/now/table/sys_properties?sysparm_query=${query}&sysparm_fields=name,value&sysparm_limit=2`,
+    undefined,
+    executorAuth,
+  );
+  const rows = Array.isArray(res.json?.result) ? res.json.result : [];
+  const responseBody = JSON.stringify(res.json ?? {});
+  const rawSecrets = ["X_MCP_EXECUTOR_HMAC_KEY", "X_MCP_EXECUTOR_HMAC_KEY_PREV"]
+    .map((name) => dv(name))
+    .filter((value) => value);
+  const exposedSecret = rawSecrets.find((value) => responseBody.includes(value));
+  const noRawSecret = rawSecrets.length > 0 && !exposedSecret;
+  const probeCompleted = res.status === 401 || res.status === 403 || (res.status >= 200 && res.status < 300);
+  check(
+    "HMAC secret isolation — executor-only principal cannot read raw current/previous HMAC properties",
+    noRawSecret && probeCompleted,
+    `(status ${res.status}, rows ${rows.length}, rawSecretExposed=${!noRawSecret})`,
+  );
+}
 async function signed(script, opts = {}) {
   const actor = {
     mcp_actor_user_id: "u1", mcp_actor_email: "ada@example.com", snow_effective_user_sys_id: "sys1",
     // `instance` is SIGNED (set before the HMAC) — opts.instance lets a test forge a VALIDLY-
     // signed actor for a DIFFERENT instance (case 2 cross-instance replay).
-    instance: opts.instance ?? host, request_id: "req-" + Math.random().toString(36).slice(2),
+    instance: opts.instance ?? host, request_id: `req-${crypto.randomUUID()}`,
     script_sha256: await sha256Base64(script), issued_at: Date.now(),
     // opts.nonce lets cases 1/5 reuse a fixed nonce; default is random.
-    nonce: opts.nonce ?? "n-" + Math.random().toString(36).slice(2),
+    nonce: opts.nonce ?? `n-${crypto.randomUUID()}`,
     // `reason` is a SIGNED canonical key (plan §P7 item 1, the new LAST key) — it MUST be present
     // or the host canonical emits "reason":"undefined" while the executor emits "reason":"" and
     // every HMAC mismatches -> a false 401 on the live PDI (including the pre-existing B1 case).
@@ -91,11 +260,13 @@ async function signed(script, opts = {}) {
   // tamperReason: change the SIGNED reason AFTER signing (case 4 — proves reason is HMAC-bound).
   if (opts.tamperReason !== undefined) actor.reason = opts.tamperReason;
   // badSig: replace a valid sig with garbage / null / empty (case 3 — clean 401, not 500).
-  const actor_sig = "actorSig" in opts ? opts.actorSig : opts.badSig ? "AAAA" : sig;
+  let actor_sig = sig;
+  if ("actorSig" in opts) actor_sig = opts.actorSig;
+  else if (opts.badSig) actor_sig = "AAAA";
   return { script, actor, actor_sig };
 }
-async function call(payload) {
-  const r = await fetch(ENDPOINT, { method: "POST", headers: { ...h, "content-type": "application/json" }, body: JSON.stringify(payload) });
+async function call(payload, authorization = endpointAuth) {
+  const r = await fetch(ENDPOINT, { method: "POST", headers: { authorization, accept: "application/json", "content-type": "application/json" }, body: JSON.stringify(payload) });
   const j = await r.json().catch(() => null);
   return { status: r.status, body: j?.result ?? j };
 }
@@ -131,6 +302,7 @@ async function grantAdminExecutorRole() {
 const existing = await currentAdminExecutorRoles();
 const hadExecutorRole = existing.length > 0;
 let executorToggleSnapshot = [];
+let executorPrincipal;
 let cleanupFailed = false;
 
 try {
@@ -167,9 +339,11 @@ for (const deadPath of ["/api/1793136/x_mcp/executor/run", "/api/x_mcp/executor/
 // verification window, then restore the operator's starting values in finally.
 executorToggleSnapshot = await enableExecutorTogglesForVerify();
 
-// Assign the role to admin (so the broad-identity call is also role-authorized), then execute.
-await grantAdminExecutorRole();
-await new Promise((r) => setTimeout(r, 3000)); // role-cache propagation
+// Use a non-admin principal with only x_1793136_mcp.executor for the executor endpoint. The admin
+// credential above remains setup/cleanup only and never proves endpoint-role or secret isolation.
+executorPrincipal = await executorOnlyPrincipal(roleId);
+endpointAuth = executorPrincipal.auth;
+await assertExecutorCannotReadHmacProperties(executorPrincipal.auth);
 
 let auditIdSeen = "";
 {
@@ -208,7 +382,7 @@ check("audit-first row written to x_1793136_mcp_audit_log (audit_id returned)", 
 // is read by case 1b below (the sys_index catalog row is only a secondary, unreliable signal).
 let concurrencyArbitrated = false;
 {
-  const sameNonce = "concur-" + Math.random().toString(36).slice(2);
+  const sameNonce = `concur-${crypto.randomUUID()}`;
   // Build ONE signed payload, send the SAME object twice (identical nonce + body + sig).
   const payload = await signed("return gs.getUserName();", { nonce: sameNonce });
   const [a, b] = await Promise.all([call(payload), call(payload)]);
@@ -272,7 +446,7 @@ for (const [label, opts] of [
 //    "reason persisted in the audit `reason` column" half is operator-verify (the audit table is
 //    read-ACL-blocked to admin via Table API; the column value is checked by the operator live).
 {
-  const knownReason = "p7-audited-reason-" + Math.random().toString(36).slice(2);
+  const knownReason = `p7-audited-reason-${crypto.randomUUID()}`;
   const good = await call(await signed("return gs.getUserName();", { reason: knownReason }));
   check("SIGNED reason: valid signed reason -> 200 (reason is HMAC-bound and accepted)", good.status === 200 && typeof good.body?.result === "string", `(status ${good.status})`);
   // Sign WITH knownReason, then mutate actor.reason after signing -> HMAC no longer matches.
@@ -290,7 +464,7 @@ skip("SIGNED reason persisted in x_1793136_mcp_audit_log.reason column", "scoped
 //    >max_bytes (default 32768); `script_sha256` covers the real (oversized) code so the HMAC is
 //    valid — the 413 fires on the size gate before verify regardless.
 {
-  const freshNonce = "size-then-nonce-" + Math.random().toString(36).slice(2);
+  const freshNonce = `size-then-nonce-${crypto.randomUUID()}`;
   const big = "x".repeat(40000); // > 32768-byte default max_bytes
   const oversized = await call(await signed(`return "${big}";`, { nonce: freshNonce }));
   const rejected413 = oversized.status === 413 && oversized.body?.error === "code_size";
@@ -318,6 +492,12 @@ skip("SIGNED reason persisted in x_1793136_mcp_audit_log.reason column", "scoped
   } catch (e) {
     cleanupFailed = true;
     console.error("FAILED to restore executor kill-switch properties:", e instanceof Error ? e.message : String(e));
+  }
+  try {
+    await cleanupExecutorOnlyPrincipal(executorPrincipal);
+  } catch (e) {
+    cleanupFailed = true;
+    console.error("FAILED to clean up executor-only verify principal:", e instanceof Error ? e.message : String(e));
   }
   try {
     await removeAdminExecutorRole();

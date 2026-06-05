@@ -26,6 +26,7 @@ export { TokenStoreDO } from "./do/token-store.js";
 export { BudgetDO } from "./do/budget.js";
 export { MutationLedgerDO } from "./do/mutation-ledger.js";
 export { ConsentRateDO } from "./do/consent-rate.js";
+export { McpAdmissionDO } from "./do/mcp-admission.js";
 
 export interface Env {
   LOADER: WorkerLoader;
@@ -41,6 +42,8 @@ export interface Env {
   LEDGER_DO: DurableObjectNamespace;
   // Consent-write rate limiter (finding 4). Missing binding fails closed on consent/registration.
   CONSENT_RATE_DO?: ConsentRateNamespace;
+  // Authenticated /mcp admission limiter. Missing/unreachable binding fails closed.
+  MCP_ADMISSION_DO?: DurableObjectNamespace;
   ALLOWED_ORIGINS?: string;
   // I-1: pin the worker's public origin for OAuth redirect_uri / reauth URLs instead of deriving
   // it from the request Host. Required when SERVICENOW_CREDENTIAL_MODE=per_user_oauth.
@@ -69,6 +72,8 @@ export interface Env {
   DEPLOYMENT_PROFILE?: string;
   ALLOW_ADMIN_SCRIPT_CEILING?: string;
   SNOW_EXECUTOR_VERIFIER_ATTESTED?: string;
+  AUDIT_SIEM_ATTESTED?: string;
+  MUTATION_FREEZE?: string;
   ALLOW_LOCALHOST?: string;
   TENANT_MAX_MODE?: Mode;
   INSTANCE_MAX_MODE?: Mode;
@@ -130,6 +135,7 @@ function oauthAuthorizationServerMetadataRequest(request: Request): Request {
 const serviceName = "servicenow-codemode-mcp";
 const appVersion = "0.1.0";
 const workerCompatibilityDate = "2026-05-13";
+const ADMISSION_LEASE_RENEWAL_MS = 30_000;
 
 function healthLive(): Response {
   return Response.json({ ok: true, service: serviceName });
@@ -157,6 +163,142 @@ function productionPostureResponse(error: ProductionPostureError, includeViolati
     },
     { status: 503 },
   );
+}
+
+export interface AdmissionStub {
+  admit(now?: number): Promise<{ ok: true; leaseId: string } | { ok: false; reason: "rate" | "concurrency"; retryAfterMs: number }>;
+  release(leaseId: string): Promise<void>;
+  renew(leaseId: string, now?: number): Promise<boolean>;
+}
+
+export type AdmissionLease = { stub: AdmissionStub; leaseId: string };
+
+function retryAfterSeconds(ms: number): string {
+  return String(Math.max(1, Math.ceil(ms / 1000)));
+}
+
+async function admitMcpRequest(env: Env, userId: string): Promise<AdmissionLease | Response> {
+  if (!env.MCP_ADMISSION_DO) {
+    return Response.json({ error: "admission_unavailable" }, { status: 503 });
+  }
+  try {
+    const ns = env.MCP_ADMISSION_DO;
+    const stub = ns.get(ns.idFromName(userId)) as unknown as AdmissionStub;
+    const admitted = await stub.admit(Date.now());
+    if (!admitted.ok) {
+      return Response.json(
+        { error: admitted.reason === "rate" ? "rate_limited" : "too_many_in_flight" },
+        { status: 429, headers: { "Retry-After": retryAfterSeconds(admitted.retryAfterMs) } },
+      );
+    }
+    return { stub, leaseId: admitted.leaseId };
+  } catch (e) {
+    console.error("mcp admission failed:", redactString(e instanceof Error ? e.message : String(e)));
+    return Response.json({ error: "admission_unavailable" }, { status: 503 });
+  }
+}
+
+async function releaseMcpAdmission(lease: AdmissionLease): Promise<void> {
+  try {
+    await lease.stub.release(lease.leaseId);
+  } catch (e) {
+    console.error("mcp admission release failed:", redactString(e instanceof Error ? e.message : String(e)));
+  }
+}
+
+function admissionRenewalDelay(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ADMISSION_LEASE_RENEWAL_MS);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
+async function renewMcpAdmissionUntilReleased(
+  lease: AdmissionLease,
+  signal: AbortSignal,
+  onLeaseLost: () => void,
+): Promise<void> {
+  while (!signal.aborted) {
+    await admissionRenewalDelay(signal);
+    if (signal.aborted) return;
+    try {
+      const renewed = await lease.stub.renew(lease.leaseId, Date.now());
+      if (!renewed) {
+        console.error("mcp admission lease lost before response closed");
+        onLeaseLost();
+        return;
+      }
+    } catch (e) {
+      console.error("mcp admission renew failed:", redactString(e instanceof Error ? e.message : String(e)));
+    }
+  }
+}
+
+function abortAdmissionStreamAfterLeaseLoss(
+  controller: ReadableStreamDefaultController<Uint8Array> | undefined,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  releaseOnce: () => Promise<void>,
+): void {
+  controller?.error("admission_lease_lost");
+  void reader.cancel().catch(() => undefined);
+  void releaseOnce();
+}
+
+export function responseWithAdmissionRelease(response: Response, lease: AdmissionLease, ctx: ExecutionContext): Response {
+  if (!response.body) {
+    ctx.waitUntil(releaseMcpAdmission(lease));
+    return response;
+  }
+  const renewalAbort = new AbortController();
+  const reader = response.body.getReader();
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let released = false;
+  const releaseOnce = async () => {
+    if (released) return;
+    released = true;
+    renewalAbort.abort();
+    await releaseMcpAdmission(lease);
+  };
+  function onLeaseLost(): void {
+    abortAdmissionStreamAfterLeaseLoss(controller, reader, releaseOnce);
+  }
+  const renewal = renewMcpAdmissionUntilReleased(lease, renewalAbort.signal, onLeaseLost);
+  const readable = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+    async pull(c) {
+      try {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          c.close();
+          await releaseOnce();
+          return;
+        }
+        c.enqueue(chunk.value);
+      } catch (e) {
+        await releaseOnce();
+        throw e;
+      }
+    },
+    async cancel() {
+      try {
+        await reader.cancel();
+      } finally {
+        await releaseOnce();
+      }
+    },
+  });
+  ctx.waitUntil(renewal.catch(() => undefined));
+  return new Response(readable, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 function healthVersion(env: Env): Response {
@@ -206,17 +348,25 @@ const apiHandler = {
       if (env.SERVICENOW_CREDENTIAL_MODE === "per_user_oauth" && !workerOrigin) {
         return Response.json({ error: "public_origin_required" }, { status: 500 });
       }
-      // Per-request server (§2.3); auth props flow to tools via getMcpAuthContext().
-      return await createMcpHandler(createServer(buildHandlers(env, {
-        userId,
-        scopeMaxMode,
-        props,
-        ...(workerOrigin ? { workerOrigin } : {}),
-        schemaIdentityResolver: (budget) => resolveSchemaIdentity(env, userId, { budget }),
-        schemaIdentityFreshResolver: () => resolveSchemaIdentity(env, userId, { freshOnly: true }),
-      })), {
-        authContext: { props },
-      })(request, env, ctx);
+      const admission = await admitMcpRequest(env, userId);
+      if (admission instanceof Response) return admission;
+      try {
+        // Per-request server (§2.3); auth props flow to tools via getMcpAuthContext().
+        const response = await createMcpHandler(createServer(buildHandlers(env, {
+          userId,
+          scopeMaxMode,
+          props,
+          ...(workerOrigin ? { workerOrigin } : {}),
+          schemaIdentityResolver: (budget) => resolveSchemaIdentity(env, userId, { budget }),
+          schemaIdentityFreshResolver: () => resolveSchemaIdentity(env, userId, { freshOnly: true }),
+        })), {
+          authContext: { props },
+        })(request, env, ctx);
+        return responseWithAdmissionRelease(response, admission, ctx);
+      } catch (e) {
+        await releaseMcpAdmission(admission);
+        throw e;
+      }
     } catch (e) {
       if (e instanceof ProductionPostureError) {
         return productionPostureResponse(e, true);

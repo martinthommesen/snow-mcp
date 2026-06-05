@@ -88,6 +88,24 @@ export function normalizeLedgerRecordForStorage(
 }
 
 export class MutationLedgerDO extends DurableObject {
+  private mutationChain: Promise<unknown> = Promise.resolve();
+
+  private serializeMutation<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.mutationChain.then(task);
+    this.mutationChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private runCritical<Args extends unknown[], T>(
+    task: (...args: Args) => Promise<T>,
+    ...args: Args
+  ): Promise<T> {
+    return this.serializeMutation(() => task.apply(this, args));
+  }
+
   private async getActiveRecord(): Promise<LedgerRecord | undefined> {
     const rec = await this.ctx.storage.get<Partial<LedgerRecord>>(RECORD_KEY);
     const normalized = normalizeLedgerRecordForStorage(rec);
@@ -118,6 +136,10 @@ export class MutationLedgerDO extends DurableObject {
    * A request-hash mismatch on an existing key is treated as a conflict ("blocked").
    */
   async begin(requestHash: string): Promise<BeginResult> {
+    return this.runCritical(this.beginCritical, requestHash);
+  }
+
+  private async beginCritical(requestHash: string): Promise<BeginResult> {
     const rec = await this.getActiveRecord();
     if (!rec) {
       await this.putRecord({ status: "started", requestHash });
@@ -138,6 +160,10 @@ export class MutationLedgerDO extends DurableObject {
   }
 
   async complete(result: unknown): Promise<void> {
+    return this.runCritical(this.completeCritical, result);
+  }
+
+  private async completeCritical(result: unknown): Promise<void> {
     // Only a key with an in-flight ("started") attempt may be completed. A missing row
     // means complete() was called without a matching begin() — it must NOT invent a
     // record (which would stamp a result under an empty requestHash, replaying it for
@@ -148,12 +174,20 @@ export class MutationLedgerDO extends DurableObject {
   }
 
   async fail(): Promise<void> {
+    return this.runCritical(this.failCritical);
+  }
+
+  private async failCritical(): Promise<void> {
     const rec = await this.getActiveRecord();
     if (rec?.status === "started") await this.putRecord({ status: "failed", requestHash: rec.requestHash });
   }
 
   /** Mark an outcome unknown (e.g. runServerScript timed out). Blocks future retries (S17). */
   async markIndeterminate(): Promise<void> {
+    return this.runCritical(this.markIndeterminateCritical);
+  }
+
+  private async markIndeterminateCritical(): Promise<void> {
     const rec = await this.getActiveRecord();
     if (rec?.status === "started") await this.putRecord({ status: "indeterminate", requestHash: rec.requestHash });
   }

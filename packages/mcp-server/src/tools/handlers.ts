@@ -90,6 +90,7 @@ export interface HandlerEnv extends PolicyEnv {
   // Executor (runServerScript / admin_script): HMAC signing key + endpoint path (§2.0, §5.6).
   X_MCP_EXECUTOR_HMAC_KEY?: string;
   SNOW_EXECUTOR_PATH?: string;
+  MUTATION_FREEZE?: string;
   // Recovery-snapshot config (§7.7): the snapshot ring uses SNAPSHOT_KEK_CURRENT/_PREV
   // (declared above) via buildKekRing (same scheme as the token ring, P3).
   SNAPSHOT_ENABLED_TABLES?: string; // comma-separated tables that get before/after snapshots.
@@ -114,6 +115,12 @@ function stringArrayProp(value: unknown): string[] {
 
 function utcDateKey(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+function auditSeverity(status: AuditRecord["status"]): "info" | "notice" | "alert" {
+  if (status === "ok") return "info";
+  if (status === "intent") return "notice";
+  return "alert";
 }
 
 type ParsedCredentialMode = CredentialMode | "invalid";
@@ -432,6 +439,11 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
           JSON.stringify(record),
           { expirationTtl: RETENTION_TTL_SECONDS },
         );
+        console.log(JSON.stringify({
+          event: "mcp_audit_record",
+          severity: auditSeverity(record.status),
+          record,
+        }));
       }
     : undefined;
 
@@ -489,6 +501,7 @@ export function buildHandlers(env: HandlerEnv, auth: AuthContext): ServerHandler
       identity,
       now: () => Date.now(),
       durabilityRequired: true,
+      mutationFreeze: env.MUTATION_FREEZE === "true",
       ...(ledgerFactory && runContext.runKey ? { ledger: ledgerFactory(runContext.runKey) } : {}),
       ...(auditSink ? { audit: auditSink } : {}),
       ...(captureSnapshot ? { captureSnapshot, snapshotEnabledTables } : {}),
