@@ -9,8 +9,7 @@
         "allowJs": true,
         "noEmit": true,
         "noEmitHelpers": true,
-        "esModuleInterop": false,
-        "module": "None",
+        "module": "es2022",
         "types": []
     },
     "include": [
