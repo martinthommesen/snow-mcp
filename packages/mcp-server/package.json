@@ -11,7 +11,7 @@
     "@modelcontextprotocol/sdk": "1.29.0",
     "@servicenow-codemode/shared": "*",
     "agents": "0.14.1",
-    "alchemy": "0.87.0",
+    "alchemy": "0.93.11",
     "esbuild-wasm": "0.28.0",
     "jose": "6.2.3",
     "zod": "4.4.3"
