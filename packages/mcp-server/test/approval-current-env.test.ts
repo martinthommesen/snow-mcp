@@ -1,6 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildHandlers, type HandlerEnv } from "../src/tools/handlers.js";
+import { REDACTED } from "../src/observability/redact.js";
 
 interface TestEnv {
   LOADER: WorkerLoader;
@@ -155,7 +156,7 @@ describe("admin_script group approval uses current env config", () => {
       const res = await handlers.runCode({
         code: `async () => { await servicenow.runServerScript({ script: "gs.info('x')" }); return "done"; }`,
         mode: "admin_script",
-        reason: "rotate",
+        reason: "rotate OIDC_CLIENT_SECRET=oidc-secret-value",
         idempotencyKey: `audit-log-${crypto.randomUUID()}`,
       });
 
@@ -166,7 +167,10 @@ describe("admin_script group approval uses current env config", () => {
         severity: "info",
         record: { op: "runServerScript", status: "ok", actor: { mcpActorUserId: "operator" } },
       });
-      expect(JSON.stringify(auditLogs)).not.toContain("gs.info");
+      const serializedLogs = JSON.stringify(auditLogs);
+      expect(serializedLogs).not.toContain("gs.info");
+      expect(serializedLogs).not.toContain("oidc-secret-value");
+      expect(serializedLogs).toContain(REDACTED);
     } finally {
       log.mockRestore();
     }

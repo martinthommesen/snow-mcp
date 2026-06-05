@@ -136,12 +136,26 @@ async function createExecutorOnlyPrincipal(roleId) {
     const grant = await apiOk("POST", "/api/now/table/sys_user_has_role", { user: userId, role: roleId });
     principal.roleGrantId = grant.json?.result?.sys_id;
     if (!principal.roleGrantId) throw new Error("Temporary executor-only role grant did not return sys_id.");
-    await new Promise((r) => setTimeout(r, 3000));
+    await waitForExecutorRole(auth);
     return principal;
   } catch (e) {
     await cleanupExecutorOnlyPrincipal(principal);
     throw e;
   }
+}
+async function waitForExecutorRole(auth, timeoutMs = 15_000, stepMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = "none";
+  while (Date.now() < deadline) {
+    const r = await call(await signed("return 1;"), auth);
+    lastStatus = String(r.status);
+    if (r.status >= 200 && r.status < 300) return;
+    if (r.status !== 401 && r.status !== 403) {
+      throw new Error(`Executor role readiness probe failed with HTTP ${r.status}: ${JSON.stringify(r.body)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+  throw new Error(`Executor role grant did not become effective before timeout; last status ${lastStatus}.`);
 }
 async function cleanupExecutorOnlyPrincipal(principal) {
   if (!principal?.managed) return;
@@ -180,10 +194,10 @@ async function signed(script, opts = {}) {
     mcp_actor_user_id: "u1", mcp_actor_email: "ada@example.com", snow_effective_user_sys_id: "sys1",
     // `instance` is SIGNED (set before the HMAC) — opts.instance lets a test forge a VALIDLY-
     // signed actor for a DIFFERENT instance (case 2 cross-instance replay).
-    instance: opts.instance ?? host, request_id: "req-" + Math.random().toString(36).slice(2),
+    instance: opts.instance ?? host, request_id: `req-${crypto.randomUUID()}`,
     script_sha256: await sha256Base64(script), issued_at: Date.now(),
     // opts.nonce lets cases 1/5 reuse a fixed nonce; default is random.
-    nonce: opts.nonce ?? "n-" + Math.random().toString(36).slice(2),
+    nonce: opts.nonce ?? `n-${crypto.randomUUID()}`,
     // `reason` is a SIGNED canonical key (plan §P7 item 1, the new LAST key) — it MUST be present
     // or the host canonical emits "reason":"undefined" while the executor emits "reason":"" and
     // every HMAC mismatches -> a false 401 on the live PDI (including the pre-existing B1 case).
@@ -317,7 +331,7 @@ check("audit-first row written to x_1793136_mcp_audit_log (audit_id returned)", 
 // is read by case 1b below (the sys_index catalog row is only a secondary, unreliable signal).
 let concurrencyArbitrated = false;
 {
-  const sameNonce = "concur-" + Math.random().toString(36).slice(2);
+  const sameNonce = `concur-${crypto.randomUUID()}`;
   // Build ONE signed payload, send the SAME object twice (identical nonce + body + sig).
   const payload = await signed("return gs.getUserName();", { nonce: sameNonce });
   const [a, b] = await Promise.all([call(payload), call(payload)]);
@@ -381,7 +395,7 @@ for (const [label, opts] of [
 //    "reason persisted in the audit `reason` column" half is operator-verify (the audit table is
 //    read-ACL-blocked to admin via Table API; the column value is checked by the operator live).
 {
-  const knownReason = "p7-audited-reason-" + Math.random().toString(36).slice(2);
+  const knownReason = `p7-audited-reason-${crypto.randomUUID()}`;
   const good = await call(await signed("return gs.getUserName();", { reason: knownReason }));
   check("SIGNED reason: valid signed reason -> 200 (reason is HMAC-bound and accepted)", good.status === 200 && typeof good.body?.result === "string", `(status ${good.status})`);
   // Sign WITH knownReason, then mutate actor.reason after signing -> HMAC no longer matches.
@@ -399,7 +413,7 @@ skip("SIGNED reason persisted in x_1793136_mcp_audit_log.reason column", "scoped
 //    >max_bytes (default 32768); `script_sha256` covers the real (oversized) code so the HMAC is
 //    valid — the 413 fires on the size gate before verify regardless.
 {
-  const freshNonce = "size-then-nonce-" + Math.random().toString(36).slice(2);
+  const freshNonce = `size-then-nonce-${crypto.randomUUID()}`;
   const big = "x".repeat(40000); // > 32768-byte default max_bytes
   const oversized = await call(await signed(`return "${big}";`, { nonce: freshNonce }));
   const rejected413 = oversized.status === 413 && oversized.body?.error === "code_size";

@@ -164,12 +164,12 @@ function productionPostureResponse(error: ProductionPostureError, includeViolati
   );
 }
 
-interface AdmissionStub {
+export interface AdmissionStub {
   admit(now?: number): Promise<{ ok: true; leaseId: string } | { ok: false; reason: "rate" | "concurrency"; retryAfterMs: number }>;
   release(leaseId: string): Promise<void>;
 }
 
-type AdmissionLease = { stub: AdmissionStub; leaseId: string };
+export type AdmissionLease = { stub: AdmissionStub; leaseId: string };
 
 function retryAfterSeconds(ms: number): string {
   return String(Math.max(1, Math.ceil(ms / 1000)));
@@ -204,7 +204,7 @@ async function releaseMcpAdmission(lease: AdmissionLease): Promise<void> {
   }
 }
 
-function responseWithAdmissionRelease(response: Response, lease: AdmissionLease, ctx: ExecutionContext): Response {
+export function responseWithAdmissionRelease(response: Response, lease: AdmissionLease, ctx: ExecutionContext): Response {
   if (!response.body) {
     ctx.waitUntil(releaseMcpAdmission(lease));
     return response;
