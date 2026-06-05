@@ -30,7 +30,7 @@
     "@cyclonedx/cyclonedx-npm": "4.2.1",
     "playwright": "1.60.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.0",
+    "vitest": "^4.1.8",
     "wrangler": "4.95.0"
   },
   "dependencies": {
