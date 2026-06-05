@@ -22,10 +22,11 @@ S8 role-ACL enforced, B1 valid executes, forged→401, audit-first row written.
 `new Function` (eval) and `GlideCertificateEncryption` (HMAC) are **global-only** — not
 permitted in scoped apps. So the scoped `executor/run` does what scope allows — audit-first,
 kill switch, byte cap, the role-gated endpoint — and calls the GLOBAL `x_mcp_verify.verify()`
-before consuming the scoped nonce, then `x_mcp_verify.execute()` after the nonce insert succeeds.
-The global core has installer-injected HMAC material, performs the HMAC verification
-(cross-engine-equal to the host signer, B1), checks the wrapper-created running audit row and
-consumed nonce, inserts a one-time execution claim, and runs the `new Function` execution.
+before consuming the scoped nonce and inserting the scoped execution claim, then
+`x_mcp_verify.execute()` after those proof rows exist. The global core has installer-injected HMAC
+material, performs the HMAC verification (cross-engine-equal to the host signer, B1), checks the
+wrapper-created running audit row, consumed nonce, and execution claim, and runs the `new Function`
+execution.
 
 ## Build / deploy
 

@@ -46,6 +46,7 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(executorSource).not.toContain("x_1793136_mcp.executor.hmac_secret");
     expect(executorSource).not.toContain("x_mcp_exec_cap");
     expect(executorSource).toContain("out = core.execute(code, actor, sig, auditId + '')");
+    expect(executorSource).toContain("function claimExecutionOnce");
     expect(verifierCoreSource).toContain("_auditCapabilityValid");
     expect(verifierCoreSource).toContain("_nonceConsumed");
     expect(verifierCoreSource).not.toContain("gs.getProperty('x_1793136_mcp.executor.hmac_secret");
@@ -71,9 +72,11 @@ describe("Phase 2 — admin_script executor defaults", () => {
     expect(verifierCoreSource).toContain("function executeCode(code)");
     expect(verifierCoreSource).toContain("return executeCode(code)");
     expect(verifierCoreSource).not.toContain("_executeCode:");
-    expect(verifierCoreSource).toContain("function claimExecutionOnce");
+    expect(verifierCoreSource).toContain("function executionClaimExists");
+    expect(verifierCoreSource).not.toContain("function claimExecutionOnce");
     expect(verifierCoreSource).not.toContain("_claimExecutionOnce:");
     expect(verifierCoreSource).not.toContain("_executionClaimKey:");
+    expect(verifierCoreSource).not.toContain("gr.insert()");
     expect(verifierCoreSource).toContain("capabilityOk = false");
     expect(verifierCoreSource).toContain("error: 'capability_required'");
     expect(verifierCoreSource).toContain("'x:' + String(auditId || '')");

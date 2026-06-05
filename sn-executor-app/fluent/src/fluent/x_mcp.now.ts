@@ -145,8 +145,8 @@ Acl({
 
 // ─── Scheduled nonce-purge (TTL) job (plan §P7 item 5; finding 24) ────────────
 // THE LIVE nonce purge: bounds the scoped x_1793136_mcp_nonce table the wrapper writes.
-// The nonce table stores bounded proof rows: wrapper nonce consumption plus the global core's
-// one-time execution claim. These rows are never read after the freshness window (120s). Purge rows
+// The nonce table stores bounded proof rows: wrapper nonce consumption plus the wrapper's one-time
+// execution claim. These rows are never read after the freshness window (120s). Purge rows
 // older than 1 hour every 15 minutes so the table stays bounded (the 1-hour cutoff is far longer
 // than the freshness window, so a still-relevant proof row is never deleted).
 ScheduledScript({

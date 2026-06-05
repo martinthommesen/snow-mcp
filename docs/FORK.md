@@ -246,7 +246,7 @@ After installing, in ServiceNow:
 > `x_mcp_verify.execute()` with the wrapper-created audit sys_id after the nonce insert succeeds.
 > The global core is rendered by `executor-install.mjs` with the Worker HMAC key material, so the
 > scoped executor never reads raw HMAC properties; `execute()` also checks that the audit row is
-> still running, the nonce row exists, and a one-time execution claim can be inserted before eval.
+> still running, the nonce row exists, and the scoped wrapper-created execution claim exists before eval.
 > That is why there are two copies of
 > `x_mcp_verify.js` and why
 > `check:verifier-sync` enforces their bodies stay byte-identical.

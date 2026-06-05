@@ -3,10 +3,10 @@
 // the GLOBAL x_mcp_verify (plan §0.13a) via its verify()/execute() split. The global core carries
 // installer-injected HMAC material; the executor role only gates endpoint invocation. The scoped app owns the
 // role-gated REST endpoint (REST_Endpoint ACL = S8), the audit-first row (x_1793136_mcp_audit_log),
-// the kill switch, the byte cap, the safe truncation envelope, AND single-use nonce consumption —
-// the INSERT-as-arbiter into the scoped x_1793136_mcp_nonce table (the deployable unique-indexed
+// the kill switch, the byte cap, the safe truncation envelope, single-use nonce consumption, AND
+// execution-claim creation — INSERT-as-arbiter rows in the scoped x_1793136_mcp_nonce table (the deployable unique-indexed
 // store; plan §P7 nonce-store fix). Order: audit -> kill -> egress -> size/413 -> verify ->
-// consume-nonce -> execute, so a forged request never burns a nonce and a replay never executes.
+// consume-nonce -> claim-execution -> execute, so a forged request never burns a nonce and a replay never executes.
 function utf8Len(s) {
     var n = 0
     for (var i = 0; i < s.length; i++) {
@@ -38,6 +38,27 @@ function utf8Slice(s, maxBytes) {
         if (w === 4) i++ // surrogate pair: skip the low surrogate too
     }
     return s
+}
+
+function executionClaimKey(auditId, nonce) {
+    var digest = new GlideDigest().getSHA256Hex(String(nonce || ''))
+    return 'x:' + String(auditId || '') + ':' + String(digest || '').toLowerCase().substring(0, 32)
+}
+
+function insertNonceValue(value) {
+    var gr = new GlideRecord('x_1793136_mcp_nonce')
+    gr.initialize()
+    gr.value = value
+    gr.created = new GlideDateTime()
+    try {
+        return !!gr.insert()
+    } catch (e) {
+        return false
+    }
+}
+
+function claimExecutionOnce(auditId, nonce) {
+    return insertNonceValue(executionClaimKey(auditId, nonce))
 }
 
 ;(function process(request, response) {
@@ -103,13 +124,15 @@ function utf8Slice(s, maxBytes) {
     // QUOTA (maximum execution time), which kills the whole transaction. Do not represent
     // timeout_ms as an in-script kill.
 
-    // VERIFY -> CONSUME NONCE -> EXECUTE (plan §P7 nonce-store fix). The global core does HMAC +
+    // VERIFY -> CONSUME NONCE -> CLAIM EXECUTION -> EXECUTE (plan §P7 nonce-store fix). The global core does HMAC +
     // eval (new Function + GlideCertificateEncryption are global-only), but it uses installer-
     // injected key material. The scoped wrapper never reads the HMAC properties. SINGLE-USE NONCE
-    // consumption is owned HERE, in scope, against the scoped x_1793136_mcp_nonce table — the only
-    // reliably-creatable unique-indexed nonce store (now-sdk deploys its table+UNIQUE index; the
-    // global x_mcp_nonce table could not be created via the Table API). The interleave is:
-    //   verify() (no nonce, no eval) -> INSERT-as-arbiter nonce -> execute() (re-verifies HMAC).
+    // consumption and execution-claim creation are owned HERE, in scope, against the scoped
+    // x_1793136_mcp_nonce table — the only reliably-creatable unique-indexed nonce store
+    // (now-sdk deploys its table+UNIQUE index; the global x_mcp_nonce table could not be created
+    // via the Table API). The interleave is:
+    //   verify() (no nonce, no eval) -> insert nonce -> insert execution claim -> execute()
+    //   (re-verifies HMAC and proof rows).
     // The try/catch around verify() is defense-in-depth (finding 31): if verify ever throws, close
     // the audit row to 'rejected' + 401 instead of leaving it stuck 'running' with a 500.
     var core
@@ -150,19 +173,18 @@ function utf8Slice(s, maxBytes) {
         response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
         return
     }
-    var ng = new GlideRecord('x_1793136_mcp_nonce')
-    ng.initialize()
-    ng.value = nonceVal
-    ng.created = new GlideDateTime()
-    var nid
-    try {
-        nid = ng.insert()
-    } catch (ne) {
-        nid = null // unique-index collision thrown => replay
-    }
-    if (!nid) {
+    if (!insertNonceValue(nonceVal)) {
         audit.status = 'rejected'
         audit.error_class = 'nonce_replay'
+        audit.update()
+        response.setStatus(401)
+        response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
+        return
+    }
+
+    if (!claimExecutionOnce(auditId + '', nonceVal)) {
+        audit.status = 'rejected'
+        audit.error_class = 'capability_required'
         audit.update()
         response.setStatus(401)
         response.setBody({ error: 'actor_signature_invalid', audit_id: auditId + '' })
@@ -177,7 +199,7 @@ function utf8Slice(s, maxBytes) {
 
     // EXECUTE the verified script (eval is global-only). Pass the wrapper-created audit sys_id as
     // proof input, not secret material: the global core re-checks that this audit row is still
-    // running, matches the signed request/code, and that the nonce has already been consumed before eval.
+    // running, matches the signed request/code, and that the nonce + execution-claim rows exist before eval.
     // execute() catches internally and never throws, so the audit row always closes below — no
     // 'running'-stuck row on the execute path.
     var out
