@@ -31,7 +31,7 @@
     "playwright": "1.60.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8",
-    "wrangler": "4.95.0"
+    "wrangler": "4.98.0"
   },
   "dependencies": {
     "zod": "4.4.3"
