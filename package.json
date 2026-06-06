@@ -26,7 +26,7 @@
     "production:oidc:e2e": "node scripts/deployed-oidc-e2e.mjs"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "0.16.10",
+    "@cloudflare/vitest-pool-workers": "0.16.13",
     "@cyclonedx/cyclonedx-npm": "4.2.1",
     "playwright": "1.60.0",
     "typescript": "^6.0.3",
